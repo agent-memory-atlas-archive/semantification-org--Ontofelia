@@ -281,6 +281,21 @@ List all named graphs of the primary agent with their content.
 }
 ```
 
+#### `POST /api/knowledge/sparql`
+
+Run a read-only SPARQL query. Same bearer-token authentication as the other `/api/` routes.
+
+```json
+{ "query": "SELECT ?s WHERE { GRAPH <urn:shared:ontology> { ?s a ?t } }" }
+```
+
+- Only `SELECT` and `ASK` are accepted. The query must parse; otherwise `400`. `SERVICE` clauses are rejected with `400`.
+- Every triple pattern must be inside a `GRAPH <iri> { ... }` pattern, unless the query has a `FROM <iri>` clause that defines the default graph; otherwise `400`.
+- `GRAPH ?var` patterns and any user or session graph (`urn:ontofelia:user:*`, `urn:ontofelia:session:*`, in `GRAPH`, `FROM` or `FROM NAMED`) are rejected with `403`.
+- `SELECT` returns at most 1000 rows; `truncated` is `true` when more matched.
+
+Response for `SELECT`: `{ "type": "bindings", "variables": ["s"], "bindings": [{ "s": { "type": "uri", "value": "..." } }], "truncated": false }`. Response for `ASK`: `{ "type": "boolean", "boolean": true }`.
+
 #### `DELETE /api/knowledge?confirm=true`
 
 Clear the entire knowledge graph. Requires `confirm=true`, is rate-limited to once per hour, writes a Turtle backup to `~/.ontofelia/backups/` first, and re-seeds the core ontology. Response: `{ "deleted": true, "backupPath": "...", "timestamp": "..." }`

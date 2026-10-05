@@ -7,8 +7,13 @@ import * as path from 'path';
 import * as os from 'os';
 import { AuditLog } from '@ontofelia/tools';
 import { fileURLToPath } from 'url';
+import { Parser, Generator, type SparqlQuery } from 'sparqljs';
+import { checkQueryAst } from '../sparqlGuard.js';
 
 const PRIMARY_AGENT_ID = 'ontofelia';
+
+/** Maximum number of rows returned by `POST /api/knowledge/sparql`. */
+const SPARQL_MAX_ROWS = 1000;
 const AGENT_GRAPH_ROLES = [
   ['self', GraphUriResolver.getSelfGraph(PRIMARY_AGENT_ID)],
   ['skills', GraphUriResolver.getSkillsGraph(PRIMARY_AGENT_ID)],
@@ -144,6 +149,82 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
     } catch (e) {
       logger.error('Failed to read knowledge graphs: ' + (e as Error).message);
       return reply.code(500).send({ error: (e as Error).message });
+    }
+  });
+
+  /**
+   * POST /api/knowledge/sparql: read-only SPARQL over HTTP.
+   *
+   * Body: `{ "query": string }`. Only SELECT and ASK are accepted. The query is
+   * parsed strictly (no fallback): a parse error, any other query form, or a
+   * SERVICE clause anywhere yields 400. Every triple pattern must lie inside a
+   * GRAPH pattern, unless the query has a FROM clause that defines the default
+   * graph; otherwise 400 (some backends expose the union of all graphs as the
+   * default graph). A GRAPH pattern with a variable name,
+   * or any user or session graph IRI (GRAPH, FROM, FROM NAMED), yields 403.
+   *
+   * SELECT results are capped at 1000 rows (the query is rewritten to LIMIT
+   * min(user limit, 1001); a 1001st row only sets `truncated`).
+   *
+   * Response 200:
+   * - ASK:    `{ "type": "boolean", "boolean": true }`
+   * - SELECT: `{ "type": "bindings", "variables": ["s"], "bindings": [{ "s": { "type": "uri", "value": "..." } }], "truncated": false }`
+   *   Terms are `{ type: "uri" | "literal" | "bnode", value, datatype?, language? }`.
+   *   `variables` is taken from the first row and is empty when there are no rows.
+   *
+   * Errors: `{ "error": string }` with status 400, 403 or 500.
+   */
+  fastify.post('/api/knowledge/sparql', async (request: FastifyRequest<{ Body: { query?: unknown } }>, reply) => {
+    const query = request.body?.query;
+    if (typeof query !== 'string' || query.trim() === '') {
+      return reply.code(400).send({ error: 'Body must be a JSON object with a non-empty "query" string' });
+    }
+
+    let parsed: SparqlQuery;
+    try {
+      parsed = new Parser().parse(query);
+    } catch (e) {
+      return reply.code(400).send({ error: 'SPARQL parse error: ' + (e as Error).message });
+    }
+
+    if (parsed.type !== 'query' || (parsed.queryType !== 'SELECT' && parsed.queryType !== 'ASK')) {
+      return reply.code(400).send({ error: 'Only SELECT and ASK queries are allowed' });
+    }
+
+    const violation = checkQueryAst(parsed);
+    if (violation) {
+      return reply.code(violation.status).send({ error: violation.message });
+    }
+
+    let toRun: string;
+    try {
+      if (parsed.queryType === 'SELECT') {
+        parsed.limit = Math.min(parsed.limit ?? SPARQL_MAX_ROWS + 1, SPARQL_MAX_ROWS + 1);
+      }
+      toRun = new Generator().stringify(parsed);
+    } catch (e) {
+      return reply.code(400).send({ error: 'Query could not be normalized: ' + (e as Error).message });
+    }
+
+    try {
+      const result = await triplestore.query(toRun);
+      if (result.type === 'boolean') {
+        return { type: 'boolean', boolean: result.boolean === true };
+      }
+      if (result.type !== 'bindings') {
+        return reply.code(500).send({ error: 'Unexpected result type from the triplestore' });
+      }
+      const rows = result.bindings ?? [];
+      const truncated = rows.length > SPARQL_MAX_ROWS;
+      return {
+        type: 'bindings',
+        variables: result.variables ?? [],
+        bindings: truncated ? rows.slice(0, SPARQL_MAX_ROWS) : rows,
+        truncated,
+      };
+    } catch (e) {
+      logger.error('SPARQL query failed: ' + (e as Error).message);
+      return reply.code(500).send({ error: 'Query execution failed: ' + (e as Error).message });
     }
   });
 
