@@ -13,7 +13,6 @@ export function registerStatusCommand(program: Command) {
   program
     .command('status')
     .description('Show system status summary')
-    .option('--usage', 'Show usage statistics')
     .option('--json', 'Output as JSON')
     .action(async (options) => {
       const config = await loadConfig();

@@ -903,8 +903,7 @@ Users can use these commands:
         }
       }
 
-      // maxContext lives in the global OntofeliaConfig (messages.maxContext);
-      // AgentConfig has no such field, so fall back to the schema default of 20.
+      // Number of transcript entries replayed as history (fixed; not configurable).
       const maxContext = 20;
       const history = await this.sessionStore.loadTranscript(session.sessionId, maxContext);
       

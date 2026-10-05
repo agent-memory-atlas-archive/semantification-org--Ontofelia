@@ -19,7 +19,6 @@ export function registerOnboardCommand(program: Command) {
   program
     .command('onboard')
     .description('Interactive setup for Ontofelia')
-    .option('--install-daemon', 'Install systemd/launchd daemon')
     .option('--non-interactive', 'Run without prompts (uses defaults)')
     .action(async (options) => {
       console.log('');

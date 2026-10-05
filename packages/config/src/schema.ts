@@ -72,9 +72,6 @@ export const configSchema = z.object({
     },
     list: []
   }),
-  routing: z.object({
-    agents: z.record(z.string(), z.unknown()).default({})
-  }).default({ agents: {} }),
   channels: z.object({
     telegram: z.object({
       enabled: z.boolean().default(false),
@@ -107,19 +104,10 @@ export const configSchema = z.object({
       accessToken: z.string().optional(),
     }).optional(),
   }).default({}),
-  messages: z.object({
-    maxContext: z.number().default(20),
-    truncateAt: z.number().default(4000)
-  }).default({ maxContext: 20, truncateAt: 4000 }),
   session: z.object({
     maxHistory: z.number().default(50),
     pruneAfterDays: z.number().default(90),
-    scope: z.enum(['main', 'per-channel-peer']).default('per-channel-peer'),
-  }).default({ maxHistory: 50, pruneAfterDays: 90, scope: 'per-channel-peer' }),
-  commands: z.object({
-    prefix: z.string().default('/'),
-    allowAdminOnly: z.boolean().default(false)
-  }).default({ prefix: '/', allowAdminOnly: false }),
+  }).default({ maxHistory: 50, pruneAfterDays: 90 }),
   tools: z.object({
     allow: z.array(z.string()).default([]),
     deny: z.array(z.string()).default([])
@@ -129,7 +117,6 @@ export const configSchema = z.object({
     allowUntrusted: z.boolean().default(false)
   }).default({ trusted: [], allowUntrusted: false }),
   security: z.object({
-    requireGuardian: z.boolean().default(true),
     guardianTimeoutMs: z.number().default(60000),
     // Directories the agent must never mutate (self-source-write / self-git
     // protection). Empty = protect the directory the gateway runs from
@@ -138,7 +125,7 @@ export const configSchema = z.object({
     // OWNER escape hatch: disables the self-source-write and self-git hard
     // blocks. Logged as a startup warning when enabled.
     allowSelfSourceWrites: z.boolean().default(false)
-  }).default({ requireGuardian: true, guardianTimeoutMs: 60000, protectedRoots: [], allowSelfSourceWrites: false }),
+  }).default({ guardianTimeoutMs: 60000, protectedRoots: [], allowSelfSourceWrites: false }),
   // Owner-notification policy (docs/initiative-architecture.md §7). All fields
   // are governed by the NotificationService, not the LLM: the service evaluates
   // the daily cap and quiet hours BEFORE any send and queues suppressed items as
