@@ -233,6 +233,17 @@ const BOOTSTRAP_FILES: Record<string, string> = {
   'BOOTSTRAP.md': `# Bootstrap\n\nStartup configuration and first steps.\n`,
 };
 
+/**
+ * A live human owner turn: the owner, on an interactive chat type, outside the
+ * system/cron/webhook channels and not one of the synthetic sender ids.
+ */
+function isHumanOwnerTurn(envelope: MessageEnvelope): boolean {
+  if (envelope.sender.isOwner !== true) return false;
+  if (envelope.chatType !== 'dm' && envelope.chatType !== 'group') return false;
+  if (envelope.channel === 'system' || envelope.channel === 'cron' || envelope.channel === 'webhook') return false;
+  return !['scheduler', 'cron', 'initiative'].includes(envelope.sender.id);
+}
+
 export class AgentRuntime {
   public lifecycle: AgentLifecycle = 'created';
   private activeRuns = 0;
@@ -2022,7 +2033,18 @@ Users can use these commands:
     // Subcommands map to the idempotent background jobs so the scheduler can
     // drive them by prompt, and an operator can trigger them on demand.
     if (cmd === '/cog' || cmd.startsWith('/cog ')) {
+      // Owner-only: the family reads cycle data and writes maintenance state.
+      // The built-in scheduler jobs arrive with an owner envelope, so they pass.
+      if (!isOwner) {
+        return { text: 'This command is owner-only.', sessionId: session.sessionId };
+      }
       const sub = cmd.slice(4).trim().toLowerCase();
+      // debug on|off and migrate change state on the owner's behalf: they need
+      // a live human owner turn, not a scheduler/cron/webhook/initiative envelope.
+      const requiresHumanTurn = sub === 'migrate' || sub === 'debug on' || sub === 'debug off';
+      if (requiresHumanTurn && !isHumanOwnerTurn(envelope)) {
+        return { text: 'This command needs a live owner turn.', sessionId: session.sessionId };
+      }
       if (sub === 'health' || sub === '') {
         const health = await this.cogHealth();
         return {
@@ -2246,7 +2268,7 @@ Users can use these commands:
     }
 
     if (cmd === '/help') {
-      const ownerCommands = isOwner ? ', /goals, /initiative, /reseed-persona' : '';
+      const ownerCommands = isOwner ? ', /goals, /initiative, /cog, /reseed-persona' : '';
       return { text: `Available commands: /new, /reset, /status, /tools, /model, /skills, /plugins, /help, /stop${ownerCommands}`, sessionId: session.sessionId };
     }
     if (cmd === '/stop') {
