@@ -92,15 +92,18 @@ guard). With the flag off, a wake returns `flag-off` and nothing else happens:
 no episode, no counter change, no dispatch.
 
 **Related cognitive flags.** These are separate flags in the same setup
-resource, all default OFF, and there is no chat command or config key that sets
-them in the current code (the design note in
+resource, all default OFF (the design note in
 `docs/cognitive-architecture/09-integration-and-migration.md` shows the
 triples):
 
 - `flagCycleManager`: routes conversational messages through `CycleManager`.
   Only then are `message-received` episodes written, and those are the only
   thing a mandate can validly point to (§5.1). `arm_goal` (§9) therefore
-  refuses to work without this flag.
+  refuses to work without this flag. The owner switches it with the chat
+  command `/cog cycle on` and `/cog cycle off` (`CognitiveConfig.setCycleManagerEnabled`).
+  The command is refused for non-owners and for synthetic owner senders
+  (scheduler, cron, webhook, initiative; `isHumanOwnerTurn`). `/initiative`
+  says so when the flag is off, and `/cog health` shows its state.
 - `flagGoalStack`: manages goals during conversational cycles. Not required for
   initiative cycles, which always run with goal management on (§6).
 - `flagDebugPanel`: `/cog debug on|off`. Required for the `/api/cog/inspect/*`
@@ -519,6 +522,9 @@ Episodes and Initiative. The Initiative tab shows the flag, the counters, the
 recent initiative cycles and the recent notifications. It needs
 `/cog debug on`; otherwise the panel shows that the debug panel is disabled.
 
+**Demo.** [demo-initiative.md](demo-initiative.md) walks through the whole
+chain on a local install with supported steps only.
+
 **Other traces.** Every skip and cycle is an `initiative` episode; every
 notification is a `notification` episode; the tool audit log records denied
 tool calls with rule `initiative-restricted-tool`.
@@ -530,7 +536,7 @@ What the code in this repository does not do, stated plainly:
 - **No goal receives a mandate or a wake automatically.** The only way from
   normal use is the owner-only `arm_goal` tool (§9), which the agent may call
   only when the owner asks for it in the current message and which needs
-  `flagCycleManager`. The cycle manager itself still creates goals only for a
+  `flagCycleManager` (`/cog cycle on`). The cycle manager itself still creates goals only for a
   message intent (without wake policy) or the implicit "Respond to the user"
   goal. A wake needs a further `/initiative on` before it fires.
 - **An unattended cycle can change only its own goal's progress.** The sole

@@ -1532,6 +1532,9 @@ Users can use these commands:
 
     const parts: string[] = [];
     parts.push(`⚙️ Initiative: ${report.enabled ? 'ON' : 'OFF'} (flagInitiative)`);
+    if (!(await this.cognitiveConfig?.isCycleManagerEnabled().catch(() => false))) {
+      parts.push('Cycle manager: OFF (flagCycleManager). arm_goal needs /cog cycle on.');
+    }
     if (counters) {
       parts.push(
         `Runaway counter: ${counters.inHour}/${counters.maxPerHour} in the last hour, ` +
@@ -2144,9 +2147,10 @@ Users can use these commands:
       }
       if (sub === 'health' || sub === '') {
         const health = await this.cogHealth();
+        const cycleManager = (await this.cognitiveConfig?.isCycleManagerEnabled().catch(() => false)) ?? false;
         return {
           text: health
-            ? '```json\n' + JSON.stringify(health, null, 2) + '\n```'
+            ? '```json\n' + JSON.stringify({ ...health, flags: { cycleManager } }, null, 2) + '\n```'
             : 'Cognitive architecture is not active (no knowledge engine).',
           sessionId: session.sessionId,
         };
@@ -2176,6 +2180,28 @@ Users can use these commands:
         await this.cognitiveConfig.setDebugPanelEnabled(on);
         return { text: `🪟 Cognitive debug panel ${on ? 'enabled' : 'disabled'}.`, sessionId: session.sessionId };
       }
+      // Cycle-manager switch (setup flag cog.flagCycleManager). Owner-only AND a
+      // live human owner turn: a scheduler/cron/webhook envelope claims isOwner
+      // but is not the owner speaking. arm_goal needs this flag on, because the
+      // owner's message is only recorded as a mandate episode on that path.
+      if (sub === 'cycle on' || sub === 'cycle off') {
+        if (!isOwner) {
+          return { text: 'This command is owner-only.', sessionId: session.sessionId };
+        }
+        if (!isHumanOwnerTurn(envelope)) {
+          return { text: 'This command needs the owner in a live conversation; scheduled and system turns cannot use it.', sessionId: session.sessionId };
+        }
+        if (!this.cognitiveConfig) {
+          return { text: 'Cognitive architecture is not active.', sessionId: session.sessionId };
+        }
+        const on = sub === 'cycle on';
+        await this.cognitiveConfig.setCycleManagerEnabled(on);
+        return {
+          text: `⚙️ Cycle manager ${on ? 'enabled' : 'disabled'} (flagCycleManager = ${on}).` +
+            (on ? '\nOwner messages are now recorded as episodes, so arm_goal can use them as a mandate.' : ''),
+          sessionId: session.sessionId,
+        };
+      }
       if (sub === 'cycles') {
         const cycles = await this.cogListCycles(session.sessionId, 20);
         if (!cycles) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
@@ -2187,7 +2213,7 @@ Users can use these commands:
         if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|retain|consolidate|scan|migrate|debug on|debug off|cycles|explain <cycleId>]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|retain|consolidate|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.
@@ -2365,7 +2391,7 @@ Users can use these commands:
     }
 
     if (cmd === '/help') {
-      const ownerCommands = isOwner ? ', /goals, /initiative, /cog, /reseed-persona' : '';
+      const ownerCommands = isOwner ? ', /goals, /initiative, /cog cycle on|off, /reseed-persona' : '';
       return { text: `Available commands: /new, /reset, /status, /tools, /model, /skills, /plugins, /help, /stop${ownerCommands}`, sessionId: session.sessionId };
     }
     if (cmd === '/stop') {

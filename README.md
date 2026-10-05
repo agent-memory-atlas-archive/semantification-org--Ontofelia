@@ -362,6 +362,7 @@ ontofelia/
 | [Deployment](docs/deployment.md) | Production deployment guide |
 | [Interface Contracts](docs/interfaces.md) | TypeScript interfaces for all adapter boundaries |
 | [Initiative Architecture](docs/initiative-architecture.md) | Governed autonomy: goal wakes, mandates, guards, owner notification |
+| [Initiative Demo](docs/demo-initiative.md) | Operator walkthrough: give the agent a goal, let it wake and work on its own |
 | [Known Gaps](docs/known_gaps.md) | Current limitations and planned improvements |
 | [Known Limitations](docs/known-limitations.md) | Correctness & scaling limitations with tracking tickets |
 
