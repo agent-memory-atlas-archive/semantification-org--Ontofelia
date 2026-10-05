@@ -361,6 +361,7 @@ ontofelia/
 | [CLI Reference](docs/cli.md) | All CLI commands |
 | [Deployment](docs/deployment.md) | Production deployment guide |
 | [Interface Contracts](docs/interfaces.md) | TypeScript interfaces for all adapter boundaries |
+| [Initiative Architecture](docs/initiative-architecture.md) | Governed autonomy: goal wakes, mandates, guards, owner notification |
 | [Known Gaps](docs/known_gaps.md) | Current limitations and planned improvements |
 | [Known Limitations](docs/known-limitations.md) | Correctness & scaling limitations with tracking tickets |
 
