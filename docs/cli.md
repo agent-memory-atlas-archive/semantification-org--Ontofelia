@@ -125,11 +125,15 @@ Manage channel pairing requests (Telegram/Discord user approval).
 ```bash
 ontofelia pairing list                     # Show pending requests
 ontofelia pairing list telegram            # Filter by channel
-ontofelia pairing approve <code>           # Approve a user
+ontofelia pairing approve <code> [--yes]   # Approve a user (asks for confirmation unless --yes)
 ontofelia pairing reject <code>            # Reject a user
 ```
 
 When a new Telegram/Discord user messages the bot, they get a pairing code. The admin must approve it via this command before the user can chat.
+
+> **Warning: approving a pairing grants owner rights.** On Telegram, every approved account is treated as the owner. That person gets the same rights as you: shell access on the host through the agent (the `exec` tool), owner commands, and access to the owner's private memory. Only approve accounts that belong to you. Separate per-user identities are planned but not implemented yet. (Discord users are currently not treated as the owner.)
+
+`pairing approve` prints this warning and asks for confirmation. Use `--yes` to skip the prompt; without a terminal (for example in scripts) the command refuses unless `--yes` is given.
 
 ---
 
