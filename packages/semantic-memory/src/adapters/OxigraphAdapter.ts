@@ -30,6 +30,11 @@ export class OxigraphAdapter implements TriplestoreAdapter {
   private dataDir!: string;
   private dataFile!: string;
 
+  /** Depth of nested/overlapping `batch()` calls currently in progress. */
+  private batchDepth = 0;
+  /** Set when a write happened while `batchDepth > 0` and flush was deferred. */
+  private dirty = false;
+
   /** Serialised N-Quads format string understood by oxigraph. */
   private static readonly NQUADS_MIME = 'application/n-quads';
 
@@ -75,6 +80,45 @@ export class OxigraphAdapter implements TriplestoreAdapter {
       await fs.rename(tmp, this.dataFile);
     } catch (e) {
       throw new Error(`Failed to persist Oxigraph dataset: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Persist now, unless a `batch()` is in progress — then just mark the
+   * store dirty so the outermost `batch()` flushes once on the way out.
+   */
+  private async persistOrDefer(): Promise<void> {
+    if (this.batchDepth === 0) {
+      await this.flush();
+    } else {
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * Run `fn` with all writes it performs (directly, or via nested write
+   * calls / nested `batch()` calls) coalesced into a single `flush()` once
+   * the OUTERMOST batch ends — this is what lets `KnowledgeEngine.storeFact()`
+   * persist once instead of once per internal write.
+   *
+   * Durability note: if the process crashes mid-batch, the disk is left at
+   * the state from before the batch started (no partially-written fact ever
+   * reaches disk) — the deferred flush simply never ran. If `fn` throws, the
+   * `finally` below still flushes whatever was written in memory before the
+   * throw (same as today's per-call behaviour, where a later write in a
+   * multi-write operation failing still leaves earlier writes persisted) —
+   * there is no in-memory rollback on error, mid-batch or not.
+   */
+  async batch<T>(fn: () => Promise<T>): Promise<T> {
+    this.batchDepth++;
+    try {
+      return await fn();
+    } finally {
+      this.batchDepth--;
+      if (this.batchDepth === 0 && this.dirty) {
+        this.dirty = false;
+        await this.flush();
+      }
     }
   }
 
@@ -163,7 +207,7 @@ export class OxigraphAdapter implements TriplestoreAdapter {
   async update(sparql: string): Promise<void> {
     try {
       this.store.update(sparql);
-      await this.flush();
+      await this.persistOrDefer();
     } catch (e) {
       throw new Error(`SPARQL Update failed in Oxigraph: ${(e as Error).message}`);
     }
@@ -184,7 +228,7 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     try {
       const graphNode = oxigraph.namedNode(graphUri);
       this.store.load(data, { format: mime, to_graph_name: graphNode });
-      await this.flush();
+      await this.persistOrDefer();
     } catch (e) {
       throw new Error(`putGraph failed in Oxigraph: ${(e as Error).message}`);
     }
@@ -234,7 +278,7 @@ export class OxigraphAdapter implements TriplestoreAdapter {
                    format === 'rdfxml' ? 'application/rdf+xml' : 'text/turtle';
       this.store.load(data, { format: mime, to_graph_name: oxigraph.namedNode(graphUri) });
     }
-    await this.flush();
+    await this.persistOrDefer();
   }
 
   async backup(targetDir: string): Promise<string> {
@@ -257,6 +301,6 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     if (data.trim().length > 0) {
       this.store.load(data, { format: OxigraphAdapter.NQUADS_MIME });
     }
-    await this.flush();
+    await this.persistOrDefer();
   }
 }

@@ -61,6 +61,12 @@ export interface TriplestoreAdapter {
   // Backup
   backup(targetDir: string): Promise<string>;
   restore(backupPath: string): Promise<void>;
+
+  /**
+   * Run fn with writes coalesced; durable persistence happens once when the
+   * outermost batch ends.
+   */
+  batch?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface TriplestoreConfig {
