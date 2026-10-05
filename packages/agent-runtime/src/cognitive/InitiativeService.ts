@@ -11,15 +11,14 @@
  *    reserved and protected by the self-protection layer, so the agent cannot
  *    tamper with its own wake schedule via cron_manage).
  *  - {@link onWake} is the handler the gateway routes those jobs to. It enforces,
- *    in order: the `flagInitiative` kill switch → persisted runaway guards
- *    (cycles/hour and /day) → per-goal cooldown → mandate gate, and only then
- *    dispatches an initiative envelope through the agent.
+ *    in order: the `flagInitiative` kill switch → goal active → mandate gate →
+ *    persisted runaway guards (cycles/hour, then /day) → per-goal cooldown, and
+ *    only then dispatches an initiative envelope through the agent.
  *  - {@link recoverOnStart} replaces any periodic sweep: one scan on boot
  *    re-registers future wakes and fires overdue ones (subject to the guards).
  *
- * Everything that would reach the owner (a notification) goes through a
- * {@link NotificationSink}; the default is a no-op logger. Actual delivery
- * (Telegram) is a separate task that drops a real sink in here — see §7.
+ * This service sends nothing itself. Owner notifications are delivered by
+ * NotificationService, which backs the `notify_owner` tool (§7).
  *
  * Determinism: the service reads "now" only through an injected {@link Clock},
  * so tests drive the hourly/daily caps and cooldown with a fake clock.
@@ -55,24 +54,9 @@ export interface InitiativeScheduler {
   listOneTimeJobs(): Array<{ id: string; name: string; runAt: string; status: string }>;
 }
 
-/**
- * Sink for anything an initiative cycle wants to send to the owner. The default
- * {@link LoggingNotificationSink} only logs — real outbound delivery (Telegram)
- * is a separate task that provides a concrete sink (docs §7).
- */
+/** Contract for sending a notification to the owner; NotificationService implements it. */
 export interface NotificationSink {
   notify(n: { message: string; priority: 'low' | 'normal' | 'high'; goalId?: string }): Promise<void>;
-}
-
-/** Default no-op sink: records the intent to the log; delivers nothing. */
-export class LoggingNotificationSink implements NotificationSink {
-  private readonly logger = createLogger('initiative-notify');
-  async notify(n: { message: string; priority: 'low' | 'normal' | 'high'; goalId?: string }): Promise<void> {
-    this.logger.info(
-      { priority: n.priority, goalId: n.goalId },
-      `notify_owner (no-op sink): ${n.message}`,
-    );
-  }
 }
 
 /**
@@ -116,8 +100,6 @@ export interface InitiativeGuardConfig {
   maxPerDay?: number;
   /** Per-goal cooldown in minutes since its last wake. Default 30. */
   cooldownMinutes?: number;
-  /** Lower tool-round budget for initiative cycles (design §5). Default 25. */
-  toolRoundBudget?: number;
   /** Goal-session transcript cap that triggers early archival. Default 500. */
   transcriptCap?: number;
   /** When a wake is already past, schedule it this many ms out. Default 2000. */
@@ -128,7 +110,6 @@ const DEFAULTS: Required<InitiativeGuardConfig> = {
   maxPerHour: 4,
   maxPerDay: 24,
   cooldownMinutes: 30,
-  toolRoundBudget: 25,
   transcriptCap: 500,
   pastWakeDelayMs: 2000,
 };
@@ -163,7 +144,6 @@ export interface InitiativeServiceOptions {
   scheduler: InitiativeScheduler;
   dispatch: InitiativeDispatch;
   cognitiveConfig?: CognitiveConfig;
-  notificationSink?: NotificationSink;
   session?: InitiativeSessionPort;
   clock?: Clock;
   guards?: InitiativeGuardConfig;
@@ -176,7 +156,6 @@ export class InitiativeService {
   private readonly scheduler: InitiativeScheduler;
   private readonly dispatch: InitiativeDispatch;
   private readonly cognitiveConfig: CognitiveConfig;
-  private readonly sink: NotificationSink;
   private readonly session: InitiativeSessionPort;
   private readonly clock: Clock;
   private readonly guards: Required<InitiativeGuardConfig>;
@@ -198,20 +177,9 @@ export class InitiativeService {
     this.dispatch = opts.dispatch;
     this.cognitiveConfig =
       opts.cognitiveConfig ?? new CognitiveConfig(opts.triplestore, opts.agentId);
-    this.sink = opts.notificationSink ?? new LoggingNotificationSink();
     this.session = opts.session ?? new NoopInitiativeSessionPort();
     this.clock = opts.clock ?? (() => new Date());
     this.guards = { ...DEFAULTS, ...(opts.guards ?? {}) };
-  }
-
-  /** The lower tool-round budget initiative cycles should run with (design §5). */
-  get toolRoundBudget(): number {
-    return this.guards.toolRoundBudget;
-  }
-
-  /** The notification sink, for the notify_owner tool wiring (design §7). */
-  get notificationSink(): NotificationSink {
-    return this.sink;
   }
 
   /** Run `fn` after any in-flight wake for this agent completes (design H3). */

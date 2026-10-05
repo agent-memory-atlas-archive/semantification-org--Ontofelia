@@ -121,8 +121,8 @@ effective values; there is no configuration key for them.
 schema (`packages/config/src/schema.ts`) has `maxPerDay` (default 5, 0 means
 never send), optional `quietHours` (`start` and `end` as `HH:MM`, wrapping
 midnight), `minPriorityDuringQuietHours` (default `high`), optional IANA
-`timezone`, and optional `target`. The schema also has `approvalMaxPerDay`
-(default 10), which no code reads yet (§10).
+`timezone`, and optional `target`. The `approvalMaxPerDay` key
+that older configs may carry has been removed; it is ignored on load.
 
 ## 4. Components and data flow
 
@@ -553,18 +553,17 @@ What the code in this repository does not do, stated plainly:
 - **Mandated goals must be in the long-term goal graph** to be seen by the wake
   path (§5.1).
 - **Guard values are not configurable.** The caps, cooldown and transcript cap
-  use fixed defaults. The `InitiativeService.toolRoundBudget` value is exposed
-  but not consumed: the runtime uses its own constant of 25. The numbers in
+  use fixed defaults, and so does the tool-round budget of initiative cycles
+  (the constant `INITIATIVE_TOOL_ROUNDS` = 25 in the runtime). The numbers in
   `/initiative` ("caps are defaults") are constants in the runtime, which has no
   reference to the gateway's service.
 - **Notifications go to Telegram only.** There is no other outbound channel.
   Without a configured target or an enabled Telegram adapter, notifications are
   suppressed as `no-target` and wait in the digest.
 - **`NotificationService` is wired to `notify_owner` regardless of the
-  Telegram setting.** The `notificationSink` chosen in the gateway is passed to
-  `InitiativeService`, but the service never calls it.
-- **No approval queue** for unattended cycles. `notifications.approvalMaxPerDay`
-  exists in the schema and is unused.
+  Telegram setting.** `InitiativeService` itself sends nothing.
+- **No approval queue** for unattended cycles. The former
+  `notifications.approvalMaxPerDay` key was removed because nothing read it.
 - **No periodic sweep.** Wakes are timers plus one boot-time recovery scan.
   A wake that fires while the flag is off is consumed and not re-armed; the
   goal keeps its `wakeAt`, so it is only picked up again as an overdue wake at

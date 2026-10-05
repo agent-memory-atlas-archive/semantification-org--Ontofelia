@@ -35,7 +35,6 @@ import type { EpisodeHit } from '@ontofelia/semantic-memory';
 // gateway composition root can construct and wire the service.
 export {
   InitiativeService,
-  LoggingNotificationSink,
   NoopInitiativeSessionPort,
   INITIATIVE_JOB_PREFIX,
 } from './cognitive/InitiativeService.js';
@@ -129,8 +128,8 @@ const INITIATIVE_TOOL_ROUNDS = 25;
  * Documented default runaway caps (InitiativeService guard defaults, docs §5).
  * The runtime holds no reference to the gateway-constructed InitiativeService, so
  * the /initiative command shows these defaults alongside the real counters and
- * labels them as defaults — the counters are exact; the caps may be overridden in
- * gateway config.
+ * labels them as defaults — the counters are exact; the caps themselves are fixed
+ * (there is no configuration key for them).
  */
 const INITIATIVE_DEFAULT_MAX_PER_HOUR = 4;
 const INITIATIVE_DEFAULT_MAX_PER_DAY = 24;

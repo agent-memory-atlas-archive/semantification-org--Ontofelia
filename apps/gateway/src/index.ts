@@ -5,8 +5,8 @@ import fastifyStatic from '@fastify/static';
 import { OntofeliaConfig } from '@ontofelia/config';
 import { createLogger, AgentConfig, ChannelType, ChannelBinding, MessageEnvelope, PRIMARY_AGENT_ID, resolveAgentId } from '@ontofelia/core';
 import { SessionStore } from '@ontofelia/session-store';
-import { AgentRuntime, InitiativeService, LoggingNotificationSink, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
-import type { InitiativeSessionPort, NotificationChannelPort, NotificationSink } from '@ontofelia/agent-runtime';
+import { AgentRuntime, InitiativeService, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
+import type { InitiativeSessionPort, NotificationChannelPort } from '@ontofelia/agent-runtime';
 import { NotifyOwnerTool, ListGoalsTool, ArmGoalTool, UpdateGoalStepTool } from '@ontofelia/tools';
 import type { SessionOrigin } from '@ontofelia/core';
 import { resolveOwnerTarget } from './services/notificationTarget.js';
@@ -201,8 +201,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     await initChannels(config, agents);
 
   // --- Owner notification (docs/initiative-architecture.md §7) ---
-  // The governed notification layer. It is the real NotificationSink for
-  // initiative cycles AND backs the notify_owner tool. Constructed here (after
+  // The governed notification layer. It backs the notify_owner tool. Constructed here (after
   // channels) because it needs the channel registry + allowlist to resolve and
   // reach the owner's Telegram chat. Delivery target resolution order:
   //   config.notifications.target ?? channels.telegram.ownerChatId
@@ -260,11 +259,6 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   }));
   // Surface the "while you were away" digest on the next owner conversation.
   defaultAgent.setDigestSource(notificationService);
-  // Use the real sink for initiative cycles only when a telegram channel exists;
-  // otherwise fall back to the no-op logging sink (design §7).
-  const notificationSink: NotificationSink = config.channels.telegram?.enabled
-    ? notificationService
-    : new LoggingNotificationSink();
 
   // --- Scheduler ---
   const { JobScheduler, WebhookRegistry } = await import('@ontofelia/scheduler');
@@ -315,7 +309,6 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     dispatch: async (envelope) => {
       await defaultAgent.handleMessage(envelope);
     },
-    notificationSink,
     session: initiativeSessionPort,
   });
 
