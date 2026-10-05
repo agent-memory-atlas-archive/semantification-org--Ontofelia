@@ -136,7 +136,7 @@ describe('/goals and /initiative observability commands', () => {
       expect(res.text).toContain('blocked');
       expect(res.text).toContain('waiting for approval');
       expect(res.text).toContain('Curiosity');
-      expect(res.text).toContain('next wake');
+      expect(res.text).toContain('waiting until'); // active goal with a future wake
       expect(res.text).toContain('draft the intro');
     });
 

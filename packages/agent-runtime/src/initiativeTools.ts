@@ -33,6 +33,7 @@ export const INITIATIVE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   // read-only inspection / utility
   'ontology_inspect',
   'self_inspect',
+  'list_goals',
   'web_fetch',
   'read_pdf',
   'datetime',

@@ -25,6 +25,8 @@ import {
   type ResponseExplanation,
 } from './cognitive/CogInspector.js';
 import type { Goal } from './cognitive/GoalStack.js';
+import { summarizeGoal, orderGoals, isOpenGoal } from './cognitive/goalSummary.js';
+import type { GoalSummary } from './cognitive/goalSummary.js';
 import type { EpisodeHit } from '@ontofelia/semantic-memory';
 
 // Initiative runtime (docs/initiative-architecture.md §5–§7). Re-exported so the
@@ -47,6 +49,8 @@ export type {
 } from './cognitive/InitiativeService.js';
 export { GoalStack, addIso8601Duration } from './cognitive/GoalStack.js';
 export type { Goal, GoalInput, GoalStatus } from './cognitive/GoalStack.js';
+export { summarizeGoal, orderGoals, isOpenGoal, nextAction } from './cognitive/goalSummary.js';
+export type { GoalSummary } from './cognitive/goalSummary.js';
 // The single shared initiative allowlist (advertisement filter + execution gate
 // both read it). Re-exported so tests and the executor import ONE list.
 export { INITIATIVE_ALLOWED_TOOLS } from './initiativeTools.js';
@@ -822,6 +826,7 @@ You are Ontofelia, an autonomous AI agent with full host access.
 
 ### Your Tools
 - **self_inspect**: Use this tool ALWAYS when you are asked about your model, config, system, or architecture. Actions: config, system, architecture, source.
+- **list_goals**: When asked what you are planning or working on, call this tool and answer only from its result; if it returns no goals, say you have no open goals.
 - **exec**: Run terminal commands directly on the host. You may install software (sudo apt-get install -y), manage files, and start/stop processes.
 - **web_fetch**: Read webpages as plain text. Useful for research and link checks.
 - **cron_manage**: Create cron jobs to wake yourself at specific times. This lets you handle recurring tasks automatically.
@@ -988,8 +993,9 @@ Users can use these commands:
     // caller must not be able to relay text into the owner's channel (H2 —
     // owner-harassment / injection vector). Hide it from non-owner senders
     // (belt); the tool also refuses such callers defensively (suspenders).
+    // list_goals exposes internal goal state: owner-only, hidden likewise.
     if (!envelope.sender.isOwner) {
-      return allowed.filter((t) => t.name !== 'notify_owner');
+      return allowed.filter((t) => t.name !== 'notify_owner' && t.name !== 'list_goals');
     }
     return allowed;
   }
@@ -1305,6 +1311,17 @@ Users can use these commands:
   }
 
   /**
+   * Open goals (not resolved/abandoned) as grounded summaries in display order —
+   * the data behind the `list_goals` tool, built by the same `summarizeGoal` as
+   * `/goals`. Undefined when no knowledge engine is configured.
+   */
+  async openGoalSummaries(sessionId: string, now: Date = new Date()): Promise<GoalSummary[] | undefined> {
+    const goals = await this.goalsForCommand(sessionId);
+    if (goals === undefined) return undefined;
+    return orderGoals(goals.filter(isOpenGoal)).map((g) => summarizeGoal(g, now));
+  }
+
+  /**
    * Resolve a `cogt:servesDrive` IRI to its human `cogt:driveLabel` from the self
    * graph. Best-effort: returns the label when present, else the IRI's local name,
    * else undefined — never throws, so a missing drive just shows nothing.
@@ -1370,7 +1387,7 @@ Users can use these commands:
 
   /**
    * Render the grounded /goals report (docs §9). Goals are grouped active →
-   * blocked → other, priority-desc within a group; every line is formatted
+   * proposed → blocked → closed, priority-desc within a group; every line is formatted
    * straight from the goal's triples (no LLM). Returns the empty-case string when
    * there are no goals, or unavailability text when the engine is absent.
    */
@@ -1381,16 +1398,12 @@ Users can use these commands:
     }
     if (goals.length === 0) return 'No goals yet.';
 
-    const rank = (s: Goal['status']): number =>
-      s === 'active' ? 0 : s === 'blocked' ? 1 : 2;
-    const ordered = [...goals].sort(
-      (a, b) => rank(a.status) - rank(b.status) || b.priority - a.priority,
-    );
-
+    const ordered = orderGoals(goals);
     const groups: Array<[string, Goal[]]> = [
       ['Active', ordered.filter((g) => g.status === 'active')],
+      ['Proposed', ordered.filter((g) => g.status === 'proposed')],
       ['Blocked', ordered.filter((g) => g.status === 'blocked')],
-      ['Other', ordered.filter((g) => g.status !== 'active' && g.status !== 'blocked')],
+      ['Closed', ordered.filter((g) => !isOpenGoal(g))],
     ];
 
     const sections: string[] = [];
@@ -1398,12 +1411,15 @@ Users can use these commands:
       if (list.length === 0) continue;
       const lines: string[] = [`*${heading}*`];
       for (const g of list) {
+        const s = summarizeGoal(g, now);
         lines.push(`• ${g.goalLabel} — ${g.status}, priority ${g.priority.toFixed(2)}`);
-        if (g.currentStep) lines.push(`   step: ${g.currentStep}`);
-        if (g.wakeAt) lines.push(`   next wake: ${humanizeRelative(g.wakeAt, now)} (${g.wakeAt})`);
+        if (isOpenGoal(g)) lines.push(`   next: ${s.nextAction ?? 'none planned'}`);
+        if (s.waitingUntil)
+          lines.push(`   waiting until ${humanizeRelative(s.waitingUntil, now)} (${s.waitingUntil})`);
+        else if (s.nextWake)
+          lines.push(`   next wake: ${humanizeRelative(s.nextWake, now)} (${s.nextWake})`);
         if (g.deadline) lines.push(`   deadline: ${humanizeRelative(g.deadline, now)} (${g.deadline})`);
-        if (g.status === 'blocked' && g.blockedReason)
-          lines.push(`   blocked: ${g.blockedReason}`);
+        if (s.blockedReason) lines.push(`   blocked: ${s.blockedReason}`);
         if (g.servesDrive) {
           const drive = await this.resolveDriveLabel(g.servesDrive);
           if (drive) lines.push(`   drive: ${drive}`);

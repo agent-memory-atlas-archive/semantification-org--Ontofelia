@@ -7,7 +7,7 @@ import { createLogger, AgentConfig, ChannelType, ChannelBinding, MessageEnvelope
 import { SessionStore } from '@ontofelia/session-store';
 import { AgentRuntime, InitiativeService, LoggingNotificationSink, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
 import type { InitiativeSessionPort, NotificationChannelPort, NotificationSink } from '@ontofelia/agent-runtime';
-import { NotifyOwnerTool } from '@ontofelia/tools';
+import { NotifyOwnerTool, ListGoalsTool } from '@ontofelia/tools';
 import type { SessionOrigin } from '@ontofelia/core';
 import { resolveOwnerTarget } from './services/notificationTarget.js';
 import { MockProvider } from '@ontofelia/testkit';
@@ -254,6 +254,10 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   // is composed after the tool registry). getAllowedTools reads the registry
   // live, so a late registration is picked up on the next message.
   toolRegistry.register(new NotifyOwnerTool(notificationService));
+  // list_goals reads the same grounded goal summaries as /goals, per agent.
+  toolRegistry.register(new ListGoalsTool({
+    openGoals: async ({ agentId, sessionId }) => agents.get(agentId)?.openGoalSummaries(sessionId),
+  }));
   // Surface the "while you were away" digest on the next owner conversation.
   defaultAgent.setDigestSource(notificationService);
   // Use the real sink for initiative cycles only when a telegram channel exists;
