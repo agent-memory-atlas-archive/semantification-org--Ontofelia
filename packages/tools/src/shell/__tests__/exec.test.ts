@@ -270,6 +270,83 @@ describe('ExecTool', () => {
       expect(res.every((r) => r.success)).toBe(true);
     });
 
+    it('blocks two installs in the same pnpm workspace, root and a package dir', async () => {
+      const repo = mkdir('repo');
+      fs.writeFileSync(path.join(repo, 'pnpm-workspace.yaml'), "packages:\n  - 'packages/*'\n");
+      const pkg = path.join(repo, 'packages', 'x');
+      fs.mkdirSync(pkg, { recursive: true });
+      const tool = new ExecTool(new NoopSandboxAdapter());
+      const res = await Promise.all([
+        tool.execute({ command: 'pnpm install' }, mkctx(repo)),
+        tool.execute({ command: 'pnpm install' }, mkctx(pkg)),
+      ]);
+      expect(res.filter(blocked)).toHaveLength(1);
+    });
+
+    describe('buildLockKey', () => {
+      const real = (p: string) => fs.realpathSync(p);
+
+      it('shares the key between an npm/yarn workspaces root and a package dir', () => {
+        const repo = mkdir('npmws');
+        fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ workspaces: ['packages/*'] }));
+        const pkg = path.join(repo, 'packages', 'x');
+        fs.mkdirSync(pkg, { recursive: true });
+        expect(ExecTool.buildLockKey(pkg)).toBe(real(repo));
+        expect(ExecTool.buildLockKey(repo)).toBe(real(repo));
+      });
+
+      it('accepts the object form of workspaces', () => {
+        const repo = mkdir('yarnws');
+        fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ workspaces: { packages: ['a/*'] } }));
+        const pkg = path.join(repo, 'a', 'x');
+        fs.mkdirSync(pkg, { recursive: true });
+        expect(ExecTool.buildLockKey(pkg)).toBe(real(repo));
+      });
+
+      it('treats a .git file (git worktree) as the root', () => {
+        const repo = mkdir('wt');
+        fs.writeFileSync(path.join(repo, '.git'), 'gitdir: /somewhere/else\n');
+        const sub = path.join(repo, 'src', 'deep');
+        fs.mkdirSync(sub, { recursive: true });
+        expect(ExecTool.buildLockKey(sub)).toBe(real(repo));
+      });
+
+      it('treats a .git directory as the root', () => {
+        const repo = mkdir('clone');
+        fs.mkdirSync(path.join(repo, '.git'));
+        const sub = path.join(repo, 'src');
+        fs.mkdirSync(sub);
+        expect(ExecTool.buildLockKey(sub)).toBe(real(repo));
+      });
+
+      it('does not stop at a package.json without workspaces', () => {
+        const repo = mkdir('plainpkg');
+        fs.writeFileSync(path.join(repo, 'pnpm-workspace.yaml'), "packages:\n  - 'packages/*'\n");
+        const pkg = path.join(repo, 'packages', 'x');
+        fs.mkdirSync(pkg, { recursive: true });
+        fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ name: 'x' }));
+        expect(ExecTool.buildLockKey(pkg)).toBe(real(repo));
+      });
+
+      it('ignores an invalid package.json and keeps walking', () => {
+        const repo = mkdir('badjson');
+        fs.writeFileSync(path.join(repo, 'pnpm-workspace.yaml'), 'packages: []\n');
+        const pkg = path.join(repo, 'p');
+        fs.mkdirSync(pkg);
+        fs.writeFileSync(path.join(pkg, 'package.json'), '{ not json');
+        expect(ExecTool.buildLockKey(pkg)).toBe(real(repo));
+      });
+
+      it('falls back to the cwd realpath when no marker exists above it', () => {
+        const dir = mkdir('nomarker');
+        const sub = path.join(dir, 'sub');
+        fs.mkdirSync(sub);
+        // The temp root must not sit inside a repo or workspace, or this
+        // test (and the different-cwds test) would measure the wrong thing.
+        expect(ExecTool.buildLockKey(sub)).toBe(real(sub));
+      });
+    });
+
     it('does not block a non-build command next to a running build', async () => {
       const cwd = mkdir('mixed');
       const tool = new ExecTool(new NoopSandboxAdapter());

@@ -98,18 +98,55 @@ export class ExecTool implements ToolDefinition {
       .some((seg) => ExecTool.BUILD_SEGMENT_PATTERNS.some((re) => re.test(seg)));
   }
 
-  // Working directories that currently have an install/build running. Module
-  // level state, shared by every ExecTool instance in this process. It guards
-  // only within one process: a CLI run beside the gateway is not covered.
+  // Lock keys (workspace or repo roots) that currently have an install/build
+  // running. Module level state, shared by every ExecTool instance in this
+  // process. It guards only within one process: a CLI run beside the gateway
+  // is not covered.
   private static readonly activeBuilds = new Set<string>();
 
-  /** Lock key: the absolute working directory, symlinks resolved when it exists. */
+  /** True if `dir` is a workspace or repo root marker location. */
+  private static isRootMarkerDir(dir: string): boolean {
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return true;
+    // `.git` is a directory in a clone and a file in a git worktree.
+    if (fs.existsSync(path.join(dir, '.git'))) return true;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as unknown;
+      if (pkg && typeof pkg === 'object' && 'workspaces' in pkg) {
+        const ws = (pkg as { workspaces?: unknown }).workspaces;
+        if (ws && typeof ws === 'object') return true;
+      }
+    } catch {
+      // missing, unreadable or invalid package.json: not a marker
+    }
+    return false;
+  }
+
+  /**
+   * Lock key: the workspace or repo root of the working directory. The cwd is
+   * resolved (symlinks included) and the walk goes up to the first directory
+   * holding pnpm-workspace.yaml, a package.json with a `workspaces` field, or
+   * .git (directory or file). Without any marker the key is the cwd itself.
+   *
+   * Two runs from the root and from a package directory of one workspace touch
+   * the same node_modules and lockfile, so they must share one key. The
+   * consequence is conservative: two separate projects inside one git repo
+   * also share a lock. Over-locking is the accepted direction. Synchronous on
+   * purpose: the caller checks and acquires without an await in between.
+   */
   static buildLockKey(cwd: string): string {
     const abs = path.resolve(cwd);
+    let start = abs;
     try {
-      return fs.realpathSync(abs);
+      start = fs.realpathSync(abs);
     } catch {
-      return abs;
+      // cwd does not exist (yet): fall back to the resolved path
+    }
+    let dir = start;
+    for (;;) {
+      if (ExecTool.isRootMarkerDir(dir)) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) return start;
+      dir = parent;
     }
   }
 
