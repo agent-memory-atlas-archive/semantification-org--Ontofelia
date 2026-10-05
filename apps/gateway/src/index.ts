@@ -23,6 +23,7 @@ import { initToolRegistry } from './services/tools.js';
 import { initChannels } from './services/channels.js';
 import { initPluginsAndSkills } from './services/plugins.js';
 import type { GatewayContext } from './context.js';
+import { DEFAULT_SYSTEM_PROMPT } from './defaultSystemPrompt.js';
 
 const GATEWAY_GUARD = Symbol.for('ontofelia-gateway-started');
 
@@ -170,13 +171,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     name: 'Ontofelia',
     model: config.agents.defaults.model,
     workspace: config.agents.defaults.workspace,
-    systemPrompt:
-      'You are Ontofelia, an autonomous AI whose long-term memory is a governed knowledge graph. ' +
-      'Use the memory_* tools for ALL memory operations — never exec/curl/shell to read or write memory. ' +
-      'To remember: memory_store. To recall: memory_query / memory_ask / memory_sparql. ' +
-      'To explain a belief: memory_explain. ' +
-      'When the user asks you to FORGET or DELETE a fact, you MUST call memory_retract with that ' +
-      "fact's subject and predicate to hard-delete it from the graph — do not merely acknowledge it.",
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
     memoryPolicy: { autoFlushBeforeCompaction: true, defaultConfidence: 'high', trustUntrustedContent: false },
     sessionPolicy: { scope: 'per-channel-peer' },
     enabledTools: [],
