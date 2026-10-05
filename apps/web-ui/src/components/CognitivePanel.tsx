@@ -7,18 +7,20 @@ import {
   fetchCogEpisodes,
   fetchCogExplain,
   fetchCogGoals,
+  fetchCogInitiative,
   type CogCycleDetail,
   type CogCycleSummary,
   type CogEpisode,
   type CogExplanation,
   type CogGoal,
+  type CogInitiativeReport,
 } from '../lib/api';
 
 interface CognitivePanelProps {
   onClose: () => void;
 }
 
-type Tab = 'cycles' | 'goals' | 'episodes';
+type Tab = 'cycles' | 'goals' | 'episodes' | 'initiative';
 
 const card: React.CSSProperties = {
   border: '1px solid var(--color-border)',
@@ -58,6 +60,7 @@ export function CognitivePanel({ onClose }: CognitivePanelProps) {
   const [explanation, setExplanation] = useState<CogExplanation | null>(null);
   const [goals, setGoals] = useState<CogGoal[]>([]);
   const [episodes, setEpisodes] = useState<CogEpisode[]>([]);
+  const [initiative, setInitiative] = useState<CogInitiativeReport | null>(null);
   const [entityFilter, setEntityFilter] = useState('');
 
   useEffect(() => {
@@ -95,6 +98,8 @@ export function CognitivePanel({ onClose }: CognitivePanelProps) {
     } else if (next === 'goals') {
       if (!activeSessionId) return;
       void guard(() => fetchCogGoals(token, activeSessionId), setGoals);
+    } else if (next === 'initiative') {
+      void guard(() => fetchCogInitiative(token), setInitiative);
     } else {
       void guard(() => fetchCogEpisodes(token, entityFilter || undefined), setEpisodes);
     }
@@ -204,7 +209,7 @@ export function CognitivePanel({ onClose }: CognitivePanelProps) {
             flexShrink: 0,
           }}
         >
-          {(['cycles', 'goals', 'episodes'] as Tab[]).map((t) => {
+          {(['cycles', 'goals', 'episodes', 'initiative'] as Tab[]).map((t) => {
             const active = tab === t;
             return (
               <button
@@ -257,6 +262,8 @@ export function CognitivePanel({ onClose }: CognitivePanelProps) {
             />
           ) : tab === 'goals' ? (
             <GoalsView sessionId={activeSessionId} goals={goals} />
+          ) : tab === 'initiative' ? (
+            <InitiativeView report={initiative} />
           ) : (
             <EpisodesView
               episodes={episodes}
@@ -458,10 +465,68 @@ function GoalsView({ sessionId, goals }: { sessionId: string | null; goals: CogG
             </span>
           </div>
           <div style={mono}>{fmt(g.createdAt)}</div>
+          {g.nextAction && <div style={{ fontSize: 'var(--font-size-xs)' }}>next: {g.nextAction}</div>}
+          {g.waitingUntil && <div style={mono}>waiting until {fmt(g.waitingUntil)}</div>}
           {g.successCriterion && <div style={{ fontSize: 'var(--font-size-xs)' }}>✓ {g.successCriterion}</div>}
           {g.triggeredByEpisode && <div style={mono}>← {g.triggeredByEpisode}</div>}
         </div>
       ))}
+    </div>
+  );
+}
+
+function InitiativeView({ report }: { report: CogInitiativeReport | null }) {
+  if (!report) return <Empty text="No initiative data." />;
+  const { counters } = report;
+  return (
+    <div>
+      <div style={card}>
+        <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600 }}>
+          Initiative: {report.enabled ? 'ON' : 'OFF'} <span style={mono}>(flagInitiative)</span>
+        </div>
+        {counters && (
+          <div style={mono}>
+            {counters.inHour}/{counters.maxPerHour} in the last hour · {counters.inDay}/{counters.maxPerDay} in the
+            last 24h (caps are defaults)
+          </div>
+        )}
+      </div>
+
+      <div style={{ ...label, margin: 'var(--space-3) 0 var(--space-2)' }}>
+        Recent initiative cycles ({report.episodes.length})
+      </div>
+      {report.episodes.length === 0 ? (
+        <Empty text="None." />
+      ) : (
+        report.episodes.map((e, i) => (
+          <div key={`${e.at}-${i}`} style={card}>
+            <div style={mono}>
+              {fmt(e.at)}
+              {e.outcome && e.outcome !== 'success' ? ` · ${e.outcome}` : ''}
+            </div>
+            <div style={{ fontSize: 'var(--font-size-sm)' }}>{e.why}</div>
+          </div>
+        ))
+      )}
+
+      <div style={{ ...label, margin: 'var(--space-3) 0 var(--space-2)' }}>
+        Recent notifications ({report.notifications.length})
+      </div>
+      {report.notifications.length === 0 ? (
+        <Empty text="None." />
+      ) : (
+        report.notifications.map((n, i) => (
+          <div key={`${n.at}-${i}`} style={card}>
+            <div style={mono}>
+              {fmt(n.at)}
+              {n.priority ? ` · priority ${n.priority}` : ''}
+            </div>
+            <div style={{ fontSize: 'var(--font-size-sm)' }}>
+              {n.delivered ? 'delivered' : `suppressed: ${n.reason}`}
+            </div>
+          </div>
+        ))
+      )}
     </div>
   );
 }

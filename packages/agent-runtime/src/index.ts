@@ -248,6 +248,14 @@ function isHumanOwnerTurn(envelope: MessageEnvelope): boolean {
   return !['scheduler', 'cron', 'initiative'].includes(envelope.sender.id);
 }
 
+/** Structured /initiative report (see {@link AgentRuntime.initiativeReport}). */
+export interface InitiativeReport {
+  enabled: boolean;
+  counters: { inHour: number; maxPerHour: number; inDay: number; maxPerDay: number } | null;
+  episodes: Array<{ at: string; why: string; outcome: string | null }>;
+  notifications: Array<{ at: string; delivered: boolean; reason: string; priority: string | null }>;
+}
+
 export class AgentRuntime {
   public lifecycle: AgentLifecycle = 'created';
   private activeRuns = 0;
@@ -1431,61 +1439,90 @@ Users can use these commands:
   }
 
   /**
-   * Render the grounded /initiative report (docs §9): recent initiative episodes,
-   * recent notification episodes (sent/suppressed with reason), the rolling
-   * runaway-counter state vs the documented caps, and the flagInitiative state.
+   * Structured data behind the grounded /initiative report (docs §9): recent
+   * initiative episodes, recent notification episodes (delivered/suppressed with
+   * reason), the rolling runaway-counter state vs the documented caps, and the
+   * flagInitiative state. The chat command and the web panel both read this, so
+   * they cannot disagree. Undefined when no knowledge engine is configured.
    */
-  private async renderInitiativeReport(now: Date, limit: number): Promise<string> {
-    if (!this.knowledgeEngine) {
-      return 'Initiative state is unavailable (no knowledge engine configured).';
-    }
-    const flagOn = this.cognitiveConfig
+  async initiativeReport(now: Date = new Date(), limit = 10): Promise<InitiativeReport | undefined> {
+    if (!this.knowledgeEngine) return undefined;
+    const enabled = this.cognitiveConfig
       ? await this.cognitiveConfig.isInitiativeEnabled()
       : false;
-    const counters = await this.initiativeCountersForCommand(now);
+    const counts = await this.initiativeCountersForCommand(now);
     const initiativeEps = (await this.recentEpisodesByType('initiative', limit)) ?? [];
     const notifyEps = (await this.recentEpisodesByType('notification', limit)) ?? [];
 
-    const parts: string[] = [];
-    parts.push(`⚙️ Initiative: ${flagOn ? 'ON' : 'OFF'} (flagInitiative)`);
-    if (counters) {
-      parts.push(
-        `Runaway counter: ${counters.inHour}/${INITIATIVE_DEFAULT_MAX_PER_HOUR} in the last hour, ` +
-          `${counters.inDay}/${INITIATIVE_DEFAULT_MAX_PER_DAY} in the last 24h (caps are defaults).`,
-      );
-    }
-
-    if (initiativeEps.length === 0) {
-      parts.push('\nRecent initiative cycles: none.');
-    } else {
-      const lines = initiativeEps.map((e) => {
-        const when = `${humanizeRelative(e.occurredAt, now)} (${e.occurredAt})`;
-        const detail = e.payload ?? `${e.episodeType} episode`;
-        const outcome = e.outcome && e.outcome !== 'success' ? ` [${e.outcome}]` : '';
-        return `• ${when}: ${detail}${outcome}`;
-      });
-      parts.push(`\nRecent initiative cycles (${initiativeEps.length}):\n${lines.join('\n')}`);
-    }
-
-    if (notifyEps.length === 0) {
-      parts.push('\nRecent notifications: none.');
-    } else {
-      const lines = notifyEps.map((e) => {
-        const when = `${humanizeRelative(e.occurredAt, now)} (${e.occurredAt})`;
+    return {
+      enabled,
+      counters: counts
+        ? {
+            inHour: counts.inHour,
+            maxPerHour: INITIATIVE_DEFAULT_MAX_PER_HOUR,
+            inDay: counts.inDay,
+            maxPerDay: INITIATIVE_DEFAULT_MAX_PER_DAY,
+          }
+        : null,
+      episodes: initiativeEps.map((e) => ({
+        at: e.occurredAt,
+        why: e.payload ?? `${e.episodeType} episode`,
+        outcome: e.outcome ?? null,
+      })),
+      notifications: notifyEps.map((e) => {
         let reason = 'unknown';
-        let priority = '';
+        let priority: string | null = null;
         try {
           const p = JSON.parse(e.payload ?? '{}') as { reason?: string; priority?: string };
           if (p.reason) reason = p.reason;
-          if (p.priority) priority = ` (priority ${p.priority})`;
+          if (p.priority) priority = p.priority;
         } catch {
           /* payload not JSON — fall back to raw */
           if (e.payload) reason = e.payload;
         }
-        const sent = reason === 'sent' ? 'sent' : `suppressed: ${reason}`;
+        return { at: e.occurredAt, delivered: reason === 'sent', reason, priority };
+      }),
+    };
+  }
+
+  /** Render {@link initiativeReport} as the /initiative chat text. */
+  private async renderInitiativeReport(now: Date, limit: number): Promise<string> {
+    const report = await this.initiativeReport(now, limit);
+    if (!report) {
+      return 'Initiative state is unavailable (no knowledge engine configured).';
+    }
+    const { counters, episodes, notifications } = report;
+
+    const parts: string[] = [];
+    parts.push(`⚙️ Initiative: ${report.enabled ? 'ON' : 'OFF'} (flagInitiative)`);
+    if (counters) {
+      parts.push(
+        `Runaway counter: ${counters.inHour}/${counters.maxPerHour} in the last hour, ` +
+          `${counters.inDay}/${counters.maxPerDay} in the last 24h (caps are defaults).`,
+      );
+    }
+
+    if (episodes.length === 0) {
+      parts.push('\nRecent initiative cycles: none.');
+    } else {
+      const lines = episodes.map((e) => {
+        const when = `${humanizeRelative(e.at, now)} (${e.at})`;
+        const outcome = e.outcome && e.outcome !== 'success' ? ` [${e.outcome}]` : '';
+        return `• ${when}: ${e.why}${outcome}`;
+      });
+      parts.push(`\nRecent initiative cycles (${episodes.length}):\n${lines.join('\n')}`);
+    }
+
+    if (notifications.length === 0) {
+      parts.push('\nRecent notifications: none.');
+    } else {
+      const lines = notifications.map((n) => {
+        const when = `${humanizeRelative(n.at, now)} (${n.at})`;
+        const sent = n.delivered ? 'sent' : `suppressed: ${n.reason}`;
+        const priority = n.priority ? ` (priority ${n.priority})` : '';
         return `• ${when}: notification ${sent}${priority}`;
       });
-      parts.push(`\nRecent notifications (${notifyEps.length}):\n${lines.join('\n')}`);
+      parts.push(`\nRecent notifications (${notifications.length}):\n${lines.join('\n')}`);
     }
 
     return parts.join('\n');

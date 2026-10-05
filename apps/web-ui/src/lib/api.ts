@@ -210,6 +210,15 @@ export interface CogGoal {
   successCriterion?: string;
   deadline?: string;
   longTerm?: boolean;
+  nextAction?: string | null;
+  waitingUntil?: string | null;
+}
+
+export interface CogInitiativeReport {
+  enabled: boolean;
+  counters: { inHour: number; maxPerHour: number; inDay: number; maxPerDay: number } | null;
+  episodes: Array<{ at: string; why: string; outcome: string | null }>;
+  notifications: Array<{ at: string; delivered: boolean; reason: string; priority: string | null }>;
 }
 
 export interface CogExplainAction {
@@ -274,6 +283,10 @@ export function fetchCogGoals(token: string, sessionId: string): Promise<CogGoal
 export function fetchCogEpisodes(token: string, entity?: string, limit = 50): Promise<CogEpisode[]> {
   const q = entity ? `&entity=${encodeURIComponent(entity)}` : '';
   return cogFetch(`/cog/inspect/episodes?limit=${limit}${q}`, token);
+}
+
+export function fetchCogInitiative(token: string, limit = 10): Promise<CogInitiativeReport> {
+  return cogFetch(`/cog/inspect/initiative?limit=${limit}`, token);
 }
 
 export function fetchCogExplain(token: string, sessionId: string, cycleId: string): Promise<CogExplanation> {

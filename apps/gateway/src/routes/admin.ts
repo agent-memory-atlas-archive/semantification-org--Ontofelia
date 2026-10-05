@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { GatewayContext } from '../context.js';
 import { MessageEnvelope, resolveAgentId } from '@ontofelia/core';
+import { summarizeGoal } from '@ontofelia/agent-runtime';
 
 export default async function adminRoutes(fastify: FastifyInstance, ctx: GatewayContext) {
   const { agents, scheduler, webhookRegistry, sandboxAdapter,
@@ -72,7 +73,12 @@ export default async function adminRoutes(fastify: FastifyInstance, ctx: Gateway
     if (!request.query.sessionId) return reply.code(400).send({ error: 'sessionId required' });
     const ins = await agent.cogInspector();
     if (!ins) return reply.code(403).send({ error: 'Cognitive debug panel disabled' });
-    return ins.listGoals(request.query.sessionId);
+    const now = new Date();
+    const goals = await ins.listGoals(request.query.sessionId);
+    return goals.map((g) => {
+      const s = summarizeGoal(g, now);
+      return { ...g, nextAction: s.nextAction, waitingUntil: s.waitingUntil };
+    });
   });
 
   fastify.get('/api/cog/inspect/episodes', async (
@@ -85,6 +91,22 @@ export default async function adminRoutes(fastify: FastifyInstance, ctx: Gateway
     if (!ins) return reply.code(403).send({ error: 'Cognitive debug panel disabled' });
     const limit = request.query.limit ? Number(request.query.limit) : undefined;
     return ins.listEpisodes(request.query.entity, limit);
+  });
+
+  // Same data as the owner's /initiative chat command (flag, runaway counters,
+  // recent initiative cycles, notifications with suppression reason).
+  fastify.get('/api/cog/inspect/initiative', async (
+    request: FastifyRequest<{ Querystring: { agentId?: string; limit?: string } }>,
+    reply,
+  ) => {
+    const agent = agents.get(resolveAgentId(request.query.agentId));
+    if (!agent) return reply.code(404).send({ error: 'Agent not found' });
+    const ins = await agent.cogInspector();
+    if (!ins) return reply.code(403).send({ error: 'Cognitive debug panel disabled' });
+    const limit = request.query.limit ? Number(request.query.limit) : undefined;
+    const report = await agent.initiativeReport(new Date(), limit);
+    if (!report) return reply.code(503).send({ error: 'Cognitive architecture not active' });
+    return report;
   });
 
   fastify.get('/api/cog/inspect/explain', async (
