@@ -10,6 +10,18 @@ node apps/cli/dist/index.js onboard
 node apps/cli/dist/index.js gateway start
 ```
 
+## Updating
+
+For a self-hosted install, updating is an operator action. The agent does not rebuild or update itself.
+
+```bash
+cd /path/to/ontofelia     # the install directory
+git pull
+ontofelia rebuild
+```
+
+`ontofelia rebuild` stops the gateway, runs `pnpm install --frozen-lockfile` if the lockfile changed since the last install, builds all packages and restarts the gateway. If the install fails, nothing is built and the gateway stays stopped; fix the problem, then run `ontofelia rebuild` again. Configuration and data under `~/.ontofelia` are not touched. Use `ontofelia rebuild --no-restart` to build without starting the gateway.
+
 ## Keeping the gateway running
 
 `ontofelia gateway start` backgrounds the gateway (PID file `~/.ontofelia/gateway.pid`, logs in `~/.ontofelia/logs/gateway.log`), but on its own nothing restarts it after a crash or a reboot. Pick **one** of the options below — running two supervisors against the same instance is asking for trouble.

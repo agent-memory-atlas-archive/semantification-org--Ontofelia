@@ -290,7 +290,7 @@ ontofelia daemon uninstall
 ```bash
 ontofelia data-reset [--yes]               # Delete conversations + knowledge graph; keep LLM/Telegram settings
 ontofelia reset [--yes] [--keep-config]    # Factory reset: all data, re-seeds from bootstrap
-ontofelia rebuild [--no-restart]           # Recompile all packages and restart the gateway
+ontofelia rebuild [--no-restart]           # Install changed dependencies, recompile all packages, restart the gateway
 ontofelia uninstall [--yes] [--keep-data]  # Remove Ontofelia from this system
 ```
 
