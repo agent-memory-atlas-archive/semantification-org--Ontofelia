@@ -98,10 +98,20 @@ export type ToolEpisodeRecorder = (ev: ToolEpisodeEvent) => void;
  */
 export type GoalContextProvider = (sessionId: string) => Promise<string | undefined>;
 
+/**
+ * Records the inbound `message-received` episode of a conversational turn
+ * before the core runs its tools, and returns its IRI (undefined in initiative
+ * mode, or when the write failed). Idempotent per cycle. The core calls it once
+ * the session id is resolved and after the goal hook, so the episode still
+ * carries the turn's active goal.
+ */
+export type InboundEpisodeRecorder = (sessionId: string) => Promise<string | undefined>;
+
 /** The delegated core; receives the tool sink and the goal-context hook. */
 export type CoreFn<T> = (
   recordTool: ToolEpisodeRecorder,
   prepareGoals: GoalContextProvider,
+  recordInbound: InboundEpisodeRecorder,
 ) => Promise<T>;
 
 export interface RunCycleOptions {
@@ -261,11 +271,32 @@ export class CycleManager {
       }
     };
 
+    // The inbound episode is written ahead of the core (conversational turns
+    // only) so tools can reference it as a goal mandate. persist() reuses it
+    // instead of writing a second one.
+    let inboundEpisodeUri: string | undefined;
+    const recordInbound: InboundEpisodeRecorder = async (sessionId) => {
+      if (mode !== 'conversational') return undefined;
+      if (inboundEpisodeUri) return inboundEpisodeUri;
+      try {
+        inboundEpisodeUri = await this.appendInboundEpisode(
+          envelope,
+          sessionId,
+          cycleId,
+          startedAt,
+          activeGoalUri,
+        );
+      } catch (e) {
+        this.onError?.(e);
+      }
+      return inboundEpisodeUri;
+    };
+
     let result: T;
     let coreError: unknown;
     let status: 'completed' | 'aborted' = 'completed';
     try {
-      result = await core(recordTool, prepareGoals);
+      result = await core(recordTool, prepareGoals, recordInbound);
     } catch (e) {
       status = 'aborted';
       coreError = e;
@@ -305,6 +336,7 @@ export class CycleManager {
         options.selfModelEnabled === true,
         mode,
         options.initiativeGoalUri,
+        inboundEpisodeUri,
       );
     } catch (persistErr) {
       this.onError?.(persistErr);
@@ -504,6 +536,7 @@ export class CycleManager {
     selfModelEnabled = false,
     mode: 'conversational' | 'initiative' = 'conversational',
     initiativeGoalUri?: string,
+    inboundEpisodeUri?: string,
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri);
@@ -517,6 +550,7 @@ export class CycleManager {
       responseText,
       toolEvents,
       activeGoalUri,
+      inboundEpisodeUri,
     );
     // Initiative episode (docs/initiative-architecture.md §6): one auditable
     // record per unattended cycle — trigger, outcome and reason. Written only in
@@ -850,6 +884,35 @@ export class CycleManager {
   }
 
   /**
+   * C2 — append the `message-received` perception episode (actor = sender,
+   * payload = text, transcriptRef = session). D4 — backfills the turn's active
+   * goal when known.
+   */
+  private async appendInboundEpisode(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    occurredAt: Date,
+    activeGoalUri?: string,
+  ): Promise<string> {
+    const channel = envelope.channel ? String(envelope.channel) : undefined;
+    const actor = envelope.sender?.id
+      ? `urn:entity:agent-sender:${encodeURIComponent(envelope.sender.id)}`
+      : undefined;
+    return new EpisodicMemory(this.triplestore, this.agentId).append({
+      episodeType: 'message-received',
+      occurredAt,
+      sessionId,
+      cycleId,
+      channel,
+      actor,
+      payload: envelope.text || '',
+      transcriptRef: `${sessionId}.jsonl`,
+      partOfGoal: activeGoalUri,
+    });
+  }
+
+  /**
    * Episodic memory + retrieval (Phase C, C2 + C4 + the response half of C3).
    *
    *  - Phase 1 records a `message-received` episode (actor = sender, payload =
@@ -872,27 +935,18 @@ export class CycleManager {
     responseText?: string,
     toolEvents: ToolEpisodeEvent[] = [],
     activeGoalUri?: string,
+    inboundEpisodeUri?: string,
   ): Promise<{ retrievalHits: number }> {
     let retrievalHits = 0;
     const em = new EpisodicMemory(this.triplestore, this.agentId);
     const text = envelope.text || '';
     const channel = envelope.channel ? String(envelope.channel) : undefined;
-    const actor = envelope.sender?.id
-      ? `urn:entity:agent-sender:${encodeURIComponent(envelope.sender.id)}`
-      : undefined;
 
-    // C2 — perception episode. D4 — backfill the turn's active goal.
-    const perceptionEpUri = await em.append({
-      episodeType: 'message-received',
-      occurredAt: startedAt,
-      sessionId,
-      cycleId,
-      channel,
-      actor,
-      payload: text,
-      transcriptRef: `${sessionId}.jsonl`,
-      partOfGoal: activeGoalUri,
-    });
+    // C2 — perception episode (already written ahead of the core on a
+    // conversational turn; see runCycle).
+    const perceptionEpUri =
+      inboundEpisodeUri ??
+      (await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri));
 
     // C4 — pull relevant *past* episodes into the retrieval buffer (excluding
     // the one we just wrote for this turn).

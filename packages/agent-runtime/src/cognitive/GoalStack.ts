@@ -200,7 +200,7 @@ export class GoalStack {
    * churn), or beyond the sanity ceiling (design B1/M1). Throws a clear error so
    * a bad interval is refused at write time, never at the next wake.
    */
-  private validateWakeEvery(wakeEvery: string): void {
+  validateWakeEvery(wakeEvery: string): void {
     const ms = iso8601DurationToMs(wakeEvery); // throws on bad grammar
     if (ms < this.minWakeIntervalMs) {
       throw new Error(
@@ -558,9 +558,8 @@ export class GoalStack {
    */
   async migrateLongterm(now: Date = new Date()): Promise<number> {
     const session = this.sessionGraphUri();
-    const longterm = this.longtermGraphUri();
     this.registry.assertWritable(session);
-    this.registry.assertWritable(longterm);
+    this.registry.assertWritable(this.longtermGraphUri());
 
     const all = await this.readGraph(session);
     const eligible = all.filter(
@@ -569,18 +568,50 @@ export class GoalStack {
         g.longTerm === true ||
         (g.deadline !== undefined && Date.parse(g.deadline) > now.getTime()),
     );
-    if (eligible.length === 0) return 0;
-
-    for (const g of eligible) {
-      // A graph move: copy every triple of the goal, then delete the originals.
-      await this.triplestore.update(`
-        INSERT { GRAPH <${longterm}> { <${g.uri}> ?p ?o } }
-        WHERE  { GRAPH <${session}> { <${g.uri}> ?p ?o } }`);
-      await this.triplestore.update(`
-        DELETE { GRAPH <${session}> { <${g.uri}> ?p ?o } }
-        WHERE  { GRAPH <${session}> { <${g.uri}> ?p ?o } }`);
-    }
+    for (const g of eligible) await this.promoteToLongterm(g.uri);
     return eligible.length;
+  }
+
+  /**
+   * Move one goal from this session's graph to the longterm graph, preserving
+   * URI and provenance (a graph move: copy every triple, then delete the
+   * originals). Returns false when the goal is not in the session graph (it is
+   * already longterm, or unknown); the move is the same one `migrateLongterm`
+   * performs at session end.
+   */
+  async promoteToLongterm(goalId: GoalId): Promise<boolean> {
+    const session = this.sessionGraphUri();
+    const longterm = this.longtermGraphUri();
+    this.registry.assertWritable(session);
+    this.registry.assertWritable(longterm);
+    const res = await this.triplestore.query(`
+      SELECT ?p WHERE { GRAPH <${session}> { <${goalId}> <${COGT}goalId> ?p } } LIMIT 1`);
+    if ((res.bindings?.length ?? 0) === 0) return false;
+    await this.triplestore.update(`
+      INSERT { GRAPH <${longterm}> { <${goalId}> ?p ?o } }
+      WHERE  { GRAPH <${session}> { <${goalId}> ?p ?o } }`);
+    await this.triplestore.update(`
+      DELETE { GRAPH <${session}> { <${goalId}> ?p ?o } }
+      WHERE  { GRAPH <${session}> { <${goalId}> ?p ?o } }`);
+    return true;
+  }
+
+  /**
+   * Point a goal at the inbound-utterance episode that mandates it (replaces any
+   * earlier mandate). The write does not validate the episode: callers check
+   * {@link isMandateValid} first, and the wake path re-checks it on every wake.
+   */
+  async setMandate(goalId: GoalId, mandatedBy: string, now: Date = new Date()): Promise<void> {
+    const graph = await this.graphOf(goalId);
+    if (!graph) return;
+    this.registry.assertWritable(graph);
+    await this.replaceOne(graph, goalId, `${COGT}mandatedBy`, `<${mandatedBy}>`);
+    await this.replaceOne(
+      graph,
+      goalId,
+      `${COGT}updatedAt`,
+      `"${now.toISOString()}"^^<${XSD}dateTime>`,
+    );
   }
 
   /** Replace (delete-then-insert) a single-valued predicate on a goal. */

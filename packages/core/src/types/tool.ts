@@ -67,6 +67,14 @@ export interface ToolContext {
    */
   unattended?: boolean;
   /**
+   * IRI of the `message-received` episode recorded for the inbound message that
+   * started THIS turn, when the runtime has recorded one (only on the cycle
+   * manager path of a conversational turn). It is the only value a goal mandate
+   * may point to (docs/initiative-architecture.md §5.1); absent means no
+   * mandate can be given this turn.
+   */
+  inboundEpisodeUri?: string;
+  /**
    * Cancellation signal wired to the executor's per-call timeout. When a tool
    * exceeds its `timeoutMs`, the executor aborts this signal so long-running
    * work (child processes, network requests) can actually stop instead of

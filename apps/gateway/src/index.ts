@@ -7,7 +7,7 @@ import { createLogger, AgentConfig, ChannelType, ChannelBinding, MessageEnvelope
 import { SessionStore } from '@ontofelia/session-store';
 import { AgentRuntime, InitiativeService, LoggingNotificationSink, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
 import type { InitiativeSessionPort, NotificationChannelPort, NotificationSink } from '@ontofelia/agent-runtime';
-import { NotifyOwnerTool, ListGoalsTool } from '@ontofelia/tools';
+import { NotifyOwnerTool, ListGoalsTool, ArmGoalTool } from '@ontofelia/tools';
 import type { SessionOrigin } from '@ontofelia/core';
 import { resolveOwnerTarget } from './services/notificationTarget.js';
 import { MockProvider } from '@ontofelia/testkit';
@@ -318,6 +318,13 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     notificationSink,
     session: initiativeSessionPort,
   });
+
+  // arm_goal gives an owner-requested goal a mandate and a wake, then schedules
+  // the wake through the InitiativeService (docs/initiative-architecture.md §9).
+  toolRegistry.register(new ArmGoalTool({
+    arm: async (req) =>
+      agents.get(req.agentId)?.armGoal(req, (goal) => initiativeService.registerGoalWake(goal)),
+  }));
 
   scheduler.onJob(async (job) => {
     // Initiative wakes are routed to the InitiativeService, which enforces the

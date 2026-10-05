@@ -9,6 +9,7 @@ export * from './utility/cron.js';
 export * from './utility/PdfReadTool.js';
 export * from './channel/notify_owner.js';
 export * from './cognitive/list_goals.js';
+export * from './cognitive/arm_goal.js';
 export * from './shell/exec.js';
 export * from './filesystem/fs_read.js';
 export * from './filesystem/fs_write.js';

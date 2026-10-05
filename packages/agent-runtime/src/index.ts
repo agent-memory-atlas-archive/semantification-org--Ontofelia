@@ -14,7 +14,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
-import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider } from './cognitive/CycleManager.js';
+import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder } from './cognitive/CycleManager.js';
+import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
 import { CognitiveConfig } from './cognitive/CognitiveConfig.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
 import { CogHealth, type CogHealthReport } from './cognitive/CogHealth.js';
@@ -48,6 +49,8 @@ export type {
   Clock,
 } from './cognitive/InitiativeService.js';
 export { GoalStack, addIso8601Duration } from './cognitive/GoalStack.js';
+export { armGoal, OWNER_REQUESTED_WORK } from './cognitive/armGoal.js';
+export type { ArmGoalRequest, ArmGoalResult, ArmGoalDeps } from './cognitive/armGoal.js';
 export type { Goal, GoalInput, GoalStatus } from './cognitive/GoalStack.js';
 export { summarizeGoal, orderGoals, isOpenGoal, nextAction } from './cognitive/goalSummary.js';
 export type { GoalSummary } from './cognitive/goalSummary.js';
@@ -835,6 +838,7 @@ You are Ontofelia, an autonomous AI agent with full host access.
 ### Your Tools
 - **self_inspect**: Use this tool ALWAYS when you are asked about your model, config, system, or architecture. Actions: config, system, architecture, source.
 - **list_goals**: When asked what you are planning or working on, call this tool and answer only from its result; if it returns no goals, say you have no open goals.
+- **arm_goal**: Use only when the owner explicitly asks you to work on something later or regularly; it gives a goal a wake time.
 - **exec**: Run terminal commands directly on the host. You may install software (sudo apt-get install -y), manage files, and start/stop processes.
 - **web_fetch**: Read webpages as plain text. Useful for research and link checks.
 - **cron_manage**: Create cron jobs to wake yourself at specific times. This lets you handle recurring tasks automatically.
@@ -1001,9 +1005,10 @@ Users can use these commands:
     // caller must not be able to relay text into the owner's channel (H2 —
     // owner-harassment / injection vector). Hide it from non-owner senders
     // (belt); the tool also refuses such callers defensively (suspenders).
-    // list_goals exposes internal goal state: owner-only, hidden likewise.
+    // list_goals exposes internal goal state and arm_goal changes it: owner-only,
+    // hidden likewise (arm_goal also refuses non-owners when executed).
     if (!envelope.sender.isOwner) {
-      return allowed.filter((t) => t.name !== 'notify_owner' && t.name !== 'list_goals');
+      return allowed.filter((t) => t.name !== 'notify_owner' && t.name !== 'list_goals' && t.name !== 'arm_goal');
     }
     return allowed;
   }
@@ -1113,7 +1118,7 @@ Users can use these commands:
         return await this.cycleManager.runCycle(
           envelope,
           (recordTool, prepareGoals) =>
-            this.runCore(envelope, recordTool, prepareGoals, INITIATIVE_TOOL_ROUNDS),
+            this.runCore(envelope, recordTool, prepareGoals, undefined, INITIATIVE_TOOL_ROUNDS),
           (r) => r.sessionId,
           (r) => r.text,
           {
@@ -1138,7 +1143,7 @@ Users can use these commands:
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
         return await this.cycleManager.runCycle(
           envelope,
-          (recordTool, prepareGoals) => this.runCore(envelope, recordTool, prepareGoals),
+          (recordTool, prepareGoals, recordInbound) => this.runCore(envelope, recordTool, prepareGoals, recordInbound),
           (r) => r.sessionId,
           (r) => r.text,
           {
@@ -1316,6 +1321,29 @@ Users can use these commands:
     const gs = this.goalStackFor(sessionId);
     if (!gs) return undefined;
     return gs.list();
+  }
+
+  /**
+   * Arm a goal for initiative on behalf of the owner (the `arm_goal` tool's port;
+   * docs/initiative-architecture.md §9). `registerWake` is the gateway's
+   * InitiativeService scheduling call. Undefined when no knowledge engine is
+   * configured.
+   */
+  async armGoal(
+    req: ArmGoalRequest,
+    registerWake: (goal: Goal) => Promise<void>,
+  ): Promise<ArmGoalResult | undefined> {
+    const goalStack = this.goalStackFor(req.sessionId);
+    if (!goalStack) return undefined;
+    return armGoal(
+      {
+        goalStack,
+        registerWake,
+        initiativeEnabled: async () =>
+          (await this.cognitiveConfig?.isInitiativeEnabled().catch(() => false)) ?? false,
+      },
+      req,
+    );
   }
 
   /**
@@ -1603,6 +1631,7 @@ Users can use these commands:
     envelope: MessageEnvelope,
     recordTool?: ToolEpisodeRecorder,
     prepareGoals?: GoalContextProvider,
+    recordInbound?: InboundEpisodeRecorder,
     maxRounds: number = MAX_TOOL_ROUNDS,
   ): Promise<AgentResponse> {
       const ctx = await this.buildContext(envelope);
@@ -1623,6 +1652,11 @@ Users can use these commands:
           };
         }
       }
+
+      // Record this turn's inbound-message episode before any tool runs (cycle
+      // manager path, conversational turns only). Its IRI goes on the tool
+      // context: it is the only thing a goal mandate may point to.
+      const inboundEpisodeUri = recordInbound ? await recordInbound(session.sessionId) : undefined;
 
       // Save user message to transcript
       await this.sessionStore.appendTranscript(session.sessionId, {
@@ -1653,6 +1687,7 @@ Users can use these commands:
 
       let rounds = 0;
       const toolContext = this.buildToolContext(session, envelope, resolvedWorkspace);
+      if (inboundEpisodeUri) toolContext.inboundEpisodeUri = inboundEpisodeUri;
 
       while (response.finishReason === 'tool_calls' && rounds < maxRounds) {
         rounds++;

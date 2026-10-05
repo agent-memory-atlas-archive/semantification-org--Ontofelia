@@ -17,7 +17,7 @@ The numbering is stable on purpose:
 | §6 | The initiative cycle | `CycleManager.ts`, `packages/agent-runtime/src/index.ts` |
 | §7 | Owner notification | `NotificationService.ts`, `notify_owner.ts` |
 | §8 | Tool restrictions and privacy for unattended cycles | `initiativeTools.ts`, `ToolExecutor.ts` |
-| §9 | Observability | `/goals`, `/initiative`, `list_goals`, inspect API, web panel |
+| §9 | Observability and arming | `/goals`, `/initiative`, `list_goals`, `arm_goal`, inspect API, web panel |
 | §10 | Not implemented / limits | n/a |
 | §11 | Source map | n/a |
 | §12 | Recorded design decisions | n/a |
@@ -99,7 +99,8 @@ triples):
 
 - `flagCycleManager`: routes conversational messages through `CycleManager`.
   Only then are `message-received` episodes written, and those are the only
-  thing a mandate can validly point to (§5.1).
+  thing a mandate can validly point to (§5.1). `arm_goal` (§9) therefore
+  refuses to work without this flag.
 - `flagGoalStack`: manages goals during conversational cycles. Not required for
   initiative cycles, which always run with goal management on (§6).
 - `flagDebugPanel`: `/cog debug on|off`. Required for the `/api/cog/inspect/*`
@@ -138,7 +139,7 @@ Everything is composed in `apps/gateway/src/index.ts`:
 4. `InitiativeService.recoverOnStart()` runs once at boot, best effort (§5.2).
 
 ```
-goal (wakeAt, mandatedBy)            -- written by something outside this code, see §10
+goal (wakeAt, mandatedBy)            -- written by the owner-only arm_goal tool, see §9
         |
         v
 InitiativeService.registerGoalWake --> one-time job "initiative-<goalUri>"
@@ -205,7 +206,8 @@ and `onWake` reports `goal-missing`. Goals reach the long-term graph through
 `GoalStack.migrateLongterm` (at `/new` or `/cog migrate`, which act only when
 `flagGoalStack` is on, for goals that are resolved, flagged `cogt:longTerm true`,
 or have a future deadline) or by being
-written there directly.
+written there directly. The `arm_goal` tool (§9) uses
+`GoalStack.promoteToLongterm`, the single-goal form of that move.
 
 ### 5.2 Scheduling and downtime recovery
 
@@ -380,7 +382,7 @@ escape hatch.
 
 **Privacy and data exposure.**
 
-- `list_goals`, `/goals` and `/initiative` are owner-only; the digest is shown
+- `list_goals`, `arm_goal`, `/goals` and `/initiative` are owner-only; the digest is shown
   only to the owner; `notify_owner` is hidden from non-owners.
 - An initiative cycle can read: the knowledge graph (through the three memory
   read tools), and the file system and the web through `fs_read`, `fs_list`,
@@ -422,6 +424,52 @@ the current step.
 built by the same `summarizeGoal` as `/goals`, so the two cannot disagree. It
 is in the initiative allow-list, so an unattended cycle can read its own goals.
 
+**`arm_goal`** (tool, owner-only, writes). The one supported way to give a goal
+a mandate and a wake from normal use. Code: `packages/tools/src/cognitive/arm_goal.ts`
+(the tool) and `packages/agent-runtime/src/cognitive/armGoal.ts` (the goal writes);
+the gateway wires them to `InitiativeService`.
+
+- *Input.* An existing open goal (`goal`: label or IRI, matched against the same
+  list as `/goals` and `list_goals`) or a new goal (`newGoal`: label, optional
+  `priority`); exactly one of `wakeAt` (ISO-8601 timestamp with time zone, in
+  the future) or `wakeIn` (ISO-8601 duration such as `PT2H`); optional `every`
+  (recurring duration). `every` goes through the same `GoalStack` validation as
+  any other write: grammar, minimum interval (the per-goal cooldown) and
+  ceiling (§5.1); a refused interval writes nothing. An existing goal that is
+  not given `every` keeps its own interval. A proposed goal is activated; a
+  blocked goal, the implicit "Respond to the user" goal and a closed goal are
+  refused. A new goal gets the type `cogt:OwnerRequestedWork`, priority 0.6 by
+  default, and `cogt:longTerm true`.
+- *Mandate.* The episode of the owner's current message. `CycleManager` writes
+  that `message-received` episode before the tool loop of a conversational turn
+  (it used to write it only afterwards, when the IRI could not be known) and
+  puts its IRI on the tool context (`inboundEpisodeUri`); persistence reuses it,
+  so there is still exactly one episode per turn. The tool never mints a mandate:
+  it passes this IRI, and `armGoal` checks `GoalStack.isMandateValid` before any
+  write. The episode exists only on the cycle manager path, so without
+  `flagCycleManager`, and on streamed replies, the tool refuses and names the
+  flag; it does not switch any flag on. Initiative cycles record no such
+  episode ahead of the tool loop.
+- *Writes.* A new goal is pushed with mandate and wake and then moved with
+  `GoalStack.promoteToLongterm`; an existing goal gets `GoalStack.setMandate` and
+  `GoalStack.setWake` and is moved the same way, keeping its IRI. Afterwards the
+  goal must be readable in the long-term graph, otherwise no wake is scheduled.
+- *Scheduling.* The gateway passes `InitiativeService.registerGoalWake`, the same
+  call the wake path uses (§5.2), so the job is `initiative-<goalUri>`. If
+  scheduling fails the wake stays stored and is picked up by `recoverOnStart`
+  at the next gateway start, and the tool says so.
+- *Gating.* Owner only: hidden from non-owner senders in tool advertisement
+  and refused when executed. Not in `INITIATIVE_ALLOWED_TOOLS`, so the executor
+  denies it in an unattended cycle, and the tool also refuses when
+  `context.unattended` is set. An unattended cycle can therefore never arm a
+  goal for itself.
+- *Output.* What was armed, the next wake time, the recurring interval if any,
+  and, when `flagInitiative` is off, a reminder that the wake will not fire until
+  `/initiative on` (and that a wake falling due while the flag is off is
+  consumed, §10).
+- *Prompt.* The system prompt tells the agent to use it only when the owner
+  explicitly asks for work later or regularly.
+
 **`GET /api/cog/inspect/initiative`** (gateway, bearer token). Returns the
 `InitiativeReport` JSON (`enabled`, `counters`, `episodes`, `notifications`)
 from `AgentRuntime.initiativeReport`, the same function behind `/initiative`.
@@ -444,20 +492,21 @@ tool calls with rule `initiative-restricted-tool`.
 
 What the code in this repository does not do, stated plainly:
 
-- **No goal receives a mandate or a wake automatically, and no tool, command or
-  API sets them.** `mandatedBy`, `wakeAt` and `wakeEvery` are written only by
-  `GoalStack.push` and `GoalStack.setWake`, and in production code nothing
-  outside `GoalStack` and `InitiativeService` calls them with a mandate. In the
-  conversational flow the cycle manager creates goals only for a message intent
-  (without wake policy) or the implicit "Respond to the user" goal. The only way
-  to create a mandated waking goal today is to call the `GoalStack` API (or
-  write the triples) from outside the running agent. Until a supported way
-  exists, initiative cycles cannot be started from normal use.
-- **No tool lets an agent change its goals.** There is no goal-writing tool
-  in the registry, and in production code no caller of `GoalStack.setStatus`
-  or `GoalStack.setStep`. The initiative envelope asks the agent to "update its
-  status/next step", but an unattended cycle has no allow-listed tool that can
-  do it; it can only read goals and notify.
+- **No goal receives a mandate or a wake automatically.** The only way from
+  normal use is the owner-only `arm_goal` tool (§9), which the agent may call
+  only when the owner asks for it in the current message and which needs
+  `flagCycleManager`. The cycle manager itself still creates goals only for a
+  message intent (without wake policy) or the implicit "Respond to the user"
+  goal. A wake needs a further `/initiative on` before it fires.
+- **No tool lets an unattended cycle change its goals.** `arm_goal` is the only
+  goal-writing tool and it is refused in unattended cycles; in production code
+  there is still no caller of `GoalStack.setStatus` other than `arm_goal`
+  activating a proposed goal, and none of `GoalStack.setStep`. The initiative
+  envelope asks the agent to "update its status/next step", but an unattended
+  cycle has no allow-listed tool that can do it; it can only read goals and
+  notify.
+- **`arm_goal` cannot clear a recurring interval.** Re-arming a recurring goal
+  keeps its `every` unless a new one is given.
 - **The mandate proves "inbound human utterance", not "owner".** No owner bit is
   stored on episodes (§5.1).
 - **Mandated goals must be in the long-term goal graph** to be seen by the wake
@@ -504,7 +553,9 @@ What the code in this repository does not do, stated plainly:
   `packages/tools/src/utility/cron.ts`
 - Commands, reports, digest: `packages/agent-runtime/src/index.ts`,
   `packages/agent-runtime/src/cognitive/goalSummary.ts`,
-  `packages/tools/src/cognitive/list_goals.ts`
+  `packages/tools/src/cognitive/list_goals.ts`,
+  `packages/tools/src/cognitive/arm_goal.ts`,
+  `packages/agent-runtime/src/cognitive/armGoal.ts`
 - Gateway wiring and inspect routes: `apps/gateway/src/index.ts`,
   `apps/gateway/src/routes/admin.ts`
 - Web panel: `apps/web-ui/src/components/CognitivePanel.tsx`
