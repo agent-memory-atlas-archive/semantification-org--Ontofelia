@@ -34,3 +34,4 @@ export * from './sparql/scopeGuard.js';
 export * from './ingestion/VaultNoteMapper.js';
 export * from './ingestion/VaultImporter.js';
 export * from './export/VaultExporter.js';
+export * from './adapters/QueryExecutor.js';

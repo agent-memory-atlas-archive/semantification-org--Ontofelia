@@ -293,6 +293,7 @@ Run a read-only SPARQL query. Same bearer-token authentication as the other `/ap
 - Every triple pattern must be inside a `GRAPH <iri> { ... }` pattern, unless the query has a `FROM <iri>` clause that defines the default graph; otherwise `400`.
 - `GRAPH ?var` patterns and any user or session graph (`urn:ontofelia:user:*`, `urn:ontofelia:session:*`, in `GRAPH`, `FROM` or `FROM NAMED`) are rejected with `403`.
 - `SELECT` returns at most 1000 rows; `truncated` is `true` when more matched.
+- Queries have a deadline, `memory.sparqlTimeoutMs` (default `5000`, clamped to 100..60000 ms). A query that exceeds it is stopped and answered with `504` `{ "error": "Query exceeded the time limit of N ms" }`. With the embedded Oxigraph backend the query runs in a worker thread against a replica of the persisted dataset (reloaded when the data file changes), one query at a time, so a runaway query does not block the gateway; the deadline starts when evaluation starts, not while queued. Other backends run in process and cannot be interrupted (Fuseki aborts its request after 30 s).
 
 Response for `SELECT`: `{ "type": "bindings", "variables": ["s"], "bindings": [{ "s": { "type": "uri", "value": "..." } }], "truncated": false }`. Response for `ASK`: `{ "type": "boolean", "boolean": true }`.
 

@@ -5,6 +5,8 @@ import { sparqlTripleLine } from '../utils/TripleSyntax.js';
 export class FusekiAdapter implements TriplestoreAdapter {
   readonly backend = 'fuseki';
   status: 'stopped' | 'starting' | 'running' | 'error' = 'stopped';
+  /** Client-side cap for one query request; matches the `Timeout` header sent with it. */
+  static readonly QUERY_TIMEOUT_MS = 30000;
   private config!: TriplestoreConfig;
 
   async initialize(config: TriplestoreConfig): Promise<void> {
@@ -50,9 +52,11 @@ export class FusekiAdapter implements TriplestoreAdapter {
       headers: {
         'Accept': accept,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Timeout': '30000'
+        'Timeout': String(FusekiAdapter.QUERY_TIMEOUT_MS)
       },
-      body: params.toString()
+      body: params.toString(),
+      // Client-side cap matching the server-side Timeout header (30 s).
+      signal: AbortSignal.timeout(FusekiAdapter.QUERY_TIMEOUT_MS)
     });
 
     if (!res.ok) {

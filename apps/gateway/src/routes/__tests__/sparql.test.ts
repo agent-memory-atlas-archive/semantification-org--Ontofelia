@@ -3,7 +3,7 @@ import Fastify, { FastifyInstance } from 'fastify';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { OxigraphAdapter } from '@ontofelia/semantic-memory';
+import { OxigraphAdapter, InProcessQueryExecutor } from '@ontofelia/semantic-memory';
 import type { SparqlResult, RdfTerm } from '@ontofelia/core';
 import { startGateway } from '../../index.js';
 import { getDefaultConfig } from '@ontofelia/config';
@@ -191,7 +191,7 @@ describe('POST /api/knowledge/sparql with a union default graph backend', () => 
       { subject: EX + 'secret', predicate: EX + 'knows', object: EX + 'x' },
     ]);
     app = Fastify();
-    await app.register(memoryRoutes, { triplestore: store } as unknown as GatewayContext);
+    await app.register(memoryRoutes, { triplestore: store, sparqlExecutor: new InProcessQueryExecutor(store) } as unknown as GatewayContext);
     await app.ready();
   });
 

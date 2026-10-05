@@ -1,7 +1,7 @@
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { GatewayContext } from '../context.js';
 import { createLogger, resolveAgentId } from '@ontofelia/core';
-import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport } from '@ontofelia/semantic-memory';
+import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport, QueryTimeoutError, createQueryExecutor } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -14,6 +14,15 @@ const PRIMARY_AGENT_ID = 'ontofelia';
 
 /** Maximum number of rows returned by `POST /api/knowledge/sparql`. */
 const SPARQL_MAX_ROWS = 1000;
+
+const SPARQL_DEFAULT_TIMEOUT_MS = 5000;
+const SPARQL_MIN_TIMEOUT_MS = 100;
+const SPARQL_MAX_TIMEOUT_MS = 60000;
+
+function resolveSparqlDeadline(configured: unknown): number {
+  const n = typeof configured === 'number' && Number.isFinite(configured) ? configured : SPARQL_DEFAULT_TIMEOUT_MS;
+  return Math.min(SPARQL_MAX_TIMEOUT_MS, Math.max(SPARQL_MIN_TIMEOUT_MS, Math.round(n)));
+}
 const AGENT_GRAPH_ROLES = [
   ['self', GraphUriResolver.getSelfGraph(PRIMARY_AGENT_ID)],
   ['skills', GraphUriResolver.getSkillsGraph(PRIMARY_AGENT_ID)],
@@ -59,6 +68,16 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
   const logger = createLogger('routes-memory');
 
   let lastKnowledgeDelete = 0;
+
+  // The SPARQL endpoint runs queries through an executor so a runaway query can
+  // be stopped (worker thread for Oxigraph). It starts its worker lazily.
+  const sparqlDeadlineMs = resolveSparqlDeadline(ctx.config?.memory?.sparqlTimeoutMs);
+  const sparqlExecutor = ctx.sparqlExecutor ?? createQueryExecutor(triplestore);
+  if (!ctx.sparqlExecutor) {
+    fastify.addHook('onClose', async () => {
+      await sparqlExecutor.close();
+    });
+  }
 
   const listRegisteredGraphUris = () => {
     return [
@@ -172,7 +191,17 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
    *   Terms are `{ type: "uri" | "literal" | "bnode", value, datatype?, language? }`.
    *   `variables` is taken from the first row and is empty when there are no rows.
    *
-   * Errors: `{ "error": string }` with status 400, 403 or 500.
+   * Deadline: `memory.sparqlTimeoutMs` (default 5000, clamped to 100..60000).
+   * With the Oxigraph backend the query runs in a worker thread that is
+   * terminated at the deadline (a fresh worker serves the next query), so a
+   * runaway query yields 504 `{ "error": "Query exceeded the time limit of N ms" }`
+   * and never blocks the event loop. The worker queries a replica of the
+   * persisted dataset, reloaded whenever the data file changes; queries run one
+   * at a time and the deadline starts when evaluation starts. Other backends
+   * run in process: no real timeout is possible there (Fuseki aborts its HTTP
+   * request after 30 s).
+   *
+   * Errors: `{ "error": string }` with status 400, 403, 500 or 504.
    */
   fastify.post('/api/knowledge/sparql', async (request: FastifyRequest<{ Body: { query?: unknown } }>, reply) => {
     const query = request.body?.query;
@@ -207,7 +236,7 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
     }
 
     try {
-      const result = await triplestore.query(toRun);
+      const result = await sparqlExecutor.execute(toRun, sparqlDeadlineMs);
       if (result.type === 'boolean') {
         return { type: 'boolean', boolean: result.boolean === true };
       }
@@ -223,6 +252,9 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
         truncated,
       };
     } catch (e) {
+      if (e instanceof QueryTimeoutError) {
+        return reply.code(504).send({ error: `Query exceeded the time limit of ${sparqlDeadlineMs} ms` });
+      }
       logger.error('SPARQL query failed: ' + (e as Error).message);
       return reply.code(500).send({ error: 'Query execution failed: ' + (e as Error).message });
     }

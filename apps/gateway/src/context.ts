@@ -9,7 +9,7 @@ import type { PluginLoader, PluginRegistry } from '@ontofelia/plugins';
 import type { JobScheduler, WebhookRegistry } from '@ontofelia/scheduler';
 import type { MediaStore, SignedUrlService, MimeDetector } from '@ontofelia/media';
 import type { NodeRegistry } from '@ontofelia/nodes';
-import type { FusekiManager, KnowledgeEngine, OntologyManager, ConflictDetector, ReflectionRunner } from '@ontofelia/semantic-memory';
+import type { QueryExecutor, FusekiManager, KnowledgeEngine, OntologyManager, ConflictDetector, ReflectionRunner } from '@ontofelia/semantic-memory';
 import type { SandboxAdapter } from '@ontofelia/sandbox';
 
 export interface GatewayContext {
@@ -41,4 +41,6 @@ export interface GatewayContext {
   nodeRegistry: NodeRegistry;
   ontologyBasePath: string;
   initiativeService: InitiativeService;
+  /** Optional override for the SPARQL endpoint's query executor (default: chosen from the triplestore). */
+  sparqlExecutor?: QueryExecutor;
 }
