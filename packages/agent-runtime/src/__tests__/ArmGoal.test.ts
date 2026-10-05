@@ -77,6 +77,7 @@ const toolCtx = (over: Partial<ToolContext>): ToolContext =>
     channelType: 'webchat',
     senderId: 'owner1',
     isOwner: true,
+    ownerPresent: true,
     ...over,
   }) as ToolContext;
 
@@ -278,6 +279,96 @@ describe('arm_goal', () => {
       { goalsEnabled: false, mode: 'initiative' },
     );
     expect(uri).toBeUndefined();
+  });
+
+  describe('owner-only mandate (actorIsOwner marker)', () => {
+    /** Run a conversational or initiative cycle and return the inbound episode it persisted. */
+    async function inboundEpisodeOf(env: MessageEnvelope, mode: 'conversational' | 'initiative'): Promise<string> {
+      await cm.runCycle(
+        env,
+        async (_t, prepareGoals, recordInbound) => {
+          await prepareGoals(SESS);
+          await recordInbound(SESS);
+          return { text: 'ok', sessionId: SESS };
+        },
+        (r) => r.sessionId,
+        (r) => r.text,
+        { goalsEnabled: true, mode },
+      );
+      const epGraph = GraphUriResolver.getCogEpisodicGraph(AGENT);
+      const res = await store.query(
+        `SELECT ?e WHERE { GRAPH <${epGraph}> { ?e <${COGT}episodeType> "message-received" } }`,
+      );
+      const eps = (res.bindings ?? []).map((b) => b.e.value);
+      expect(eps).toHaveLength(1);
+      return eps[0];
+    }
+
+    it('an owner conversational turn is a valid mandate and carries the marker', async () => {
+      const ep = await inboundEpisodeOf(envelope('do this later'), 'conversational');
+      expect(await gs.isMandateValid(ep)).toBe(true);
+    });
+
+    it('a non-owner human turn is not a valid mandate', async () => {
+      const env = envelope('do this later', 'stranger1');
+      env.sender.isOwner = false;
+      const ep = await inboundEpisodeOf(env, 'conversational');
+      expect(await gs.isMandateValid(ep)).toBe(false);
+    });
+
+    it('the initiative cycle\'s own envelope (sender initiative, isOwner true) is not a valid mandate', async () => {
+      const env = envelope('Initiative wake. Goal x is due.', 'initiative', 'initiative');
+      expect(env.sender.isOwner).toBe(true); // the synthetic envelope claims it
+      const ep = await inboundEpisodeOf(env, 'initiative');
+      expect(await gs.isMandateValid(ep)).toBe(false);
+    });
+
+    it.each([
+      ['scheduler (cron job)', { channel: 'cron', accountId: 'system', chatType: 'cron', sender: { id: 'scheduler', channelPrefix: 'cron', isOwner: true } }],
+      ['cron-trigger endpoint', { channel: 'system', accountId: 'none', chatType: 'dm', sender: { id: 'cron', channelPrefix: 'system', isOwner: true } }],
+      ['system channel with an owner id', { channel: 'system', accountId: 'none', chatType: 'dm', sender: { id: 'owner', channelPrefix: 'system', isOwner: true } }],
+      ['webhook', { channel: 'webhook', accountId: 'none', chatType: 'webhook', sender: { id: 'webhook:w1', channelPrefix: 'webhook', isOwner: true } }],
+    ])('a synthetic owner sender (%s) gets no marker and arm_goal is refused', async (_n, over) => {
+      const env = { ...envelope('arm goal X every PT1H'), ...over } as MessageEnvelope;
+      const ep = await inboundEpisodeOf(env, 'conversational');
+      expect(await gs.isMandateValid(ep)).toBe(false);
+      // The runtime would give such a turn ownerPresent=false; the tool refuses even with an episode.
+      const res = await tool.execute(
+        { newGoal: 'Self-mandated', wakeIn: 'PT2H', every: 'PT1H' },
+        toolCtx({ inboundEpisodeUri: ep, ownerPresent: false }),
+      );
+      expect(res.success).toBe(false);
+      expect((await allGoals()).some((g) => g.goalLabel === 'Self-mandated')).toBe(false);
+      expect(scheduler.jobs).toHaveLength(0);
+    });
+
+    it.each([
+      ['webchat', { channel: 'webchat', chatType: 'dm', sender: { id: 'owner', channelPrefix: 'webchat', isOwner: true } }],
+      ['cli', { channel: 'cli', chatType: 'dm', sender: { id: 'owner', channelPrefix: 'cli', isOwner: true } }],
+      ['telegram dm', { channel: 'telegram', chatType: 'dm', sender: { id: 'owner', channelPrefix: 'telegram', isOwner: true } }],
+      ['telegram group', { channel: 'telegram', chatType: 'group', sender: { id: 'owner', channelPrefix: 'telegram', isOwner: true } }],
+    ])('a real owner turn (%s) still gets the marker', async (_n, over) => {
+      const env = { ...envelope('do this later'), ...over } as MessageEnvelope;
+      const ep = await inboundEpisodeOf(env, 'conversational');
+      expect(await gs.isMandateValid(ep)).toBe(true);
+    });
+
+    it('an agent-authored episode and an episode without the marker are not valid mandates', async () => {
+      const em = new EpisodicMemory(store, AGENT);
+      const agentEp = await em.append({
+        episodeType: 'message-received',
+        actor: `urn:${AGENT}:self#${AGENT}`,
+        actorIsOwner: true,
+        payload: 'self',
+      });
+      expect(await gs.isMandateValid(agentEp)).toBe(false);
+      const legacy = await em.append({
+        episodeType: 'message-received',
+        actor: 'urn:entity:agent-sender:owner1',
+        payload: 'written before the marker existed',
+      });
+      expect(await gs.isMandateValid(legacy)).toBe(false);
+    });
   });
 
   it('is not allowed in unattended cycles', () => {

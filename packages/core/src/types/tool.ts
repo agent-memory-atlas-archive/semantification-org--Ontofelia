@@ -75,6 +75,20 @@ export interface ToolContext {
    */
   inboundEpisodeUri?: string;
   /**
+   * True only when the verified owner is present in a live, human-facing turn
+   * (`isHumanOwnerTurn`). Synthetic owner senders (scheduler, cron trigger,
+   * webhook, initiative) leave it false even though `isOwner` is true. Owner-
+   * gated goal tools (`arm_goal`, `update_goal_step`) require it; other tools
+   * keep reading `isOwner` / `unattended`.
+   */
+  ownerPresent?: boolean;
+  /**
+   * IRI of the goal an unattended initiative cycle was woken for
+   * (`routingHints.initiativeGoalId`). Set only when `unattended` is true; the
+   * `update_goal_step` tool restricts such a cycle to this one goal.
+   */
+  initiativeGoalUri?: string;
+  /**
    * Cancellation signal wired to the executor's per-call timeout. When a tool
    * exceeds its `timeoutMs`, the executor aborts this signal so long-running
    * work (child processes, network requests) can actually stop instead of

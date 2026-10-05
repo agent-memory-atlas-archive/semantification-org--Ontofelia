@@ -484,6 +484,9 @@ cogt:tags rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Episode ; rdfs:range xsd:string ; rdfs:label "tag" .
 cogt:actor rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:label "actor" .
+cogt:actorIsOwner rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Episode ; rdfs:range xsd:boolean ;
+    rdfs:label "actor is owner (written only when true, on inbound owner turns)" .
 cogt:about rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:label "about entity" .
 

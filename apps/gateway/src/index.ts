@@ -7,7 +7,7 @@ import { createLogger, AgentConfig, ChannelType, ChannelBinding, MessageEnvelope
 import { SessionStore } from '@ontofelia/session-store';
 import { AgentRuntime, InitiativeService, LoggingNotificationSink, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
 import type { InitiativeSessionPort, NotificationChannelPort, NotificationSink } from '@ontofelia/agent-runtime';
-import { NotifyOwnerTool, ListGoalsTool, ArmGoalTool } from '@ontofelia/tools';
+import { NotifyOwnerTool, ListGoalsTool, ArmGoalTool, UpdateGoalStepTool } from '@ontofelia/tools';
 import type { SessionOrigin } from '@ontofelia/core';
 import { resolveOwnerTarget } from './services/notificationTarget.js';
 import { MockProvider } from '@ontofelia/testkit';
@@ -324,6 +324,12 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   toolRegistry.register(new ArmGoalTool({
     arm: async (req) =>
       agents.get(req.agentId)?.armGoal(req, (goal) => initiativeService.registerGoalWake(goal)),
+  }));
+
+  // update_goal_step records progress on a goal; an unattended initiative cycle
+  // may touch only the goal it was woken for (docs/initiative-architecture.md §9).
+  toolRegistry.register(new UpdateGoalStepTool({
+    update: async (req) => agents.get(req.agentId)?.updateGoalStep(req),
   }));
 
   scheduler.onJob(async (job) => {

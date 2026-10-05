@@ -56,6 +56,12 @@ export interface EpisodeInput {
   channel?: string;
   /** Entity IRI of who performed the episode (user or agent self). */
   actor?: string;
+  /**
+   * The actor was the verified owner of a live conversation when this episode
+   * was written. Persisted as `cogt:actorIsOwner` only when true; an absent
+   * marker means "not known to be the owner" (also for older episodes).
+   */
+  actorIsOwner?: boolean;
   /** Entity IRIs this episode is about. */
   about?: string[];
   /** Explicit predecessor; when omitted, append() chains to the session's last. */
@@ -241,6 +247,7 @@ export class EpisodicMemory {
     if (ep.cycleId) lines.push(`<${uri}> <${COGT}cycleId> "${escapeLiteral(ep.cycleId)}" .`);
     if (ep.channel) lines.push(`<${uri}> <${COGT}channel> "${escapeLiteral(ep.channel)}" .`);
     if (ep.actor) lines.push(`<${uri}> <${COGT}actor> <${ep.actor}> .`);
+    if (ep.actorIsOwner === true) lines.push(`<${uri}> <${COGT}actorIsOwner> "true"^^<${XSD}boolean> .`);
     for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> <${a}> .`);
     if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> <${precededBy}> .`);
     if (ep.partOfGoal) lines.push(`<${uri}> <${COGT}partOfGoal> <${ep.partOfGoal}> .`);

@@ -10,6 +10,7 @@ const ctx = (over: Partial<ToolContext> = {}): ToolContext =>
     channelType: 'webchat',
     senderId: 'u',
     isOwner: true,
+    ownerPresent: true,
     inboundEpisodeUri: 'urn:a:cog:episode:1',
     ...over,
   }) as ToolContext;

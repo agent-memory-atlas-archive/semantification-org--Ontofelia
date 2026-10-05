@@ -114,6 +114,13 @@ export class ArmGoalTool implements ToolDefinition {
         'arm_goal: unattended context',
       );
     }
+    if (context.ownerPresent !== true) {
+      return refuse(
+        'arm_goal needs the owner present in a live conversation; scheduled, webhook and ' +
+          'system turns do not count as the owner asking.',
+        'arm_goal: owner not present',
+      );
+    }
     if (!context.inboundEpisodeUri) {
       return refuse(
         'arm_goal needs the record of the owner\'s current message as its mandate, but this turn ' +

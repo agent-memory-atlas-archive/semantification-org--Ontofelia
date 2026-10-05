@@ -1,4 +1,4 @@
-import { AgentConfig, AgentLifecycle, AgentState, ProviderAdapter, MessageEnvelope, ChatMessage, SessionRecord, SessionOrigin, ToolCall, ToolContext, createLogger } from '@ontofelia/core';
+import { AgentConfig, AgentLifecycle, AgentState, ProviderAdapter, MessageEnvelope, ChatMessage, SessionRecord, SessionOrigin, ToolCall, ToolContext, createLogger, isHumanOwnerTurn } from '@ontofelia/core';
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { SessionStore } from '@ontofelia/session-store';
 import { ToolRegistry, AuditLog } from '@ontofelia/tools';
@@ -15,6 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
 import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder } from './cognitive/CycleManager.js';
+import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
 import { CognitiveConfig } from './cognitive/CognitiveConfig.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
@@ -49,6 +50,8 @@ export type {
   Clock,
 } from './cognitive/InitiativeService.js';
 export { GoalStack, addIso8601Duration } from './cognitive/GoalStack.js';
+export { updateGoalStep } from './cognitive/updateGoalStep.js';
+export type { UpdateGoalStepRequest, UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 export { armGoal, OWNER_REQUESTED_WORK } from './cognitive/armGoal.js';
 export type { ArmGoalRequest, ArmGoalResult, ArmGoalDeps } from './cognitive/armGoal.js';
 export type { Goal, GoalInput, GoalStatus } from './cognitive/GoalStack.js';
@@ -239,17 +242,6 @@ const BOOTSTRAP_FILES: Record<string, string> = {
   'USER.md': `# User\n\nInformation about the user.\n`,
   'BOOTSTRAP.md': `# Bootstrap\n\nStartup configuration and first steps.\n`,
 };
-
-/**
- * A live human owner turn: the owner, on an interactive chat type, outside the
- * system/cron/webhook channels and not one of the synthetic sender ids.
- */
-function isHumanOwnerTurn(envelope: MessageEnvelope): boolean {
-  if (envelope.sender.isOwner !== true) return false;
-  if (envelope.chatType !== 'dm' && envelope.chatType !== 'group') return false;
-  if (envelope.channel === 'system' || envelope.channel === 'cron' || envelope.channel === 'webhook') return false;
-  return !['scheduler', 'cron', 'initiative'].includes(envelope.sender.id);
-}
 
 /** Structured /initiative report (see {@link AgentRuntime.initiativeReport}). */
 export interface InitiativeReport {
@@ -839,6 +831,7 @@ You are Ontofelia, an autonomous AI agent with full host access.
 - **self_inspect**: Use this tool ALWAYS when you are asked about your model, config, system, or architecture. Actions: config, system, architecture, source.
 - **list_goals**: When asked what you are planning or working on, call this tool and answer only from its result; if it returns no goals, say you have no open goals.
 - **arm_goal**: Use only when the owner explicitly asks you to work on something later or regularly; it gives a goal a wake time.
+- **update_goal_step**: Record progress on one of your goals: its current step, progress ("3/8"), plan, or its status (active, blocked with a reason, resolved). It cannot change a goal's mandate, wake or priority. In an unattended initiative cycle it only works on the goal you were woken for.
 - **exec**: Run terminal commands directly on the host. You may install software (sudo apt-get install -y), manage files, and start/stop processes.
 - **web_fetch**: Read webpages as plain text. Useful for research and link checks.
 - **cron_manage**: Create cron jobs to wake yourself at specific times. This lets you handle recurring tasks automatically.
@@ -983,6 +976,10 @@ Users can use these commands:
       // the EXECUTION chokepoint (not merely hide them from the LLM), and so
       // notify_owner can tell initiative from cron (channel:'system' too).
       unattended: envelope.chatType === 'initiative',
+      ownerPresent: isHumanOwnerTurn(envelope),
+      ...(envelope.chatType === 'initiative' && envelope.routingHints?.initiativeGoalId
+        ? { initiativeGoalUri: envelope.routingHints.initiativeGoalId }
+        : {}),
       sandboxPath: sandboxConfig?.scope !== 'off' ? path.join(resolvedWorkspace, 'sandbox') : undefined,
       sandboxConfig,
     };
@@ -1006,9 +1003,10 @@ Users can use these commands:
     // owner-harassment / injection vector). Hide it from non-owner senders
     // (belt); the tool also refuses such callers defensively (suspenders).
     // list_goals exposes internal goal state and arm_goal changes it: owner-only,
-    // hidden likewise (arm_goal also refuses non-owners when executed).
+    // hidden likewise (arm_goal also refuses non-owners when executed), as is
+    // update_goal_step.
     if (!envelope.sender.isOwner) {
-      return allowed.filter((t) => t.name !== 'notify_owner' && t.name !== 'list_goals' && t.name !== 'arm_goal');
+      return allowed.filter((t) => t.name !== 'notify_owner' && t.name !== 'list_goals' && t.name !== 'arm_goal' && t.name !== 'update_goal_step');
     }
     return allowed;
   }
@@ -1344,6 +1342,17 @@ Users can use these commands:
       },
       req,
     );
+  }
+
+  /**
+   * Update the step / progress / plan / status of a goal (the `update_goal_step`
+   * tool's port; docs/initiative-architecture.md §9). Undefined when no
+   * knowledge engine is configured.
+   */
+  async updateGoalStep(req: UpdateGoalStepRequest): Promise<UpdateGoalStepResult | undefined> {
+    const goalStack = this.goalStackFor(req.sessionId);
+    if (!goalStack) return undefined;
+    return updateGoalStep({ goalStack }, req);
   }
 
   /**

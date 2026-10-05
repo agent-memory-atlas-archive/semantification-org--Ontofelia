@@ -351,6 +351,20 @@ export class GoalStack {
       await this.replaceOne(graph, goalId, `${COGT}stepProgress`, `"${escapeLiteral(progress)}"`);
   }
 
+  /** Replace the goal's free-text plan (`cogt:plannedSteps`). */
+  async setPlannedSteps(goalId: GoalId, plannedSteps: string, now: Date = new Date()): Promise<void> {
+    const graph = await this.graphOf(goalId);
+    if (!graph) return;
+    this.registry.assertWritable(graph);
+    await this.replaceOne(graph, goalId, `${COGT}plannedSteps`, `"${escapeLiteral(plannedSteps)}"`);
+    await this.replaceOne(
+      graph,
+      goalId,
+      `${COGT}updatedAt`,
+      `"${now.toISOString()}"^^<${XSD}dateTime>`,
+    );
+  }
+
   // ──────────────────────────────────────────────────────────────────────
   // Initiative wake policy (docs/initiative-architecture.md §5). All writes
   // route through replaceOne (single-valued) and assertWritable, exactly like
@@ -495,23 +509,23 @@ export class GoalStack {
    * or an initiative-/agent-authored episode therefore all fail — closing the
    * self-mandate escape where a self-inferred goal invents its own mandate.
    *
-   * Residual gap (flagged per design §5): the episodic model records the sender
-   * entity (`urn:entity:agent-sender:<id>`) but does NOT persist the
-   * `isOwner` bit, so this validates "inbound human utterance, not self-authored"
-   * rather than strictly "the OWNER". Distinguishing owner from any other
-   * inbound sender needs an owner marker on the episode (or an allowlist check)
-   * and is left as a follow-up; the primary v1 threat (self-mandate) is closed.
+   * The episode must also carry `cogt:actorIsOwner true`, which the cycle manager
+   * writes only for an inbound turn of the verified owner in a live conversation
+   * (never for other senders, nor for the initiative cycle's synthetic envelope,
+   * which claims isOwner too). Episodes written before the marker existed lack it
+   * and are therefore not valid mandates.
    */
   async isMandateValid(mandatedBy: string | undefined): Promise<boolean> {
     if (!mandatedBy) return false;
     const graph = GraphUriResolver.getCogEpisodicGraph(this.agentId);
     const selfActor = `urn:${this.agentId}:self#${this.agentId}`;
     const res = await this.triplestore.query(`
-      SELECT ?type ?actor WHERE {
+      SELECT ?type ?actor ?owner WHERE {
         GRAPH <${graph}> {
           <${mandatedBy}> a <${COGT}Episode> ;
                           <${COGT}episodeType> ?type .
           OPTIONAL { <${mandatedBy}> <${COGT}actor> ?actor . }
+          OPTIONAL { <${mandatedBy}> <${COGT}actorIsOwner> ?owner . }
         }
       } LIMIT 1`);
     const b = res.bindings?.[0];
@@ -519,6 +533,7 @@ export class GoalStack {
     if (b.type?.value !== 'message-received') return false; // not an inbound utterance
     const actor = b.actor?.value;
     if (!actor || actor === selfActor) return false; // (c) agent/initiative-authored
+    if (b.owner?.value !== 'true') return false; // (d) not marked as an owner turn
     return true;
   }
 

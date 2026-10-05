@@ -21,7 +21,7 @@
  * of the LLM call.
  */
 
-import { createLogger, type MessageEnvelope, type TriplestoreAdapter } from '@ontofelia/core';
+import { createLogger, isHumanOwnerTurn, type MessageEnvelope, type TriplestoreAdapter } from '@ontofelia/core';
 import {
   GraphRegistry,
   GraphUriResolver,
@@ -899,6 +899,11 @@ export class CycleManager {
     const actor = envelope.sender?.id
       ? `urn:entity:agent-sender:${encodeURIComponent(envelope.sender.id)}`
       : undefined;
+    // Owner marker (the mandate gate reads it, docs §5.1): only a live,
+    // human-facing turn from the verified owner carries it. Synthetic envelopes
+    // (initiative, scheduler, cron trigger, webhooks) also claim isOwner and are
+    // excluded by isHumanOwnerTurn.
+    const actorIsOwner = isHumanOwnerTurn(envelope);
     return new EpisodicMemory(this.triplestore, this.agentId).append({
       episodeType: 'message-received',
       occurredAt,
@@ -906,6 +911,7 @@ export class CycleManager {
       cycleId,
       channel,
       actor,
+      ...(actorIsOwner ? { actorIsOwner: true } : {}),
       payload: envelope.text || '',
       transcriptRef: `${sessionId}.jsonl`,
       partOfGoal: activeGoalUri,
