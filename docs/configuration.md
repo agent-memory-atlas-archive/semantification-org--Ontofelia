@@ -113,6 +113,7 @@ All values shown are the defaults.
   // Tool and security policy
   tools: {
     allow: [],                      // Explicitly allowed host-only tools, e.g. ["exec"]
+                                    // (never for a non-owner person on a chat channel)
     deny: []                        // Explicitly denied tools
   },
   plugins: {

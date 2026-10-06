@@ -68,7 +68,7 @@ channels: {
 }
 ```
 
-- With `ownerId` set, only that account is the owner (identity `owner`, so existing sessions and memory stay yours). Other approved users get their own identity (`telegram:<id>`) and a private memory without owner rights, and they cannot approve Guardian prompts.
+- With `ownerId` set, only that account is the owner (identity `owner`, so existing sessions and memory stay yours). Other approved users get their own identity (`telegram:<id>`) and a private memory without owner rights: no host tools such as `exec` or the `fs_*` tools, no owner commands, and they cannot approve Guardian prompts.
 - Without `ownerId`, every approved Telegram user is the owner, and the gateway logs a warning at start.
 - To find your id: send `/pair` from your own account and run `ontofelia pairing list telegram` (the sender id is shown in parentheses), or ask a bot such as @userinfobot.
 
