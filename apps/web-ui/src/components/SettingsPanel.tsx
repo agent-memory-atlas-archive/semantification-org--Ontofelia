@@ -20,6 +20,8 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
   const [modelMessage, setModelMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   
   const [pendingForce, setPendingForce] = useState<{ model: string; validModels: string[] } | null>(null);
+  // A model id typed next to the loaded list, for a model the provider list does not offer.
+  const [customModel, setCustomModel] = useState('');
 
   // Knowledge Graph
   const [clearing, setClearing] = useState(false);
@@ -80,6 +82,7 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
       const res = force ? await changeModel(token, id, true) : await changeModel(token, id);
       setPendingForce(null);
       setCurrentModel(id);
+      setModelInput(id);
       setModelMessage({
         type: 'success',
         text: res.warning ? `Model changed to ${id} — ${res.warning}` : `Model changed to ${id}`
@@ -268,6 +271,34 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
                   <option value={modelInput}>{modelInput}</option>
                 )}
               </select>
+              <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                <input
+                  id="model-custom"
+                  type="text"
+                  value={customModel}
+                  onChange={(e) => { setCustomModel(e.target.value); setPendingForce(null); }}
+                  placeholder="Other model id…"
+                  style={{ ...inputStyle, flex: 1 }}
+                />
+                <button
+                  id="model-custom-apply"
+                  onClick={() => applyModel(customModel.trim(), false)}
+                  disabled={modelSaving || !customModel.trim() || customModel.trim() === currentModel}
+                  style={{
+                    padding: 'var(--space-2) var(--space-4)',
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: 'var(--color-primary)',
+                    color: '#fff',
+                    fontWeight: 600,
+                    fontSize: 'var(--font-size-sm)',
+                    opacity: modelSaving || !customModel.trim() || customModel.trim() === currentModel ? 0.5 : 1,
+                    cursor: modelSaving || !customModel.trim() || customModel.trim() === currentModel ? 'not-allowed' : 'pointer',
+                    border: 'none',
+                  }}
+                >
+                  Use id
+                </button>
+              </div>
               {modelSaving && (
                 <p style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-secondary)', margin: 0 }}>
                   Saving...
