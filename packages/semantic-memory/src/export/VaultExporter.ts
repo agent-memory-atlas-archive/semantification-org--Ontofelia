@@ -334,20 +334,33 @@ async function assertNotSymlink(p: string, kind: 'dir' | 'file'): Promise<boolea
   return true;
 }
 
+export interface WriteVaultNotesOptions {
+  /** Target folder; created when missing. */
+  dir: string;
+  /** Allow a non-empty folder. Nothing is ever deleted; only the given files are replaced. */
+  overwrite?: boolean;
+}
+export interface WriteVaultNotesReport {
+  dir: string;
+  notesWritten: number;
+  /** Folder-relative paths of the written files, sorted. */
+  paths: string[];
+}
+
 /**
- * Build the export and write one `.md` per note under `opts.dir`.
+ * Write `{ path, content }` notes (`<folder>/<name>.md`) under `opts.dir`.
  *
  * Safety: a non-empty folder is refused unless `overwrite`; even then nothing
- * is deleted, only the export's own files are created or replaced. Every
- * target is checked up front (no symlink, no non-regular file, safe name),
- * before the first byte is written, and files are opened with O_NOFOLLOW.
+ * is deleted, only the given files are created or replaced. Every target is
+ * checked up front (no symlink, no non-regular file, safe name), before the
+ * first byte is written, and files are opened with O_NOFOLLOW. The paths are
+ * validated here whatever produced them.
  */
-export async function writeVaultExport(
-  engine: KnowledgeEngine, opts: WriteVaultExportOptions,
-): Promise<WriteVaultExportReport> {
+export async function writeVaultNotes(
+  notes: { path: string; content: string }[], opts: WriteVaultNotesOptions,
+): Promise<WriteVaultNotesReport> {
   const dir = path.resolve(opts.dir);
-  const report = await buildVaultExport(engine, { agentId: opts.agentId });
-  const plan = report.notes.map(n => ({ note: n, parts: assertSafeRelPath(n.path) }));
+  const plan = notes.map(n => ({ note: n, parts: assertSafeRelPath(n.path) }));
   const seen = new Set<string>();
   for (const { note } of plan) {
     const k = note.path.toLowerCase();
@@ -380,5 +393,17 @@ export async function writeVaultExport(
     try { await fh.writeFile(note.content, 'utf8'); } finally { await fh.close(); }
     written.push(note.path);
   }
-  return { dir, notesWritten: written.length, paths: written.sort(cmp), skipped: report.skipped, totals: report.totals };
+  return { dir, notesWritten: written.length, paths: written.sort(cmp) };
+}
+
+/**
+ * Build the export and write one `.md` per note under `opts.dir`
+ * (see `writeVaultNotes` for the safety rules).
+ */
+export async function writeVaultExport(
+  engine: KnowledgeEngine, opts: WriteVaultExportOptions,
+): Promise<WriteVaultExportReport> {
+  const report = await buildVaultExport(engine, { agentId: opts.agentId });
+  const w = await writeVaultNotes(report.notes, { dir: opts.dir, overwrite: opts.overwrite });
+  return { ...w, skipped: report.skipped, totals: report.totals };
 }
