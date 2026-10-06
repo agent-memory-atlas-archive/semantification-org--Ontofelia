@@ -2,6 +2,7 @@ import { ChannelType, ChannelCapabilities, ChatType, SendOptions, SendResult, At
 import { BaseChannelAdapter } from '../base/BaseChannelAdapter.js';
 import { PairingStore } from '../pairing/PairingStore.js';
 import { AllowlistStore } from '../pairing/AllowlistStore.js';
+import { resolveTelegramSender } from './TelegramSender.js';
 import TelegramBot from 'node-telegram-bot-api';
 
 export class TelegramAdapter extends BaseChannelAdapter {
@@ -28,132 +29,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
       this.bot.on('callback_query', this.callbackQueryHandler);
     }
 
-    this.bot?.on('message', async (msg) => {
-      console.log('Incoming Telegram msg:', JSON.stringify(msg, null, 2));
-      if (!msg.from) return;
-      
-      // Extract text: prefer msg.text, fall back to msg.caption for photos/documents
-      const textContent = msg.text || msg.caption || '';
-      
-      // If there's no text AND no photo/document, skip (e.g. service messages)
-      if (!textContent && !msg.photo && !msg.document && !msg.voice && !msg.video) return;
-
-      const senderId = msg.from.id.toString();
-      const chatId = msg.chat.id.toString();
-      const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
-      
-      const isAllowed = await this.allowlistStore.isAllowed(this.type, senderId);
-
-      if (isAllowed) {
-        if (isGroup && textContent) {
-          // If group, check mention
-          const botInfo = await this.bot?.getMe();
-          const botUsername = botInfo?.username;
-          if (botUsername && !textContent.includes(`@${botUsername}`)) {
-            return; // Not mentioning bot
-          }
-        }
-        
-        // Build attachments from photos (download and encode as base64)
-        const attachments: MessageEnvelope['attachments'] = [];
-        if (msg.photo && msg.photo.length > 0 && this.bot) {
-          // Telegram sends multiple sizes; pick the largest
-          const largest = msg.photo[msg.photo.length - 1];
-          try {
-            const fileUrl = await this.bot.getFileLink(largest.file_id);
-            const response = await fetch(fileUrl);
-            const buffer = Buffer.from(await response.arrayBuffer());
-            const base64 = buffer.toString('base64');
-            attachments.push({
-              id: largest.file_id,
-              type: 'image',
-              url: `data:image/jpeg;base64,${base64}`,
-              mimeType: 'image/jpeg',
-              sizeBytes: largest.file_size || buffer.length,
-            });
-          } catch {
-            // If download fails, still pass metadata
-            attachments.push({
-              id: largest.file_id,
-              type: 'image',
-              url: `telegram:file:${largest.file_id}`,
-              mimeType: 'image/jpeg',
-              sizeBytes: largest.file_size || 0,
-            });
-          }
-        }
-        
-        // Build attachments from documents
-        if (msg.document && this.bot) {
-          try {
-            const fileUrl = await this.bot.getFileLink(msg.document.file_id);
-            attachments.push({
-              id: msg.document.file_id,
-              type: 'document',
-              url: fileUrl,
-              mimeType: msg.document.mime_type || 'application/octet-stream',
-              filename: msg.document.file_name,
-              sizeBytes: msg.document.file_size || 0,
-            });
-          } catch {
-            attachments.push({
-              id: msg.document.file_id,
-              type: 'document',
-              url: `telegram:file:${msg.document.file_id}`,
-              mimeType: msg.document.mime_type || 'application/octet-stream',
-              filename: msg.document.file_name,
-              sizeBytes: msg.document.file_size || 0,
-            });
-          }
-        }
-
-        // Determine the text to send to the agent
-        let resolvedText = textContent;
-        if (!resolvedText && attachments.length > 0) {
-          const hasDoc = attachments.some(a => a.type === 'document');
-          if (hasDoc) {
-            resolvedText = '[Document sent without text]';
-          } else {
-            resolvedText = '[Image sent without text]';
-          }
-        }
-        
-        // Allowed and relevant: forward to MessageHandler
-        if (this.messageHandler) {
-          const envelope: MessageEnvelope = {
-            id: msg.message_id.toString(),
-            channel: this.type,
-            accountId: 'default',
-            chatType: isGroup ? 'group' : 'dm',
-            sender: {
-              id: 'owner',
-              channelPrefix: 'telegram',
-              displayName: msg.from.username || msg.from.first_name,
-              isOwner: true
-            },
-            target: chatId,
-            timestamp: new Date(msg.date * 1000).toISOString(),
-            text: resolvedText,
-            mentions: [],
-            attachments,
-            raw: msg
-          };
-          
-          await this.messageHandler(envelope);
-        }
-      } else {
-        // Not allowed, check for pairing commands
-        if (msg.text === '/start' || msg.text === '/pair') {
-          const req = await this.pairingStore.createRequest(this.type, senderId, msg.from.username || msg.from.first_name);
-          await this.sendText(chatId, `Your pairing code is: ${req.code}. Please give it to the admin.`);
-        } else {
-          // Not paired, not pairing command
-          if (!isGroup) {
-            await this.sendText(chatId, "You are not approved yet. Send /pair to request a pairing code.");
-          }
-        }
-      }
-    });
+    this.bot?.on('message', (msg) => this.handleMessage(msg));
 
     // Register slash commands so Telegram shows them in the "/" menu
     try {
@@ -173,6 +49,140 @@ export class TelegramAdapter extends BaseChannelAdapter {
     } catch { /* non-critical */ }
 
     this.status = 'connected';
+  }
+
+  /**
+   * Handle one inbound Telegram message. Public so tests can drive the real
+   * path without a bot connection.
+   */
+  async handleMessage(msg: TelegramBot.Message): Promise<void> {
+    console.log('Incoming Telegram msg:', JSON.stringify(msg, null, 2));
+    if (!msg.from) return;
+    
+    // Extract text: prefer msg.text, fall back to msg.caption for photos/documents
+    const textContent = msg.text || msg.caption || '';
+    
+    // If there's no text AND no photo/document, skip (e.g. service messages)
+    if (!textContent && !msg.photo && !msg.document && !msg.voice && !msg.video) return;
+
+    const senderId = msg.from.id.toString();
+    const chatId = msg.chat.id.toString();
+    const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+    
+    const isAllowed = await this.allowlistStore.isAllowed(this.type, senderId);
+
+    if (isAllowed) {
+      // Owner vs. other approved user is decided here and nowhere else.
+      const sender = resolveTelegramSender(
+        senderId,
+        msg.from.username || msg.from.first_name,
+        (this.config as { ownerId?: string | number } | undefined)?.ownerId,
+      );
+      if (!sender) return; // not a plain Telegram user id: refuse
+      if (isGroup && textContent) {
+        // If group, check mention
+        const botInfo = await this.bot?.getMe();
+        const botUsername = botInfo?.username;
+        if (botUsername && !textContent.includes(`@${botUsername}`)) {
+          return; // Not mentioning bot
+        }
+      }
+      
+      // Build attachments from photos (download and encode as base64)
+      const attachments: MessageEnvelope['attachments'] = [];
+      if (msg.photo && msg.photo.length > 0 && this.bot) {
+        // Telegram sends multiple sizes; pick the largest
+        const largest = msg.photo[msg.photo.length - 1];
+        try {
+          const fileUrl = await this.bot.getFileLink(largest.file_id);
+          const response = await fetch(fileUrl);
+          const buffer = Buffer.from(await response.arrayBuffer());
+          const base64 = buffer.toString('base64');
+          attachments.push({
+            id: largest.file_id,
+            type: 'image',
+            url: `data:image/jpeg;base64,${base64}`,
+            mimeType: 'image/jpeg',
+            sizeBytes: largest.file_size || buffer.length,
+          });
+        } catch {
+          // If download fails, still pass metadata
+          attachments.push({
+            id: largest.file_id,
+            type: 'image',
+            url: `telegram:file:${largest.file_id}`,
+            mimeType: 'image/jpeg',
+            sizeBytes: largest.file_size || 0,
+          });
+        }
+      }
+      
+      // Build attachments from documents
+      if (msg.document && this.bot) {
+        try {
+          const fileUrl = await this.bot.getFileLink(msg.document.file_id);
+          attachments.push({
+            id: msg.document.file_id,
+            type: 'document',
+            url: fileUrl,
+            mimeType: msg.document.mime_type || 'application/octet-stream',
+            filename: msg.document.file_name,
+            sizeBytes: msg.document.file_size || 0,
+          });
+        } catch {
+          attachments.push({
+            id: msg.document.file_id,
+            type: 'document',
+            url: `telegram:file:${msg.document.file_id}`,
+            mimeType: msg.document.mime_type || 'application/octet-stream',
+            filename: msg.document.file_name,
+            sizeBytes: msg.document.file_size || 0,
+          });
+        }
+      }
+
+      // Determine the text to send to the agent
+      let resolvedText = textContent;
+      if (!resolvedText && attachments.length > 0) {
+        const hasDoc = attachments.some(a => a.type === 'document');
+        if (hasDoc) {
+          resolvedText = '[Document sent without text]';
+        } else {
+          resolvedText = '[Image sent without text]';
+        }
+      }
+      
+      // Allowed and relevant: forward to MessageHandler
+      if (this.messageHandler) {
+        const envelope: MessageEnvelope = {
+          id: msg.message_id.toString(),
+          channel: this.type,
+          accountId: 'default',
+          chatType: isGroup ? 'group' : 'dm',
+          sender,
+          target: chatId,
+          timestamp: new Date(msg.date * 1000).toISOString(),
+          text: resolvedText,
+          mentions: [],
+          attachments,
+          raw: msg
+        };
+        
+        await this.messageHandler(envelope);
+      }
+    } else {
+      // Not allowed, check for pairing commands
+      if (msg.text === '/start' || msg.text === '/pair') {
+        const req = await this.pairingStore.createRequest(this.type, senderId, msg.from.username || msg.from.first_name);
+        await this.sendText(chatId, `Your pairing code is: ${req.code}. Please give it to the admin.`);
+      } else {
+        // Not paired, not pairing command
+        if (!isGroup) {
+          await this.sendText(chatId, "You are not approved yet. Send /pair to request a pairing code.");
+        }
+      }
+    }
+  
   }
 
   async disconnect(): Promise<void> {
