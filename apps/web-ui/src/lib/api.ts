@@ -61,6 +61,18 @@ export interface ChatMessage {
   attachments?: { name: string; type: string; data: string }[];
 }
 
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(status: number, body?: unknown) {
+    super(`API Error: ${status}`);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function apiFetch<T>(endpoint: string, token: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${endpoint}`, {
     ...options,
@@ -72,7 +84,13 @@ async function apiFetch<T>(endpoint: string, token: string, options: RequestInit
   
   if (!response.ok) {
     if (response.status === 401) throw new Error('Unauthorized');
-    throw new Error(`API Error: ${response.status}`);
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+    throw new ApiError(response.status, body);
   }
   
   return response.json();

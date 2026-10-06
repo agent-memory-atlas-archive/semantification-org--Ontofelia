@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { fetchProvider, fetchModels, changeModel, clearKnowledge, toggleFallback, changeFallbackModels } from '../lib/api';
+import { fetchProvider, fetchModels, changeModel, clearKnowledge, toggleFallback, changeFallbackModels, ApiError } from '../lib/api';
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -19,6 +19,8 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
   const [modelSaving, setModelSaving] = useState(false);
   const [modelMessage, setModelMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   
+  const [pendingForce, setPendingForce] = useState<{ model: string; validModels: string[] } | null>(null);
+
   // Knowledge Graph
   const [clearing, setClearing] = useState(false);
   const [clearConfirm, setClearConfirm] = useState(false);
@@ -70,26 +72,37 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
     }
   };
 
-  const handleModelChange = async () => {
-    const id = modelInput.trim();
-    if (!token || !id || modelInput === currentModel) return;
+  const applyModel = async (id: string, force: boolean) => {
+    if (!token) return;
     setModelSaving(true);
     setModelMessage(null);
     try {
-      // The free-text field exists to set a model the provider list does not
-      // offer, so an unlisted id is sent with force instead of being rejected.
-      const listed = models.some(m => m.id === id);
-      const res = await changeModel(token, id, !listed);
+      const res = force ? await changeModel(token, id, true) : await changeModel(token, id);
+      setPendingForce(null);
       setCurrentModel(id);
       setModelMessage({
         type: 'success',
         text: res.warning ? `Model changed to ${id} — ${res.warning}` : `Model changed to ${id}`
       });
     } catch (e) {
-      setModelMessage({ type: 'error', text: (e as Error).message });
+      const body = e instanceof ApiError ? (e.body as { validModels?: unknown } | undefined) : undefined;
+      if (!force && e instanceof ApiError && e.status === 400 && body && Array.isArray(body.validModels)) {
+        // Unknown id: do not set it, ask the user for an explicit second step.
+        setPendingForce({ model: id, validModels: body.validModels.map(String) });
+      } else {
+        setPendingForce(null);
+        setModelMessage({ type: 'error', text: (e as Error).message });
+      }
     } finally {
       setModelSaving(false);
     }
+  };
+
+  const handleModelChange = async () => {
+    const id = modelInput.trim();
+    if (!token || !id || modelInput === currentModel) return;
+    setPendingForce(null);
+    await applyModel(id, false);
   };
 
   const handleClearKnowledge = async () => {
@@ -267,7 +280,7 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
                 id="model"
                 type="text"
                 value={modelInput}
-                onChange={(e) => setModelInput(e.target.value)}
+                onChange={(e) => { setModelInput(e.target.value); setPendingForce(null); }}
                 placeholder="e.g. deepseek/deepseek-v4-flash:free"
                 style={inputStyle}
               />
@@ -289,6 +302,62 @@ export function SettingsPanel({ onClose, forced = false }: SettingsPanelProps) {
                 {modelSaving ? 'Saving...' : 'Change Model'}
               </button>
             </>
+          )}
+          {pendingForce && (
+            <div
+              id="model-force-confirm"
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 'var(--space-2)',
+                padding: 'var(--space-3)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid #f59e0b',
+                fontSize: 'var(--font-size-xs)',
+                color: 'var(--color-text-secondary)',
+              }}
+            >
+              <p style={{ margin: 0, color: '#f59e0b', fontWeight: 600 }}>
+                The gateway does not know the model "{pendingForce.model}".
+              </p>
+              <p style={{ margin: 0 }}>
+                Valid alternatives: {pendingForce.validModels.slice(0, 10).join(', ') || 'none'}
+                {pendingForce.validModels.length > 10 && ` and ${pendingForce.validModels.length - 10} more`}
+              </p>
+              <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                <button
+                  id="model-force-anyway"
+                  onClick={() => applyModel(pendingForce.model, true)}
+                  disabled={modelSaving}
+                  style={{
+                    padding: 'var(--space-2) var(--space-4)',
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: '#f59e0b',
+                    color: '#fff',
+                    fontWeight: 600,
+                    fontSize: 'var(--font-size-sm)',
+                    opacity: modelSaving ? 0.5 : 1,
+                    cursor: modelSaving ? 'wait' : 'pointer',
+                    border: 'none',
+                  }}
+                >
+                  Set anyway
+                </button>
+                <button
+                  id="model-force-cancel"
+                  onClick={() => setPendingForce(null)}
+                  disabled={modelSaving}
+                  style={{
+                    padding: 'var(--space-2) var(--space-4)',
+                    borderRadius: 'var(--radius-md)',
+                    fontSize: 'var(--font-size-sm)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           )}
           {modelMessage && (
             <p style={{
