@@ -54,11 +54,12 @@ class NoListProvider implements ProviderAdapter {
 const HAND_WRITTEN_CONFIG = `{
   // Ontofelia configuration — hand maintained, comments matter.
   version: 1,
+  /* Block comment: the provider section is edited by hand too. */
   provider: {
     name: 'openai-codex',
     // The '//' in this URL is what the old hand-rolled comment stripper broke.
     baseUrl: 'https://api.example.test/v1',
-    defaultModel: 'old-model',
+    defaultModel: 'old-model', // keep this comment
     aliases: {},
     autoFallback: true,
   },
@@ -130,6 +131,19 @@ describe('AgentRuntime /model command', () => {
     // The URL used to be truncated at '//' before JSON.parse and the write was
     // then skipped silently.
     expect(raw).toContain('https://api.example.test/v1');
+
+    // Comments, trailing commas and layout survive the write.
+    expect(raw).toContain('// Ontofelia configuration — hand maintained, comments matter.');
+    expect(raw).toContain('/* Block comment: the provider section is edited by hand too. */');
+    expect(raw).toContain('// keep this comment');
+    expect(raw).toContain('brand-new-model');
+    expect(raw).toContain('autoFallback: true,\n  },');
+    const before = HAND_WRITTEN_CONFIG.split('\n');
+    const after = raw.split('\n');
+    expect(after.length).toBe(before.length);
+    const changed = after.filter((line, i) => line !== before[i]);
+    expect(changed).toHaveLength(1);
+    expect(changed[0]).toContain('brand-new-model');
 
     const written = await loadConfig(configPath);
     expect(written.provider.defaultModel).toBe('brand-new-model');
