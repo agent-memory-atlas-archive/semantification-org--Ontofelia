@@ -38,7 +38,9 @@ async function newEngine(prefix: string): Promise<{ store: OxigraphAdapter; engi
   return { store, engine: new KnowledgeEngine(store as never) };
 }
 
-const ctx = { agentId: AGENT, sessionId: 'seed', isOwner: false };
+// A vault-import context: the facts below carry a `vault://` sourceUri, exactly the
+// provenance the importer records and the export requires.
+const ctx = { agentId: AGENT, sessionId: 'seed', isOwner: false, ingestionRunId: 'vault-import-seed' };
 type Seed = { s: string; p: string; o: string; lit?: boolean };
 
 async function seed(engine: KnowledgeEngine, facts: Seed[]): Promise<void> {
@@ -46,6 +48,7 @@ async function seed(engine: KnowledgeEngine, facts: Seed[]): Promise<void> {
     const r = await engine.storeFact({
       subject: f.s, subjectType: 'Concept', predicate: f.p, object: f.o,
       objectType: f.lit ? 'literal' : 'Concept', sourceKind: 'tool', status: 'accepted',
+      evidenceType: 'document', sourceUri: 'vault://seed/seed.md', contentHash: 'sha256:seed',
     } as never, ctx);
     expect(r.success).toBe(true);
   }
@@ -55,9 +58,12 @@ async function seed(engine: KnowledgeEngine, facts: Seed[]): Promise<void> {
 async function factSet(engine: KnowledgeEngine, stripLang: boolean): Promise<string[]> {
   const rows = await engine.selectExplicitGraphs(`SELECT DISTINCT ?s ?p ?o WHERE {
     GRAPH <${CLAIMS}> { ?c a <urn:shared:ontology#Claim> ; <urn:shared:ontology#status> "accepted" ;
-      <urn:shared:ontology#assertedInGraph> <${WV}> ; <urn:shared:ontology#sourceKind> "tool" ;
+      <urn:shared:ontology#assertedInGraph> <${WV}> ;
+      <urn:shared:ontology#hasEvidence> ?e ;
       <urn:shared:ontology#claimSubject> ?s ; <urn:shared:ontology#claimPredicate> ?p ;
       <urn:shared:ontology#claimObject> ?o }
+    GRAPH <urn:${AGENT}:evidence> { ?e <urn:shared:ontology#sourceUri> ?u }
+    FILTER(STRSTARTS(STR(?u), "vault://"))
     GRAPH <${WV}> { ?s ?p ?o } }`);
   const labelRows = await engine.selectExplicitGraphs(`SELECT ?e ?l WHERE { GRAPH <${WV}> { ?e <${RDFS_LABEL}> ?l } }`);
   const label = new Map(labelRows.map(r => [r.e.value, r.l.value]));

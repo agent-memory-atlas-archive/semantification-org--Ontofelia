@@ -63,8 +63,8 @@ describe('GET /api/knowledge/vault-export', () => {
     expect((await get(URL_, { authorization: 'Bearer wrong' })).statusCode).toBe(401);
   });
 
-  it('returns the seeded tool claim as notes, and no private canary', async () => {
-    // Tool claims via the importer (sourceKind tool), the same path the exporter tests use.
+  it('returns the imported vault notes, and no private canary', async () => {
+    // Claims with vault provenance via the importer, the same path the exporter tests use.
     const imp = await fastify.inject({
       method: 'POST', url: '/api/knowledge/vault-import', headers: AUTH,
       payload: { root: FIXTURE, vaultName: 'exportdemo', apply: true },

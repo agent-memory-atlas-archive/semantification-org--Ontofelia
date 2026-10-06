@@ -4,11 +4,17 @@
  *
  * Allow-list (security-relevant): a fact is exported iff `urn:<agent>:claims`
  * holds a claim for it with status "accepted", asserted in
- * `urn:<agent>:worldview`, sourceKind "tool", AND the claim's base triple is
- * currently present in the worldview. Only the claims graph, the worldview and
- * the label sources (worldview, schema, shared ontology) are read, each by
- * explicit IRI. User, self, session, inferred, cog and evidence graphs are
- * never read. Evidence text, raw text and source spans are never exported.
+ * `urn:<agent>:worldview`, with vault provenance, AND the claim's base triple
+ * is currently present in the worldview. Vault provenance means the claim has
+ * `core:hasEvidence` to an evidence in `urn:<agent>:evidence` whose
+ * `core:sourceUri` starts with `vault://`; only the vault importer writes such
+ * evidence (no agent tool can set a sourceUri). The claim's `sourceKind` is
+ * deliberately NOT a criterion: the model can choose it (`memory_store`).
+ * Only the claims graph, the evidence graph (matched by sourceUri prefix; its
+ * text is never read), the worldview and the label sources (worldview, schema,
+ * shared ontology) are read, each by explicit IRI. User, self, session,
+ * inferred and cog graphs are never read. Evidence text, raw text and source
+ * spans are never exported.
  */
 import { constants as fsc, promises as fs } from 'fs';
 import * as path from 'path';
@@ -99,6 +105,7 @@ function scalar(t: Term): string | number {
 export async function buildVaultExport(engine: KnowledgeEngine, opts: VaultExportOptions): Promise<VaultExportReport> {
   const claimsG = sparqlIri(GraphUriResolver.getClaimsGraph(opts.agentId));
   const worldG = sparqlIri(GraphUriResolver.getWorldviewGraph(opts.agentId));
+  const evidenceG = sparqlIri(GraphUriResolver.getEvidenceGraph(opts.agentId));
   const schemaG = sparqlIri(GraphUriResolver.getSchemaGraph(opts.agentId));
   const ontoG = sparqlIri(SHARED_GRAPHS.ONTOLOGY);
 
@@ -108,11 +115,13 @@ export async function buildVaultExport(engine: KnowledgeEngine, opts: VaultExpor
     ?c a <${CORE}Claim> ;
        <${CORE}status> "accepted" ;
        <${CORE}assertedInGraph> ${worldG} ;
-       <${CORE}sourceKind> "tool" ;
+       <${CORE}hasEvidence> ?e ;
        <${CORE}claimSubject> ?s ;
        <${CORE}claimPredicate> ?p ;
        <${CORE}claimObject> ?o .
   }
+  GRAPH ${evidenceG} { ?e <${CORE}sourceUri> ?u }
+  FILTER(STRSTARTS(STR(?u), "vault://"))
   GRAPH ${worldG} { ?s ?p ?o }
 }`;
   const allowRows = await engine.selectExplicitGraphs(allowSparql);
@@ -121,16 +130,22 @@ export async function buildVaultExport(engine: KnowledgeEngine, opts: VaultExpor
   const claimSparql = `SELECT ?c
   (GROUP_CONCAT(DISTINCT ?st; separator="${SEP}") AS ?statuses)
   (GROUP_CONCAT(DISTINCT STR(?ag); separator="${SEP}") AS ?graphs)
-  (GROUP_CONCAT(DISTINCT ?sk; separator="${SEP}") AS ?kinds)
 WHERE {
   GRAPH ${claimsG} {
     ?c a <${CORE}Claim> .
     OPTIONAL { ?c <${CORE}status> ?st }
     OPTIONAL { ?c <${CORE}assertedInGraph> ?ag }
-    OPTIONAL { ?c <${CORE}sourceKind> ?sk }
   }
 } GROUP BY ?c`;
   const claimRows = await engine.selectExplicitGraphs(claimSparql);
+
+  // 2b. Claims that do have vault provenance, for the skip report only.
+  const vaultRows = await engine.selectExplicitGraphs(`SELECT DISTINCT ?c WHERE {
+  GRAPH ${claimsG} { ?c <${CORE}hasEvidence> ?e }
+  GRAPH ${evidenceG} { ?e <${CORE}sourceUri> ?u }
+  FILTER(STRSTARTS(STR(?u), "vault://"))
+}`);
+  const withVault = new Set(vaultRows.map(r => r.c.value));
 
   // 3. Labels, read-only, from explicitly named graphs.
   const labelSparql = `SELECT ?e ?l WHERE {
@@ -186,11 +201,10 @@ WHERE {
     if (allowedClaims.has(r.c.value)) continue;
     const statuses = (r.statuses?.value ?? '').split(SEP).filter(Boolean);
     const graphs = (r.graphs?.value ?? '').split(SEP).filter(Boolean);
-    const kinds = (r.kinds?.value ?? '').split(SEP).filter(Boolean);
     const world = GraphUriResolver.getWorldviewGraph(opts.agentId);
     if (!statuses.includes('accepted')) skip(r.c.value, `status ${statuses.join('|') || 'missing'}`);
     else if (!graphs.includes(world)) skip(r.c.value, 'asserted outside the worldview');
-    else if (!kinds.includes('tool')) skip(r.c.value, `sourceKind ${kinds.join('|') || 'missing'}`);
+    else if (!withVault.has(r.c.value)) skip(r.c.value, 'no vault provenance');
     else skip(r.c.value, 'base triple missing');
   }
 

@@ -1,6 +1,6 @@
 /**
- * buildVaultExport: allow-list selection (accepted tool claims whose base
- * triple is still in the worldview), rendering, determinism, round trip into
+ * buildVaultExport: allow-list selection (accepted worldview claims with vault
+ * provenance whose base triple is still in the worldview), rendering, determinism, round trip into
  * the mapper. Real engine on the embedded OxigraphAdapter.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
@@ -44,10 +44,11 @@ beforeAll(async () => {
   // (b) owner fact about "me": routed to alice's user graph
   await engine.storeFact({ subject: 'me', subjectType: 'Person', predicate: 'secretNote', object: 'SecretCanary',
     objectType: 'literal', sourceKind: 'user', status: 'accepted' } as never, { ...ctx, isOwner: true });
-  // (d) tool claim whose base triple is then removed from the worldview
+  // (d) vault-provenance claim whose base triple is then removed from the worldview
   await engine.storeFact({ subject: 'hummus', subjectType: 'Concept', predicate: 'retiredNote', object: 'RetiredCanary',
-    objectType: 'literal', sourceKind: 'tool', status: 'accepted' } as never,
-    { agentId: AGENT, sessionId: 's2', isOwner: false });
+    objectType: 'literal', sourceKind: 'tool', status: 'accepted', evidenceType: 'document',
+    sourceUri: 'vault://demo/retired.md', contentHash: 'sha256:retired' } as never,
+    { agentId: AGENT, sessionId: 's2', isOwner: false, ingestionRunId: 'vault-import-test' });
   const wv = `urn:${AGENT}:worldview`;
   const hummus = 'urn:ontofelia:entity:hummus';
   await store.update(`DELETE WHERE { GRAPH <${wv}> { <${hummus}> <urn:ontofelia:core#retiredNote> ?o } }`);
@@ -83,7 +84,7 @@ describe('buildVaultExport', () => {
   });
 
   it('reports why claims were skipped', () => {
-    expect(report.totals['skipped: sourceKind user']).toBeGreaterThanOrEqual(1);
+    expect(report.totals['skipped: no vault provenance']).toBeGreaterThanOrEqual(1);
     expect(report.totals['skipped: base triple missing']).toBe(1);
     expect(report.totals.claimsConsidered).toBe(report.totals.claimsExported + report.totals.claimsSkipped);
     expect(report.skipped.every(s => s.claim.length > 0 && s.reason.length > 0)).toBe(true);
@@ -130,6 +131,49 @@ describe('buildVaultExport', () => {
       }
       expect(pairs).toEqual(expected.sort());
     }
+  });
+});
+
+describe('buildVaultExport provenance criterion', () => {
+  const OWNER = { agentId: AGENT, sessionId: 'p', isOwner: true, userId: 'alice' };
+
+  async function fresh(): Promise<{ eng: KnowledgeEngine }> {
+    const st = new OxigraphAdapter();
+    await st.initialize({ backend: 'oxigraph', type: 'embedded',
+      dataDir: mkdtempSync(join(tmpdir(), 'vexp-prov-')), port: 0, endpoint: '' } as never);
+    return { eng: new KnowledgeEngine(st as never) };
+  }
+
+  it('an owner fact with sourceKind tool and no sourceUri is not exported', async () => {
+    const { eng } = await fresh();
+    const r = await eng.storeFact({ subject: 'Anna', subjectType: 'Person', predicate: 'livesIn', object: 'ToolNoUri',
+      objectType: 'literal', sourceKind: 'tool', status: 'accepted' } as never, OWNER);
+    expect(r.success).toBe(true);
+    const out = await buildVaultExport(eng, { agentId: AGENT });
+    expect(JSON.stringify(out.notes)).not.toContain('ToolNoUri');
+    expect(out.notes).toEqual([]);
+    expect(out.totals['skipped: no vault provenance']).toBe(1);
+  });
+
+  it('a fact with a non-vault sourceUri is not exported', async () => {
+    const { eng } = await fresh();
+    await eng.storeFact({ subject: 'Anna', subjectType: 'Person', predicate: 'livesIn', object: 'WebUri',
+      objectType: 'literal', sourceKind: 'tool', status: 'accepted', evidenceType: 'web-source',
+      sourceUri: 'https://example.org/vault://x' } as never, OWNER);
+    const out = await buildVaultExport(eng, { agentId: AGENT });
+    expect(out.notes).toEqual([]);
+  });
+
+  it('a fact imported by importVault is exported (the export is not simply empty)', async () => {
+    const { eng } = await fresh();
+    const imp = await importVault(eng, { root: FIXTURE, vaultName: 'demo', agentId: AGENT, apply: true });
+    expect(imp.totals.stored).toBeGreaterThan(0);
+    await eng.storeFact({ subject: 'Anna', subjectType: 'Person', predicate: 'livesIn', object: 'ToolNoUri',
+      objectType: 'literal', sourceKind: 'tool', status: 'accepted' } as never, OWNER);
+    const out = await buildVaultExport(eng, { agentId: AGENT });
+    expect(out.notes.length).toBeGreaterThan(0);
+    expect(out.notes.some(n => /hummus\.md$/.test(n.path))).toBe(true);
+    expect(JSON.stringify(out.notes)).not.toContain('ToolNoUri');
   });
 });
 
