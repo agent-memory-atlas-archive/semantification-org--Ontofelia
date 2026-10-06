@@ -1420,7 +1420,7 @@ export class KnowledgeEngine {
    * explicit IRI; a query that reads a variable graph (`GRAPH ?g`), federates
    * (`SERVICE`), imports a dataset (`FROM`) or is not a SELECT is refused.
    */
-  async selectExplicitGraphs(sparql: string): Promise<Array<Record<string, { type: string; value: string; datatype?: string; 'xml:lang'?: string }>>> {
+  async selectExplicitGraphs(sparql: string): Promise<Array<Record<string, { type: string; value: string; datatype?: string; 'xml:lang'?: string; language?: string }>>> {
     const body = sparql;
     if (!/^\s*(PREFIX\s+[^\s:]*:\s*<[^>]*>\s*)*SELECT\b/i.test(body)
       || /\bGRAPH\s*[?$]/i.test(body) || /\b(SERVICE|FROM)\b/i.test(body)) {

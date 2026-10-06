@@ -10,10 +10,13 @@
  * explicit IRI. User, self, session, inferred, cog and evidence graphs are
  * never read. Evidence text, raw text and source spans are never exported.
  */
+import { constants as fsc, promises as fs } from 'fs';
+import * as path from 'path';
 import * as yaml from 'js-yaml';
 import type { KnowledgeEngine } from '../KnowledgeEngine.js';
 import { GraphUriResolver, SHARED_GRAPHS } from '../utils/GraphUriResolver.js';
 import { sparqlIri } from '../utils/SparqlSyntax.js';
+import { isReferenceString, isWikiLinkSafe } from '../ingestion/VaultNoteMapper.js';
 
 export interface VaultExportOptions { agentId: string; vaultName?: string; }
 export interface VaultExportNote { path: string; content: string; subject: string; facts: number; }
@@ -24,6 +27,7 @@ export interface VaultExportReport {
 }
 
 const CORE = 'urn:shared:ontology#';
+const ENTITY_NS = 'urn:ontofelia:entity:';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const RDFS_LABEL = 'http://www.w3.org/2000/01/rdf-schema#label';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -34,7 +38,25 @@ const RESERVED_KEYS = new Set(['id', '@id', '@type', '@context', 'tags', 'aliase
 const MAX_NAME = 120;
 const SEP = '\u001f';
 
-type Term = { type: string; value: string; datatype?: string; 'xml:lang'?: string };
+/**
+ * Value encodings (what the importer reads back):
+ *  - plain string/number           a literal that cannot be mistaken for a reference
+ *  - `[[name]]`                    a reference to the entity labelled `name`
+ *  - `{"@value": text}`            a string literal that LOOKS like a reference
+ *                                  (`[[X]]`, `prefix:local`): without this form the
+ *                                  importer would turn it into an entity
+ *  - `{"@value": t, "@language"}`  a language-tagged literal (the importer validates
+ *                                  the tag but cannot store it)
+ *  - `{"@id": name-or-IRI}`        a reference that `[[...]]` cannot spell: a name with
+ *                                  `]`, `|`, `#`, `/` or outer whitespace, or an
+ *                                  unlabelled absolute IRI (e.g. a skos: class), which
+ *                                  the importer resolves back to that same IRI
+ */
+type Value = string | number | { '@value': string; '@language'?: string } | { '@id': string };
+
+type Term = { type: string; value: string; datatype?: string; 'xml:lang'?: string; language?: string };
+/** The embedded adapter reports `language`, the SPARQL JSON protocol `xml:lang`. */
+const langOf = (t: Term): string | undefined => t['xml:lang'] || t.language || undefined;
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Part of an IRI after `#` or the last `/` (percent-decoded when valid). */
@@ -148,12 +170,13 @@ WHERE {
     if (r.s.type !== 'uri') { skip(r.c.value, 'blank node subject'); continue; }
     if (r.o.type === 'bnode') { skip(r.c.value, 'blank node object'); continue; }
     if (r.p.value === RDFS_LABEL) continue; // rendered as `label`
+    if (r.o.type !== 'uri' && !r.o.value.trim()) { skip(r.c.value, 'empty literal'); continue; }
     const key = r.p.value === RDF_TYPE ? 'type' : localName(r.p.value);
     if (key === 'label') continue; // rendered as `label`, like rdfs:label
     if (key !== 'type' && RESERVED_KEYS.has(key)) { skip(r.c.value, 'reserved key'); continue; }
     if (!key) { skip(r.c.value, 'empty predicate name'); continue; }
     const facts = bySubject.get(r.s.value) ?? new Map<string, Fact>();
-    facts.set(`${r.p.value}\u0000${r.o.type}\u0000${r.o.value}\u0000${r.o.datatype ?? ''}`, { p: r.p.value, o: r.o });
+    facts.set(`${r.p.value}\u0000${r.o.type}\u0000${r.o.value}\u0000${r.o.datatype ?? ''}\u0000${langOf(r.o) ?? ''}`, { p: r.p.value, o: r.o });
     bySubject.set(r.s.value, facts);
   }
 
@@ -188,48 +211,63 @@ WHERE {
   }
 
   // 5. Render.
+  /** A reference to `iri`: by label when it has one, else by its absolute IRI. */
+  const refValue = (iri: string): Value => {
+    if (subjectSet.has(iri) || labels.has(iri) || iri.startsWith(ENTITY_NS) || !/^https?:\/\//.test(iri)) {
+      const name = labelOf(iri);
+      return isWikiLinkSafe(name) ? `[[${name}]]` : { '@id': name };
+    }
+    try { sparqlIri(iri); } catch { return { '@id': labelOf(iri) }; }
+    return { '@id': iri };
+  };
+  const literalValue = (t: Term): Value => {
+    const lang = langOf(t);
+    if (lang) return { '@value': t.value, '@language': lang };
+    const sc = scalar(t);
+    return typeof sc === 'string' && isReferenceString(sc) ? { '@value': sc } : sc;
+  };
+  const sortKey = (x: Value): string =>
+    typeof x === 'number' ? `n${x}` : typeof x === 'string' ? `s${x}` : `o${JSON.stringify(x)}`;
+  const uniqueSorted = (xs: Value[]): Value[] =>
+    [...new Map(xs.map(x => [sortKey(x), x])).entries()].sort((a, b) => cmp(a[0], b[0])).map(e => e[1]);
+
   const notes: VaultExportNote[] = [];
   for (const s of subjects) {
     const facts = [...bySubject.get(s)!.values()];
-    const values = new Map<string, Array<string | number>>();
-    const types: string[] = [];
+    const values = new Map<string, Value[]>();
+    const types: Value[] = [];
     for (const f of facts) {
       if (f.p === RDF_TYPE) {
-        if (f.o.type === 'uri') types.push(labelOf(f.o.value));
+        if (f.o.type === 'uri') types.push(refValue(f.o.value));
         continue;
       }
       const key = localName(f.p);
-      let v: string | number;
+      let v: Value;
       if (f.o.type === 'uri') {
-        // An exported object becomes a wiki link. An object that is not itself
-        // exported is written as its plain label, never as a wiki link, so the
-        // vault has no dangling links to notes that do not exist.
-        v = subjectSet.has(f.o.value) ? `[[${nameOf.get(f.o.value)}]]` : labelOf(f.o.value);
+        v = refValue(f.o.value);
       } else {
-        v = scalar(f.o);
+        v = literalValue(f.o);
       }
       const arr = values.get(key) ?? [];
       arr.push(v);
       values.set(key, arr);
     }
-    const typeLinks = [...new Set(types)].sort(cmp);
+    const typeVals = uniqueSorted(types);
     const fm: Record<string, unknown> = {};
-    if (typeLinks.length) {
-      const links = typeLinks.map(t => `[[${sanitizeFileName(t)}]]`);
-      fm.type = links.length === 1 ? links[0] : links;
-    }
+    if (typeVals.length) fm.type = typeVals.length === 1 ? typeVals[0] : typeVals;
     const label = labelOf(s);
     fm.label = label;
-    const order = (x: string | number): string => `${typeof x === 'number' ? 'n' : 's'}${String(x)}`;
     for (const key of [...values.keys()].sort(cmp)) {
-      const vs = [...new Map(values.get(key)!.map(x => [order(x), x])).entries()]
-        .sort((a, b) => cmp(a[0], b[0])).map(e => e[1]);
+      const vs = uniqueSorted(values.get(key)!);
       fm[key] = vs.length === 1 ? vs[0] : vs;
     }
     const front = yaml.dump(fm, {
       schema: yaml.CORE_SCHEMA, sortKeys: false, lineWidth: -1, noRefs: true, quotingType: '"',
     });
-    const folder = typeLinks.length ? sanitizeFileName(typeLinks[0]) : 'Untyped';
+    const first = typeVals[0];
+    const folder = first === undefined ? 'Untyped'
+      : sanitizeFileName(typeof first === 'string' ? first.replace(/^\[\[|\]\]$/g, '')
+        : typeof first === 'object' && '@id' in first ? first['@id'] : 'Untyped');
     notes.push({
       path: `${folder}/${nameOf.get(s)}.md`,
       content: `---\n${front}---\n# ${label.replace(/\s+/g, ' ').trim()}\n`,
@@ -251,4 +289,96 @@ WHERE {
     totals[`skipped: ${reason}`] = n;
   }
   return { notes, skipped, totals };
+}
+
+export interface WriteVaultExportOptions {
+  agentId: string;
+  /** Target folder; created when missing. */
+  dir: string;
+  /** Allow a non-empty folder. Nothing is ever deleted; only the export's own files are replaced. */
+  overwrite?: boolean;
+}
+export interface WriteVaultExportReport {
+  dir: string;
+  notesWritten: number;
+  /** Folder-relative paths of the written files, sorted. */
+  paths: string[];
+  skipped: VaultExportReport['skipped'];
+  totals: Record<string, number>;
+}
+
+/** Path segments are checked again here, whatever produced them. */
+function assertSafeRelPath(rel: string): string[] {
+  const parts = rel.split('/');
+  const bad = path.isAbsolute(rel) || rel.includes('\\') || rel.includes('\0') || parts.length !== 2
+    || parts.some(p => p === '' || p === '.' || p === '..');
+  if (bad) throw new Error(`Refusing unsafe export path: ${JSON.stringify(rel.slice(0, 80))}`);
+  return parts;
+}
+
+async function lstatOrNull(p: string): Promise<import('fs').Stats | null> {
+  try { return await fs.lstat(p); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+/** Throws unless `p` is absent or a real (non-symlink) entry of the wanted kind. */
+async function assertNotSymlink(p: string, kind: 'dir' | 'file'): Promise<boolean> {
+  const st = await lstatOrNull(p);
+  if (!st) return false;
+  if (st.isSymbolicLink()) throw new Error(`Refusing to write through a symlink: ${path.basename(p)}`);
+  if (kind === 'dir' ? !st.isDirectory() : !st.isFile()) {
+    throw new Error(`Refusing to replace a non-${kind === 'dir' ? 'directory' : 'regular file'}: ${path.basename(p)}`);
+  }
+  return true;
+}
+
+/**
+ * Build the export and write one `.md` per note under `opts.dir`.
+ *
+ * Safety: a non-empty folder is refused unless `overwrite`; even then nothing
+ * is deleted, only the export's own files are created or replaced. Every
+ * target is checked up front (no symlink, no non-regular file, safe name),
+ * before the first byte is written, and files are opened with O_NOFOLLOW.
+ */
+export async function writeVaultExport(
+  engine: KnowledgeEngine, opts: WriteVaultExportOptions,
+): Promise<WriteVaultExportReport> {
+  const dir = path.resolve(opts.dir);
+  const report = await buildVaultExport(engine, { agentId: opts.agentId });
+  const plan = report.notes.map(n => ({ note: n, parts: assertSafeRelPath(n.path) }));
+  const seen = new Set<string>();
+  for (const { note } of plan) {
+    const k = note.path.toLowerCase();
+    if (seen.has(k)) throw new Error('Refusing colliding export paths');
+    seen.add(k);
+  }
+
+  const dirSt = await lstatOrNull(dir);
+  if (dirSt) {
+    if (dirSt.isSymbolicLink()) throw new Error('Refusing a symlink as export folder');
+    if (!dirSt.isDirectory()) throw new Error('Export folder is not a directory');
+    if (!opts.overwrite && (await fs.readdir(dir)).length > 0) {
+      throw new Error('Export folder is not empty (pass overwrite to replace the export\'s own files)');
+    }
+  }
+  for (const { parts } of plan) {
+    await assertNotSymlink(path.join(dir, parts[0]), 'dir');
+    await assertNotSymlink(path.join(dir, parts[0], parts[1]), 'file');
+  }
+
+  if (!dirSt) await fs.mkdir(dir, { recursive: true });
+  const written: string[] = [];
+  for (const { note, parts } of plan) {
+    const folder = path.join(dir, parts[0]);
+    const target = path.join(folder, parts[1]);
+    // Re-check immediately before writing (narrows the window for a swapped entry).
+    if (!(await assertNotSymlink(folder, 'dir'))) await fs.mkdir(folder);
+    await assertNotSymlink(target, 'file');
+    const fh = await fs.open(target, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_TRUNC | fsc.O_NOFOLLOW, 0o644);
+    try { await fh.writeFile(note.content, 'utf8'); } finally { await fh.close(); }
+    written.push(note.path);
+  }
+  return { dir, notesWritten: written.length, paths: written.sort(cmp), skipped: report.skipped, totals: report.totals };
 }

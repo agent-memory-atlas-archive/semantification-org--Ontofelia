@@ -73,13 +73,13 @@ describe('buildVaultExport', () => {
   });
 
   it('canaries really sit in the store (so their absence is selection, not emptiness)', async () => {
-    const r: any = await store.query(`SELECT ?o WHERE { GRAPH ?g { ?s ?p ?o }
+    const r = await store.query(`SELECT ?o WHERE { GRAPH ?g { ?s ?p ?o }
       FILTER(?o IN ("Cologne","SecretCanary","OrphanCanary","SelfCanary","InferredCanary") ||
              STRENDS(STR(?o), "Cologne")) }`);
-    expect(r.bindings.length).toBeGreaterThanOrEqual(5);
-    const claim: any = await store.query(`SELECT ?c WHERE { GRAPH <urn:${AGENT}:claims> {
+    expect(r.bindings?.length).toBeGreaterThanOrEqual(5);
+    const claim = await store.query(`SELECT ?c WHERE { GRAPH <urn:${AGENT}:claims> {
       ?c <urn:shared:ontology#claimObject> "RetiredCanary" ; <urn:shared:ontology#sourceKind> "tool" } }`);
-    expect(claim.bindings.length).toBe(1);
+    expect(claim.bindings?.length).toBe(1);
   });
 
   it('reports why claims were skipped', () => {
