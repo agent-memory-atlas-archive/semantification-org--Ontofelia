@@ -81,6 +81,14 @@ export const configSchema = z.object({
       token: z.string().optional(),
       allowedChats: z.array(z.string()).default([]),
       ownerChatId: z.string().optional(),
+      // Telegram user id of the owner (digits). Only this account is treated as
+      // the owner; every other approved account gets its own identity without
+      // owner rights. A bare number in JSON5 is accepted and normalised to a
+      // string. When unset, every approved account is the owner (legacy mode).
+      ownerId: z.union([
+        z.string().regex(/^[0-9]+$/, 'must be a Telegram user id (digits only)'),
+        z.number().int().positive().transform((n) => String(n)),
+      ]).optional(),
       // Show a live "thinking"/progress status message that updates along the
       // agent's processing phases (in addition to the always-on typing
       // indicator). Defaults to on when unset; set false to keep the chat
