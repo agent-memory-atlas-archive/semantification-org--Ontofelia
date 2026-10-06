@@ -13,8 +13,33 @@ export const PAIRING_APPROVE_WARNING =
   'Separate per-user identities are planned but not implemented yet. ' +
   'Discord users are not treated as the owner.';
 
+export const PAIRING_APPROVE_WARNING_OWNER_SET =
+  'Note: channels.telegram.ownerId is set. The approved Telegram user gets their own identity ' +
+  "and a private memory, without owner rights (no owner commands, no owner memory). " +
+  'Only the configured owner account is the owner. Discord users are not treated as the owner.';
+
 export const PAIRING_LIST_NOTE =
   'Note: approving a Telegram request grants owner rights (shell access, owner commands, owner memory).';
+
+export const PAIRING_LIST_NOTE_OWNER_SET =
+  'Note: channels.telegram.ownerId is set; approved Telegram users get their own identity without owner rights.';
+
+type OwnerAwareConfig = { channels?: { telegram?: { ownerId?: string | number } } } | undefined;
+
+/** True when the Telegram owner id is configured, so approval grants no owner rights. */
+export function telegramOwnerConfigured(config: OwnerAwareConfig): boolean {
+  const id = config?.channels?.telegram?.ownerId;
+  return id !== undefined && id !== null && String(id) !== '';
+}
+
+/** Best effort: an unreadable config means the conservative legacy warning. */
+async function ownerConfigured(): Promise<boolean> {
+  try {
+    return telegramOwnerConfigured((await loadConfig()) as OwnerAwareConfig);
+  } catch {
+    return false;
+  }
+}
 
 /** Decide whether `pairing approve` may proceed. `answer` is the confirmation result when prompted. */
 export function shouldProceed(opts: { yes?: boolean; isTTY?: boolean; answer?: boolean }): boolean {
@@ -47,7 +72,10 @@ export function registerPairingCommand(program: Command) {
         requests.forEach(r => {
           console.log(`${chalk.yellow(r.code)}: ${r.channel} user ${r.displayName || r.senderId} (${r.senderId}) - requested at ${new Date(r.createdAt).toLocaleString()}`);
         });
-        if (requests.length > 0) console.log(chalk.yellow(`\n${PAIRING_LIST_NOTE}`));
+        if (requests.length > 0) {
+          const note = telegramOwnerConfigured(config as OwnerAwareConfig) ? PAIRING_LIST_NOTE_OWNER_SET : PAIRING_LIST_NOTE;
+          console.log(chalk.yellow(`\n${note}`));
+        }
       } catch (err: unknown) {
         console.error(chalk.red(`Failed to list pairing requests: ${(err as Error).message}`));
       }
@@ -60,7 +88,8 @@ export function registerPairingCommand(program: Command) {
     .option('--yes', 'Skip confirmation prompt')
     .action(async (code, options: { yes?: boolean }) => {
       try {
-        console.log(chalk.yellow(PAIRING_APPROVE_WARNING));
+        const ownerSet = await ownerConfigured();
+        console.log(chalk.yellow(ownerSet ? PAIRING_APPROVE_WARNING_OWNER_SET : PAIRING_APPROVE_WARNING));
         const isTTY = Boolean(process.stdin.isTTY);
         if (!options.yes && !isTTY) {
           console.error(chalk.red('Refusing to approve without confirmation in a non-interactive session. Pass --yes to approve.'));
@@ -69,7 +98,7 @@ export function registerPairingCommand(program: Command) {
         }
         const answer = options.yes || !isTTY
           ? undefined
-          : await confirm({ message: 'Approve this pairing and grant owner rights?', default: false });
+          : await confirm({ message: ownerSet ? 'Approve this pairing (the user gets their own identity, no owner rights)?' : 'Approve this pairing and grant owner rights?', default: false });
         if (!shouldProceed({ yes: options.yes, isTTY, answer })) {
           console.log(chalk.gray('Cancelled.'));
           return;

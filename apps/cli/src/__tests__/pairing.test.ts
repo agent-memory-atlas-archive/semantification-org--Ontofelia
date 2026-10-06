@@ -5,6 +5,8 @@ import {
   registerPairingCommand,
   shouldProceed,
   PAIRING_APPROVE_WARNING,
+  PAIRING_APPROVE_WARNING_OWNER_SET,
+  telegramOwnerConfigured,
 } from '../commands/pairing.js';
 
 vi.mock('@ontofelia/config', () => ({
@@ -45,6 +47,34 @@ describe('pairing approve', () => {
   it('warning mentions shell and owner', () => {
     expect(PAIRING_APPROVE_WARNING).toContain('shell');
     expect(PAIRING_APPROVE_WARNING).toContain('owner');
+  });
+
+  const printed = () => vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join('\n');
+
+  it('ownerId unset: prints the owner-rights warning', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    await program.parseAsync(['node', 'test', 'pairing', 'approve', 'ABC123', '--yes']);
+    expect(printed()).toContain('gives that person the same rights as the owner');
+  });
+
+  it('ownerId set: no owner-rights claim, says the user gets their own identity', async () => {
+    vi.mocked(configPkg.loadConfig).mockResolvedValue({
+      gateway: { port: 1, token: 't' }, channels: { telegram: { ownerId: '1000001' } },
+    } as unknown as Awaited<ReturnType<typeof configPkg.loadConfig>>);
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    await program.parseAsync(['node', 'test', 'pairing', 'approve', 'ABC123', '--yes']);
+    const out = printed();
+    expect(out).not.toContain('gives that person the same rights as the owner');
+    expect(out).toContain('own identity');
+    expect(out).toContain('without owner rights');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('telegramOwnerConfigured', () => {
+    expect(telegramOwnerConfigured(undefined)).toBe(false);
+    expect(telegramOwnerConfigured({ channels: { telegram: {} } })).toBe(false);
+    expect(telegramOwnerConfigured({ channels: { telegram: { ownerId: '5' } } })).toBe(true);
+    expect(PAIRING_APPROVE_WARNING_OWNER_SET).toContain('ownerId');
   });
 
   it('non-TTY without --yes does not call fetch', async () => {
