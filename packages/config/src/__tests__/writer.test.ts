@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import JSON5 from 'json5';
 import { updateConfigField } from '../writer.js';
+import { setJson5Value } from '../json5Edit.js';
 
 describe('updateConfigField', () => {
   let tmpDir: string;
@@ -92,7 +93,7 @@ describe('updateConfigField preserves text', () => {
     expect(b.length).toBe(a.length);
     const diff = a.map((l, i) => (l === b[i] ? -1 : i)).filter((i) => i >= 0);
     expect(diff.length).toBe(1);
-    expect(b[diff[0]]).toBe(`    defaultModel: "new-model", // keep me`);
+    expect(b[diff[0]]).toBe(`    defaultModel: 'new-model', // keep me`);
     for (const c of ['// Ontofelia config - hand maintained', '/* block comment', '// listen port', '// keep me', '// trailing section comment']) {
       expect(after).toContain(c);
     }
@@ -164,5 +165,38 @@ describe('updateConfigField preserves text', () => {
     await updateConfigField(missing, 'provider.defaultModel', 'm');
     expect(JSON5.parse(await fs.readFile(missing, 'utf-8'))).toEqual({ provider: { defaultModel: 'm' } });
     await expect(fs.stat(missing + '.bak')).rejects.toThrow();
+  });
+});
+
+describe('setJson5Value quote style', () => {
+  it('keeps the quote style of the existing value', () => {
+    const single = setJson5Value("{ provider: { defaultModel: 'gpt-5.5' } }", ['provider', 'defaultModel'], 'gpt-5.6-luna');
+    expect(single).toContain("defaultModel: 'gpt-5.6-luna'");
+    const double = setJson5Value('{ provider: { defaultModel: "gpt-5.5" } }', ['provider', 'defaultModel'], 'gpt-5.6-luna');
+    expect(double).toContain('defaultModel: "gpt-5.6-luna"');
+  });
+
+  it('round-trips awkward strings through a single-quoted literal', () => {
+    const tricky = `it's "q" \\ back\nline\r\t\u2028\u2029 end`;
+    const out = setJson5Value("{ a: 'x' }", ['a'], tricky);
+    expect(out.startsWith("{ a: '")).toBe(true);
+    expect(JSON5.parse(out).a).toBe(tricky);
+    const nested = setJson5Value("{ a: 'x' }", ['a'], { k: [tricky] });
+    expect(JSON5.parse(nested).a).toEqual({ k: [tricky] });
+  });
+
+  it('uses the dominant style of the file for a non-string old value', () => {
+    const out = setJson5Value("{ n: 1, a: 'x', b: 'y', c: \"z\" }", ['n'], 'str');
+    expect(out).toContain("n: 'str'");
+  });
+
+  it('inserts with the dominant quote style of the file', () => {
+    const singles = setJson5Value("{ a: 'x', b: 'y', c: \"z\" }", ['d'], { e: "it's" });
+    expect(singles).toContain("d: {'e':'it\\'s'}");
+    expect(JSON5.parse(singles).d).toEqual({ e: "it's" });
+    const tie = setJson5Value("{ a: 'x', b: \"y\" }", ['d'], 'v');
+    expect(tie).toContain('d: "v"');
+    const none = setJson5Value('{ a: 1, // \'not a string\'\n}', ['d'], 'v');
+    expect(none).toContain('d: "v"');
   });
 });
