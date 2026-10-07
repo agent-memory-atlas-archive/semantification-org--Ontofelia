@@ -33,8 +33,13 @@ type Node = ObjectNode | OtherNode;
 
 class ScanError extends Error {}
 
+type QuoteStyle = 'single' | 'double';
+
 class Scanner {
   pos = 0;
+  /** Number of string literals (keys included, comments excluded) per delimiter. */
+  singleQuoted = 0;
+  doubleQuoted = 0;
   constructor(readonly text: string) {}
 
   fail(msg: string): never {
@@ -63,6 +68,8 @@ class Scanner {
   scanString(): void {
     const t = this.text;
     const quote = t[this.pos];
+    if (quote === "'") this.singleQuoted++;
+    else this.doubleQuoted++;
     this.pos++;
     for (;;) {
       if (this.pos >= t.length) this.fail('unterminated string');
@@ -174,10 +181,57 @@ function onlyIndentBefore(text: string, pos: number): boolean {
   return /^[ \t]*$/.test(text.slice(lineStart, pos));
 }
 
-function buildLiteral(path: string[], value: unknown): string {
+function quoteSingle(s: string): string {
+  return (
+    "'" +
+    s.replace(/['\\\n\r\t\u2028\u2029\b\f\v\0]/g, (c) => {
+      switch (c) {
+        case "'": return "\\'";
+        case '\\': return '\\\\';
+        case '\n': return '\\n';
+        case '\r': return '\\r';
+        case '\t': return '\\t';
+        case '\b': return '\\b';
+        case '\f': return '\\f';
+        case '\v': return '\\v';
+        case '\0': return '\\u0000';
+        default: return '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0');
+      }
+    }) +
+    "'"
+  );
+}
+
+/** Serialise like JSON.stringify, but with the chosen quote style for strings. */
+function stringifyStyled(value: unknown, style: QuoteStyle): string {
   const json = JSON.stringify(value);
   if (json === undefined) throw new Error('Value is not JSON serialisable');
-  let out = json;
+  if (style === 'double') return json;
+  const walk = (v: unknown): string => {
+    if (typeof v === 'string') return quoteSingle(v);
+    if (v !== null && typeof v === 'object' && typeof (v as { toJSON?: unknown }).toJSON === 'function') {
+      return walk(JSON.parse(JSON.stringify(v)));
+    }
+    if (Array.isArray(v)) return '[' + v.map((x) => (JSON.stringify(x) === undefined ? 'null' : walk(x))).join(',') + ']';
+    if (v !== null && typeof v === 'object') {
+      const parts: string[] = [];
+      for (const [k, x] of Object.entries(v)) {
+        if (JSON.stringify(x) === undefined) continue;
+        parts.push(`${quoteSingle(k)}:${walk(x)}`);
+      }
+      return '{' + parts.join(',') + '}';
+    }
+    return JSON.stringify(v);
+  };
+  return walk(JSON.parse(json));
+}
+
+function dominantStyle(scanner: Scanner): QuoteStyle {
+  return scanner.singleQuoted > scanner.doubleQuoted ? 'single' : 'double';
+}
+
+function buildLiteral(path: string[], value: unknown, style: QuoteStyle): string {
+  let out = stringifyStyled(value, style);
   for (let i = path.length - 1; i >= 1; i--) {
     out = `{ ${formatKey(path[i])}: ${out} }`;
   }
@@ -210,8 +264,7 @@ function skipTrailingComment(text: string, pos: number): number {
  */
 export function setJson5Value(text: string, path: string[], value: unknown): string {
   if (path.length === 0) throw new Error('Empty path');
-  const json = JSON.stringify(value);
-  if (json === undefined) throw new Error('Value is not JSON serialisable');
+  if (JSON.stringify(value) === undefined) throw new Error('Value is not JSON serialisable');
 
   const scanner = new Scanner(text);
   let root: Node;
@@ -230,8 +283,11 @@ export function setJson5Value(text: string, path: string[], value: unknown): str
     const key = path[i];
     let member: Member | undefined;
     for (const m of obj.members) if (m.key === key) member = m;
-    if (!member) return insertMember(text, obj, path.slice(i), value);
+    if (!member) return insertMember(text, obj, path.slice(i), value, dominantStyle(scanner));
     if (i === path.length - 1) {
+      const old = text[member.valueStart];
+      const style: QuoteStyle = old === "'" ? 'single' : old === '"' ? 'double' : dominantStyle(scanner);
+      const json = stringifyStyled(value, style);
       return text.slice(0, member.valueStart) + json + text.slice(member.valueEnd);
     }
     if (member.node.kind !== 'object') {
@@ -243,8 +299,8 @@ export function setJson5Value(text: string, path: string[], value: unknown): str
   throw new Error('unreachable');
 }
 
-function insertMember(text: string, obj: ObjectNode, rest: string[], value: unknown): string {
-  const member = `${formatKey(rest[0])}: ${buildLiteral(rest, value)}`;
+function insertMember(text: string, obj: ObjectNode, rest: string[], value: unknown, style: QuoteStyle): string {
+  const member = `${formatKey(rest[0])}: ${buildLiteral(rest, value, style)}`;
   const closePos = obj.end - 1;
   const parentIndent = lineIndent(text, obj.start);
 
