@@ -199,18 +199,25 @@ describe('NotificationService', () => {
     });
 
     // M2: the queued digest is bounded at queue time (drop-oldest).
+    // Each deliver() costs ~4-9 ms alone (queue insert + prune + episode append) and
+    // several times that under parallel turbo load, so overshoot the bound by only a
+    // few items (5 s timeout was hit with 100 items). DIGEST_QUEUE_MAX is not exported.
     it('bounds the stored queue to the newest 50 items (M2)', async () => {
+      const BOUND = 50;
+      const OVERSHOOT = 5;
       const svc = makeService({ policy: { maxPerDay: 0 } }); // all suppressed
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < BOUND + OVERSHOOT; i++) {
         clockNow = new Date(Date.UTC(2026, 5, 1, 0, i, 0)); // distinct minute per item
         await svc.deliver({ message: `msg-${i}`, priority: 'normal' });
       }
       const drained = await svc.drainDigest();
-      expect(drained.length).toBe(50);
+      expect(drained.length).toBe(BOUND);
       const messages = drained.map((d) => d.message);
-      // Newest kept, oldest dropped.
-      expect(messages).toContain('msg-99');
+      // Newest kept, the OVERSHOOT oldest dropped, the first survivor is exactly msg-OVERSHOOT.
+      expect(messages).toContain(`msg-${BOUND + OVERSHOOT - 1}`);
       expect(messages).not.toContain('msg-0');
+      expect(messages).not.toContain(`msg-${OVERSHOOT - 1}`);
+      expect(messages[0]).toBe(`msg-${OVERSHOOT}`);
     });
   });
 
