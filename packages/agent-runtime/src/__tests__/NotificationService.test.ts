@@ -202,6 +202,7 @@ describe('NotificationService', () => {
     // Each deliver() costs ~4-9 ms alone (queue insert + prune + episode append) and
     // several times that under parallel turbo load, so overshoot the bound by only a
     // few items (5 s timeout was hit with 100 items). DIGEST_QUEUE_MAX is not exported.
+    // Explicit 15 s timeout: under 12 parallel runs on 8 cores this test took up to 4.3 s.
     it('bounds the stored queue to the newest 50 items (M2)', async () => {
       const BOUND = 50;
       const OVERSHOOT = 5;
@@ -218,7 +219,7 @@ describe('NotificationService', () => {
       expect(messages).not.toContain('msg-0');
       expect(messages).not.toContain(`msg-${OVERSHOOT - 1}`);
       expect(messages[0]).toBe(`msg-${OVERSHOOT}`);
-    });
+    }, 15_000);
   });
 
   // H1 — invalid IANA timezone must NOT throw and lose the message.
