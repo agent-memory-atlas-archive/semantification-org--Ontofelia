@@ -72,7 +72,12 @@ All values shown are the defaults.
       enabled: false,
       token: "",                    // Bot token from @BotFather
       allowedChats: [],             // Allowed Telegram chat IDs
-      // ownerChatId: "..."
+      // ownerChatId: "...",
+      // Telegram user id of the owner (digits). Only this account is the owner;
+      // other approved users get their own identity without owner rights.
+      // If unset, every approved Telegram user is the owner (a warning is
+      // logged at start). See docs/channels.md.
+      // ownerId: "123456789"
     },
     discord: {
       enabled: false,
@@ -108,6 +113,7 @@ All values shown are the defaults.
   // Tool and security policy
   tools: {
     allow: [],                      // Explicitly allowed host-only tools, e.g. ["exec"]
+                                    // (never for a non-owner person on a chat channel)
     deny: []                        // Explicitly denied tools
   },
   plugins: {
