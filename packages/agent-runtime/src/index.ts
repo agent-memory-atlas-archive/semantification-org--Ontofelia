@@ -1227,6 +1227,7 @@ Users can use these commands:
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
             episodicRecallEnabled,
             ...(await this.promptOptions()),
+            attention: await this.cognitiveConfig.attentionSettings(),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             // Surface the cognitive phases on the live debug stream so the
@@ -2133,6 +2134,7 @@ Users can use these commands:
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
             episodicRecallEnabled,
             ...(await this.promptOptions()),
+            attention: await this.cognitiveConfig.attentionSettings(),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),

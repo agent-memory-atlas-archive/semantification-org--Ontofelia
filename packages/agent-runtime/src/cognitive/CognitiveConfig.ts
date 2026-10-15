@@ -13,7 +13,7 @@
 
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
-import { DEFAULT_THETA } from './WorkingMemory.js';
+import { DEFAULT_CAPACITY, DEFAULT_THETA } from './WorkingMemory.js';
 import { DEFAULT_RECALLED_TOKEN_CAP, DEFAULT_TOTAL_TOKEN_CAP } from './PromptAssembler.js';
 
 const COGT = 'urn:shared:ontology#cog/';
@@ -41,6 +41,20 @@ export interface PromptSettings {
   theta: number;
   recalledTokenCap: number;
   totalTokenCap: number;
+}
+
+/**
+ * Attention parameters from the setup graph, on the same config subject:
+ *
+ *   cog.salienceThreshold       θ in [0,1]; default 0.5 (shared with the assembler)
+ *   cog.workingMemoryCapacity   entries per cycle graph, integer 1..10000; default 200
+ *
+ * A missing, unparseable or out-of-range value falls back to the default, which
+ * equals the behaviour before the keys existed.
+ */
+export interface AttentionSettings {
+  theta: number;
+  capacity: number;
 }
 
 /** One cognitive feature flag: its setup-graph name, short key and a one-line description. */
@@ -256,6 +270,21 @@ export class CognitiveConfig {
       theta: theta !== undefined && theta >= 0 && theta <= 1 ? theta : DEFAULT_THETA,
       recalledTokenCap: cap(recalled, DEFAULT_RECALLED_TOKEN_CAP),
       totalTokenCap: cap(total, DEFAULT_TOTAL_TOKEN_CAP),
+    };
+  }
+
+  /** θ and the working-memory capacity (see {@link AttentionSettings}). */
+  async attentionSettings(): Promise<AttentionSettings> {
+    const [theta, capacity] = await Promise.all([
+      this.readNumber('salienceThreshold').catch(() => undefined),
+      this.readNumber('workingMemoryCapacity').catch(() => undefined),
+    ]);
+    return {
+      theta: theta !== undefined && theta >= 0 && theta <= 1 ? theta : DEFAULT_THETA,
+      capacity:
+        capacity !== undefined && Number.isInteger(capacity) && capacity >= 1 && capacity <= 10_000
+          ? capacity
+          : DEFAULT_CAPACITY,
     };
   }
 

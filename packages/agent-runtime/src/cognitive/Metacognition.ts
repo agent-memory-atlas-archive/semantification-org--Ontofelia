@@ -47,6 +47,8 @@ export interface ImpasseInput {
   context: string;
   cycleId?: string;
   occurredAt?: Date;
+  /** The user key of the cycle that raised the impasse; written as `cogt:forUser` when given. */
+  forUser?: string;
 }
 
 export interface FlaggedImpasse {
@@ -165,6 +167,7 @@ export class Metacognition {
       `<${uri}> <${COGT}context> "${escapeLiteral(input.context)}" .`,
     ];
     if (input.cycleId) lines.push(`<${uri}> <${COGT}cycleId> "${escapeLiteral(input.cycleId)}" .`);
+    if (input.forUser) lines.push(`<${uri}> <${COGT}forUser> "${escapeLiteral(input.forUser)}" .`);
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
     return { id: uri, kind: input.kind, chronic };
   }

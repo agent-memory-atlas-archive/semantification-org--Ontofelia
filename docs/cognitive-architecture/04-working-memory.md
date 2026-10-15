@@ -355,4 +355,28 @@ diff in the cycle graph (`cogt:PromptShadow`); `flagWorkingMemoryPrompt` builds
 the cognitive blocks from the assembler instead of the legacy strings. Live wins
 when both are on. The always-on graph context of the prompt is not replaced.
 
+## 11. Implementation notes: carry-over and attention (cycle manager on)
+
+Done by the queued persist of the next cycle, never on the reply path:
+
+- **Carry.** The previous cycle of the same session and the same user is carried
+  into the current one: `selfBuffer` entries, `goalBuffer` entries of goals that
+  are still live (the implicit respond-to-user goal excluded), and entries with
+  `carryForward = true` (flagged notes). Salience x 0.7, `carriedFrom` to the
+  source entry. An entry the current cycle already holds in the same form
+  (buffer, kind, payload, goal) is not copied again. Nothing carries across
+  users or sessions; the link is held in memory, so the first cycle after a
+  restart has nothing to carry.
+- **Close.** The previous graph gets a `cogt:closedAt` timestamp and is kept; the
+  age-based sweep (7 days) removes it as before.
+- **Attention.** Entries that `refersTo` an entity of the active goal get +0.2
+  (cap 1.0). A carried entry about an entity of no live goal that no fresh entry
+  of the cycle refreshes is damped x 0.7 (on top of the carry decay). A carried
+  entry below the floor `min(0.1, θ)` is deleted.
+- **Overflow.** When the capacity forces out an entry above salience 0.7, one
+  `wm-overflow` impasse is raised for the cycle (metacognition on), carrying
+  `cogt:forUser`.
+- **Setup keys.** `salienceThreshold` (θ, default 0.5) and
+  `workingMemoryCapacity` (integer 1 to 10000, default 200).
+
 Continue with [`05-episodic-memory.md`](05-episodic-memory.md).

@@ -110,8 +110,19 @@ const BUFFER_ORDER: BufferName[] = [
   'perceptionBuffer',
 ];
 
-/** Hard cap on entries per cycle (doc 04 §7). */
-const MAX_ENTRIES = 200;
+/** Default hard cap on entries per cycle (doc 04 §7). */
+export const DEFAULT_CAPACITY = 200;
+/** A drop of an entry above this salience counts towards a `wm-overflow` impasse (doc 04 §7). */
+export const OVERFLOW_SALIENCE = 0.7;
+/** Salience added to an entry about an entity of the active goal (doc 07 §6.1). */
+export const GOAL_BOOST = 0.2;
+/**
+ * Hard lower bound of the drop floor for carried entries. The effective floor is
+ * `min(CARRY_FLOOR, θ)`: a carried entry that fell below it is no longer worth
+ * keeping and is deleted from the cycle. Deliberately low (0.1, well under the
+ * default θ of 0.5) so that carried material is kept rather than lost early.
+ */
+export const CARRY_FLOOR = 0.1;
 /** Salience multiplier applied to entries carried into the next cycle (§6). */
 const CARRY_DECAY = 0.7;
 /** Default global-workspace cutoff (doc 04 §4). */
@@ -146,6 +157,50 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
+/** Round to 6 decimals so repeated ×0.7 steps store exact-looking decimals. */
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
+}
+
+/** An entry the cap removed. */
+export interface DroppedEntry {
+  id: WMEntryId;
+  buffer: BufferName;
+  salience: number;
+}
+
+export interface WorkingMemoryOptions {
+  /** Entry cap per cycle graph; defaults to {@link DEFAULT_CAPACITY}. */
+  capacity?: number;
+  /** Called once for every entry the cap removed (after its deletion). */
+  onDrop?: (dropped: DroppedEntry) => void;
+}
+
+export interface CarryOptions {
+  /**
+   * Goal IRIs that are still live. `goalBuffer` entries whose `forGoal` is in
+   * the set carry; without it no goal entry carries.
+   */
+  liveGoals?: ReadonlySet<string>;
+}
+
+export interface AttentionInput {
+  /** Entity IRIs of the active goal: entries `refersTo` one get {@link GOAL_BOOST}. */
+  boostEntities: ReadonlySet<string>;
+  /** Entity IRIs of every live goal: carried entries about none of them are damped. */
+  keepEntities: ReadonlySet<string>;
+  /** θ in use; the drop floor is `min(CARRY_FLOOR, θ)`. */
+  theta: number;
+}
+
+export interface AttentionReport {
+  boosted: number;
+  damped: number;
+  dropped: number;
+}
+
+const EXTRA_CAPACITY_MAX = 10_000;
+
 /** Escape a string for safe inclusion inside a SPARQL double-quoted literal. */
 function escapeLiteral(s: string): string {
   return s
@@ -165,7 +220,18 @@ export class WorkingMemory {
     private readonly cycleId: string,
     /** The sender's user key; written as `cogt:forUser` on every entry. */
     private readonly forUser?: string,
-  ) {}
+    options: WorkingMemoryOptions = {},
+  ) {
+    const cap = options.capacity;
+    this.capacity =
+      cap !== undefined && Number.isInteger(cap) && cap >= 1 && cap <= EXTRA_CAPACITY_MAX
+        ? cap
+        : DEFAULT_CAPACITY;
+    this.onDrop = options.onDrop;
+  }
+
+  private readonly capacity: number;
+  private readonly onDrop?: (dropped: DroppedEntry) => void;
 
   graphUri(): string {
     return GraphUriResolver.getCogWorkingGraph(this.agentId, this.sessionId, this.cycleId);
@@ -309,26 +375,49 @@ export class WorkingMemory {
    * salience and a `cogt:carriedFrom` back-link (doc 04 §6). Returns the number
    * of entries carried.
    *
-   * Carry rule (the subset decidable from WM alone): an entry carries if it is
-   * in `selfBuffer` (session-constant), or it has `carryForward = true` and is
-   * not expired (`expiresAfter` unset or > 0).
+   * Carry rule: an entry carries if it is in `selfBuffer` (session-constant),
+   * or it is a `goalBuffer` entry of a goal in `opts.liveGoals`, or it has
+   * `carryForward = true` (a flagged metacognition note, for one) and is not
+   * expired (`expiresAfter` unset or > 0).
+   *
+   * Scoping: only entries written for this instance's user carry (an entry
+   * without `forUser` carries only for an instance without one), and the target
+   * graph belongs to the same session by construction.
+   *
+   * An entry the target cycle already holds in the same form (same buffer,
+   * kind, payload and goal) is "refreshed" and is not copied again.
    */
-  async carryForward(toCycleId: string): Promise<number> {
+  async carryForward(toCycleId: string, opts: CarryOptions = {}): Promise<number> {
     const target = GraphUriResolver.getCogWorkingGraph(this.agentId, this.sessionId, toCycleId);
     this.registry.assertWritable(target);
 
-    const all = await this.read();
+    const all = (await this.read()).filter((e) => (e.forUser ?? undefined) === this.forUser);
     const eligible = all.filter(
       (e) =>
         e.buffer === 'selfBuffer' ||
+        (e.buffer === 'goalBuffer' && e.forGoal !== undefined && opts.liveGoals?.has(e.forGoal) === true) ||
         (e.carryForward === true && (e.expiresAfter === undefined || e.expiresAfter > 0)),
     );
     if (eligible.length === 0) return 0;
 
+    const present = await new WorkingMemory(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      this.sessionId,
+      toCycleId,
+      this.forUser,
+    ).read();
+    const sig = (e: { buffer: string; entryKind: string; payload: string; forGoal?: string }) =>
+      `${e.buffer}\u0000${e.entryKind}\u0000${e.payload}\u0000${e.forGoal ?? ''}`;
+    const have = new Set(present.map(sig));
+    const todo = eligible.filter((e) => !have.has(sig(e)));
+    if (todo.length === 0) return 0;
+
     const lines: string[] = [];
-    for (const e of eligible) {
+    for (const e of todo) {
       const id = this.newEntryId();
-      const salience = clamp01(e.salience * CARRY_DECAY);
+      const salience = clamp01(round6(e.salience * CARRY_DECAY));
       lines.push(`<${id}> <${RDF_TYPE}> <${COGT}WorkingMemoryEntry> .`);
       lines.push(`<${id}> <${COGT}writtenTo> "${escapeLiteral(e.buffer)}" .`);
       lines.push(`<${id}> <${COGT}writtenBy> <${e.writtenBy}> .`);
@@ -338,6 +427,7 @@ export class WorkingMemory {
       lines.push(`<${id}> <${COGT}salience> "${salience}"^^<${XSD}decimal> .`);
       lines.push(`<${id}> <${COGT}carriedFrom> <${e.id}> .`);
       if (e.forUser) lines.push(`<${id}> <${COGT}forUser> "${escapeLiteral(e.forUser)}" .`);
+      if (e.refersTo) lines.push(`<${id}> <${COGT}refersTo> <${e.refersTo}> .`);
       if (e.carryForward !== undefined)
         lines.push(`<${id}> <${COGT}carryForward> "${e.carryForward}"^^<${XSD}boolean> .`);
       if (e.expiresAfter !== undefined)
@@ -349,7 +439,81 @@ export class WorkingMemory {
         lines.push(`<${id}> <${COGT}sourceGraph> "${escapeLiteral(e.sourceGraph)}" .`);
     }
     await this.triplestore.update(`INSERT DATA { GRAPH <${target}> {\n${lines.join('\n')}\n} }`);
-    return eligible.length;
+    return todo.length;
+  }
+
+  /**
+   * Goal-steered attention over this cycle's graph (doc 07 §6), once per cycle:
+   *
+   *  - an entry that `refersTo` an entity of the active goal gets +0.2 (cap 1);
+   *  - a carried entry (has `carriedFrom`) that refers to an entity of no live
+   *    goal and was not refreshed this cycle (no fresh, non-carried entry refers
+   *    to the same entity) is damped ×0.7;
+   *  - a carried entry that ends below the floor `min(0.1, θ)` is deleted.
+   *
+   * Entries without `refersTo` are never damped here (the ×0.7 of the carry
+   * itself is their decay); fresh entries are never dropped by the floor. The
+   * read is bounded by the cap.
+   */
+  async attend(input: AttentionInput): Promise<AttentionReport> {
+    const graph = this.graphUri();
+    this.registry.assertWritable(graph);
+    const report: AttentionReport = { boosted: 0, damped: 0, dropped: 0 };
+    const entries = await this.read();
+    const floor = Math.min(CARRY_FLOOR, clamp01(input.theta));
+    const refreshed = new Set<string>();
+    for (const e of entries) if (e.carriedFrom === undefined && e.refersTo) refreshed.add(e.refersTo);
+
+    for (const e of entries) {
+      let next = e.salience;
+      if (e.refersTo && input.boostEntities.has(e.refersTo)) {
+        next = clamp01(round6(next + GOAL_BOOST));
+        if (next !== e.salience) report.boosted++;
+      } else if (
+        e.carriedFrom !== undefined &&
+        e.refersTo &&
+        !input.keepEntities.has(e.refersTo) &&
+        !refreshed.has(e.refersTo)
+      ) {
+        next = clamp01(round6(next * CARRY_DECAY));
+        report.damped++;
+      }
+      if (e.carriedFrom !== undefined && next < floor) {
+        await this.triplestore.update(`
+          DELETE { GRAPH <${graph}> { <${e.id}> ?p ?o } }
+          WHERE  { GRAPH <${graph}> { <${e.id}> ?p ?o } }`);
+        report.dropped++;
+        continue;
+      }
+      if (next !== e.salience) {
+        await this.triplestore.update(`
+          DELETE { GRAPH <${graph}> { <${e.id}> <${COGT}salience> ?old } }
+          INSERT { GRAPH <${graph}> { <${e.id}> <${COGT}salience> "${next}"^^<${XSD}decimal> } }
+          WHERE  { GRAPH <${graph}> { <${e.id}> <${COGT}salience> ?old } }`);
+      }
+    }
+    return report;
+  }
+
+  /**
+   * Mark the graph closed: a `cogt:closedAt` timestamp on the graph resource.
+   * Nothing is deleted; the age-based sweep removes the graph on its normal
+   * schedule (the timestamp counts as the graph's last write). Idempotent.
+   */
+  async markClosed(at: Date = new Date()): Promise<void> {
+    const graph = this.graphUri();
+    this.registry.assertWritable(graph);
+    await this.triplestore.update(`
+      DELETE { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> ?old } }
+      WHERE  { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> ?old } }`);
+    await this.triplestore.update(
+      `INSERT DATA { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> "${at.toISOString()}"^^<${XSD}dateTime> } }`,
+    );
+  }
+
+  /** Apply the entry cap now (after a bulk copy such as a carry-over). */
+  async enforce(): Promise<void> {
+    await this.enforceCap();
   }
 
   /** Drop the whole working graph. Carried entries already live in the next cycle. */
@@ -362,8 +526,8 @@ export class WorkingMemory {
    * first (doc 04 §7). No-op while under the cap.
    *
    * Incremental: each write first runs a bounded probe that asks only whether an
-   * entry exists beyond the cap (`LIMIT 1 OFFSET MAX_ENTRIES`). The probe stops
-   * after at most MAX_ENTRIES + 1 rows and returns at most one, so a write on a
+   * entry exists beyond the cap (`LIMIT 1 OFFSET capacity`). The probe stops
+   * after at most capacity + 1 rows and returns at most one, so a write on a
    * graph under the cap never lists the whole graph. Only when the cap is
    * actually exceeded is the ordered list read and trimmed.
    */
@@ -374,23 +538,24 @@ export class WorkingMemory {
     const probe = await this.triplestore.query(`
       SELECT ?e WHERE {
         GRAPH <${graph}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s }
-      } LIMIT 1 OFFSET ${MAX_ENTRIES}`);
+      } LIMIT 1 OFFSET ${this.capacity}`);
     if ((probe.bindings ?? []).length === 0) return;
 
     // Over the cap: list salience-ascending and trim in TS.
     const res = await this.triplestore.query(`
-      SELECT ?e WHERE {
-        GRAPH <${graph}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s }
+      SELECT ?e ?s ?b WHERE {
+        GRAPH <${graph}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s ; <${COGT}writtenTo> ?b }
       } ORDER BY ASC(?s)`);
     const rows = res.bindings ?? [];
-    if (rows.length <= MAX_ENTRIES) return;
+    if (rows.length <= this.capacity) return;
 
-    const victims = rows.slice(0, rows.length - MAX_ENTRIES);
+    const victims = rows.slice(0, rows.length - this.capacity);
     for (const row of victims) {
       const e = row.e.value;
       await this.triplestore.update(`
         DELETE { GRAPH <${graph}> { <${e}> ?p ?o } }
         WHERE  { GRAPH <${graph}> { <${e}> ?p ?o } }`);
+      this.onDrop?.({ id: e, buffer: row.b.value as BufferName, salience: Number(row.s.value) });
     }
   }
 }

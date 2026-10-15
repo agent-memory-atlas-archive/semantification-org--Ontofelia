@@ -40,7 +40,12 @@ import {
   type TraceInput,
   type SelfView,
 } from '@ontofelia/semantic-memory';
-import { WorkingMemory, type WMEntryInput } from './WorkingMemory.js';
+import {
+  WorkingMemory,
+  OVERFLOW_SALIENCE,
+  type WMEntryInput,
+  type WorkingMemoryOptions,
+} from './WorkingMemory.js';
 import {
   assemblePrompt,
   diffCognitiveBlocks,
@@ -48,7 +53,7 @@ import {
   type BlockDiff,
   type WorkspaceEntry,
 } from './PromptAssembler.js';
-import type { PromptMode, PromptSettings } from './CognitiveConfig.js';
+import type { AttentionSettings, PromptMode, PromptSettings } from './CognitiveConfig.js';
 import {
   GoalStack,
   RESPOND_TO_USER,
@@ -248,6 +253,15 @@ export interface RunCycleOptions {
   /** θ and the token caps for the assembler; defaults apply when absent. */
   promptSettings?: PromptSettings;
   /**
+   * Attention and carry-over (docs/cognitive-architecture/04 §6-§7, 07 §6). When
+   * present, the queued persist carries the previous cycle's entries of the
+   * same session and user into this cycle, applies the goal-steered salience
+   * rules, applies the capacity, and marks the previous working graph closed.
+   * Absent (the default): none of that happens. The runtime passes it whenever
+   * the cycle manager is on.
+   */
+  attention?: AttentionSettings;
+  /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
    * unattended cycle: Phase 3 does NOT seed the implicit RESPOND_TO_USER goal
@@ -273,6 +287,8 @@ interface GoalExtras {
   implicitUri?: string;
 }
 
+/** Sessions (per user) whose newest working graph the carry-over remembers. */
+const LAST_CYCLE_MAX = 1000;
 /** How many levels of parent goals reach the goalBuffer. */
 const MAX_GOAL_PARENT_DEPTH = 5;
 
@@ -367,6 +383,12 @@ export class CycleManager {
    * Different sessions run independently.
    */
   private readonly persistTails = new Map<string, Promise<void>>();
+  /**
+   * The newest cycle whose working graph was written, per session and user, for
+   * the carry-over into the next cycle. In memory: after a restart the first
+   * cycle of a session simply has nothing to carry. Bounded.
+   */
+  private readonly lastCycle = new Map<string, string>();
   /**
    * (session, user) pairs whose stale implicit goals were already cleaned up by
    * this process (the first touch of a session; see {@link CycleManager.manageGoals}).
@@ -828,7 +850,14 @@ export class CycleManager {
           pendingResolved ? undefined : options.resolveEntities,
           inboundAbout,
           comprehension,
-          { wm: queuedWm, shadow, goal: goalExtras },
+          {
+            wm: queuedWm,
+            shadow,
+            goal: goalExtras,
+            ...(mode === 'conversational' && options.attention
+              ? { attention: options.attention, goalsEnabled: options.goalsEnabled === true }
+              : {}),
+          },
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
@@ -1288,9 +1317,27 @@ export class CycleManager {
     resolveEntities?: RunCycleOptions['resolveEntities'],
     inboundAbout: string[] = [],
     comprehension?: ComprehensionResult,
-    extras: { wm: WMEntryInput[]; shadow?: ShadowRecord; goal?: GoalExtras } = { wm: [] },
+    extras: {
+      wm: WMEntryInput[];
+      shadow?: ShadowRecord;
+      goal?: GoalExtras;
+      attention?: AttentionSettings;
+      goalsEnabled?: boolean;
+    } = { wm: [] },
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
+    // Capacity and drop accounting for this cycle's working-memory writes. Every
+    // drop of an entry above the overflow salience is counted; one impasse per
+    // cycle is raised from the total (metacognition on only).
+    const overflow = { dropped: 0 };
+    const wmOpts: WorkingMemoryOptions | undefined = extras.attention
+      ? {
+          capacity: extras.attention.capacity,
+          onDrop: (d) => {
+            if (d.salience > OVERFLOW_SALIENCE) overflow.dropped++;
+          },
+        }
+      : undefined;
     // Conversational turns write the perception record (computed before the LLM
     // call); a turn whose core never reached the hook (the context build threw)
     // gets the envelope-only record. Initiative turns keep the earlier write.
@@ -1325,20 +1372,24 @@ export class CycleManager {
         }
       }
     }
-    await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record);
+    await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record, wmOpts);
     // Phase 2 result (computed before the LLM call) onto the retrieval buffer.
     // An empty recall writes nothing; the marker bit reads the entry count.
     const retrievalHits = comprehension?.entries.length ?? 0;
     if (comprehension && retrievalHits > 0) {
-      await this.writeRecall(envelope, sessionId, cycleId, `${cycleUri}_2`, comprehension);
+      await this.writeRecall(envelope, sessionId, cycleId, `${cycleUri}_2`, comprehension, wmOpts);
     }
     // Goal and self entries produced for the prompt assembler (Phase 3).
     if (extras.wm.length > 0) {
       try {
-        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_3`, extras.wm);
+        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_3`, extras.wm, wmOpts);
       } catch (e) {
         this.onError?.(e);
       }
+    }
+    // Carry-over from the previous cycle and the goal-steered salience rules.
+    if (extras.attention) {
+      await this.carryAndAttend(envelope, sessionId, cycleId, activeGoalUri, extras.attention, extras.goalsEnabled === true, wmOpts);
     }
     if (extras.goal) await this.finishGoals(envelope, sessionId, cycleId, cycleUri, episodicEnabled, extras.goal);
     if (episodicEnabled) {
@@ -1416,6 +1467,8 @@ export class CycleManager {
         retrievalHits,
         goalConflict,
         selfModelEnabled,
+        wmOverflow: overflow.dropped > 0 && extras.attention ? { dropped: overflow.dropped, capacity: extras.attention.capacity } : undefined,
+        userKey: mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
       });
     } else {
       await this.writeReflectiveMarker(cycleUri, status);
@@ -1437,6 +1490,8 @@ export class CycleManager {
     retrievalHits: number;
     goalConflict: boolean;
     selfModelEnabled: boolean;
+    wmOverflow?: { dropped: number; capacity: number };
+    userKey?: string;
   }): Promise<void> {
     const meta = new Metacognition(this.triplestore, this.agentId);
 
@@ -1520,8 +1575,21 @@ export class CycleManager {
     responseText?: string;
     toolEvents: ToolEpisodeEvent[];
     goalConflict: boolean;
+    cycleId?: string;
+    wmOverflow?: { dropped: number; capacity: number };
+    userKey?: string;
   }): ImpasseInput[] {
     const out: ImpasseInput[] = [];
+    // At most one wm-overflow per cycle, however many entries were dropped.
+    if (ctx.wmOverflow) {
+      out.push({
+        kind: 'wm-overflow',
+        flaggedInPhase: `${ctx.cycleUri}_3`,
+        context: `Working memory at capacity ${ctx.wmOverflow.capacity}: ${ctx.wmOverflow.dropped} entry(ies) above salience ${OVERFLOW_SALIENCE} dropped.`,
+        ...(ctx.cycleId ? { cycleId: ctx.cycleId } : {}),
+        ...(ctx.userKey ? { forUser: ctx.userKey } : {}),
+      });
+    }
     if (ctx.goalConflict) {
       out.push({
         kind: 'goal-conflict',
@@ -1772,12 +1840,81 @@ export class CycleManager {
    * graph it was read from; the working memory stamps the sender's user key on
    * every entry.
    */
+  /**
+   * Attention and carry-over for one cycle (queued persist, conversational
+   * turns). In order:
+   *  1. carry the previous cycle's entries of this session and user into this
+   *     cycle (selfBuffer, goal entries of goals still live, flagged notes),
+   *     decayed ×0.7 and linked by `carriedFrom`, and mark that graph closed;
+   *  2. apply the capacity to what the carry added;
+   *  3. boost entries about the active goal's entities, damp stale carried
+   *     entries, drop carried entries below the floor.
+   * Best-effort: a failure goes to `onError` and never reaches the reply.
+   */
+  private async carryAndAttend(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    activeGoalUri: string | undefined,
+    settings: AttentionSettings,
+    goalsEnabled: boolean,
+    wmOpts: WorkingMemoryOptions | undefined,
+  ): Promise<void> {
+    try {
+      const userKey = cogUserKey(envelope.sender);
+      // Scoping: the key holds session AND user, so a cycle never finds another
+      // user's (or another session's) previous graph.
+      const key = `${sessionId}\u0000${userKey}`;
+      const prevCycleId = this.lastCycle.get(key);
+
+      const liveGoals = new Set<string>();
+      const boost = new Set<string>();
+      const keep = new Set<string>();
+      if (goalsEnabled) {
+        const active = await new GoalStack(
+          this.triplestore,
+          this.registry,
+          this.agentId,
+          sessionId,
+          undefined,
+          this.viewerOf(envelope),
+        ).active();
+        // The implicit respond-to-user goal is a safety net, not something to hold in mind.
+        for (const g of active) {
+          if (g.goalType === RESPOND_TO_USER) continue;
+          liveGoals.add(g.uri);
+          for (const a of g.about ?? []) keep.add(a);
+          if (g.uri === activeGoalUri) for (const a of g.about ?? []) boost.add(a);
+        }
+      }
+
+      const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId, userKey, wmOpts);
+      if (prevCycleId && prevCycleId !== cycleId) {
+        const prev = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, prevCycleId, userKey);
+        const carried = await prev.carryForward(cycleId, { liveGoals });
+        if (carried > 0) await wm.enforce();
+        await prev.markClosed();
+      }
+      await wm.attend({ boostEntities: boost, keepEntities: keep, theta: settings.theta });
+
+      this.lastCycle.delete(key);
+      this.lastCycle.set(key, cycleId);
+      if (this.lastCycle.size > LAST_CYCLE_MAX) {
+        const oldest = this.lastCycle.keys().next().value;
+        if (oldest !== undefined) this.lastCycle.delete(oldest);
+      }
+    } catch (e) {
+      this.onError?.(e);
+    }
+  }
+
   private async writeRecall(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
     phaseUri: string,
     comprehension: ComprehensionResult,
+    wmOpts?: WorkingMemoryOptions,
   ): Promise<void> {
     const wm = new WorkingMemory(
       this.triplestore,
@@ -1786,6 +1923,7 @@ export class CycleManager {
       sessionId,
       cycleId,
       cogUserKey(envelope.sender),
+      wmOpts,
     );
     for (const e of comprehension.entries) {
       // The working memory writes the reference as a bare IRI: only a safe one is kept.
@@ -1817,6 +1955,7 @@ export class CycleManager {
     cycleId: string,
     phaseUri: string,
     entries: WMEntryInput[],
+    wmOpts?: WorkingMemoryOptions,
   ): Promise<void> {
     const wm = new WorkingMemory(
       this.triplestore,
@@ -1825,6 +1964,7 @@ export class CycleManager {
       sessionId,
       cycleId,
       cogUserKey(envelope.sender),
+      wmOpts,
     );
     for (const e of entries) await wm.write(e, phaseUri);
   }
@@ -2004,6 +2144,7 @@ export class CycleManager {
     cycleId: string,
     phaseUri: string,
     perception?: Perception,
+    wmOpts?: WorkingMemoryOptions,
   ): Promise<void> {
     const wm = new WorkingMemory(
       this.triplestore,
@@ -2012,6 +2153,7 @@ export class CycleManager {
       sessionId,
       cycleId,
       cogUserKey(envelope.sender),
+      wmOpts,
     );
     if (perception) {
       for (const entry of perception.entries) await wm.write(entry, phaseUri);
