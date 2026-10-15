@@ -28,6 +28,8 @@
  * retracted or that was superseded does not come back. The user graph is also
  * checked, so a triple or accepted claim that is already there is not
  * duplicated (nothing is written for it: no corroboration evidence is added).
+ * A triple the worldview holds as an independent accepted claim (one the user's
+ * episodes did not themselves store) is counted `alreadyKnown` and not copied.
  *
  * No watermark is kept: the counts need the older episodes too, a rerun is
  * already a no-op by the ledger, and the read is bounded per user instead.
@@ -78,6 +80,8 @@ export interface EpisodicConsolidationReport {
   alreadyPromoted: number;
   /** Qualified but the user graph already holds the triple or an accepted claim. */
   alreadyPresent: number;
+  /** Qualified but the worldview already holds an independent accepted claim for the triple. */
+  alreadyKnown: number;
   /** Qualified but a functional predicate already has another accepted value. */
   conflicts: number;
   /** Qualified but cut by a per-run bound. */
@@ -105,6 +109,7 @@ function emptyReport(now: Date): EpisodicConsolidationReport {
     promoted: 0,
     alreadyPromoted: 0,
     alreadyPresent: 0,
+    alreadyKnown: 0,
     conflicts: 0,
     deferred: 0,
     excluded: { untrustedEpisodes: 0, secretEpisodes: 0, claims: 0 },
@@ -265,6 +270,10 @@ export class EpisodicConsolidation {
       });
       if (res.outcome === 'already-present') {
         report.alreadyPresent++;
+        continue;
+      }
+      if (res.outcome === 'already-known') {
+        report.alreadyKnown++;
         continue;
       }
       if (res.outcome === 'conflict') {

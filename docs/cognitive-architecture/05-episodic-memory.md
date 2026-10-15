@@ -327,9 +327,30 @@ owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
   promotions per user and 100 per run. No model call. No watermark: the counts
   need the older episodes, and the ledger already makes a rerun a no-op.
 
-Pattern 3 (user preference, "accepted X over Y") is not implemented: no episode
-records which alternative was offered and which was chosen, so it cannot be
-detected deterministically.
+- **Re-assertion links the existing claim.** The ingestion skips a triple that
+  already exists and mints no claim, so a repeated fact would never reach K.
+  While episodic memory is on, a duplicate instead returns the existing claim
+  (`StoreResult.reassertedClaimUri`, `IngestionReport.reassertedClaims`) and the
+  episode links it via `cogt:hasClaim`. The existing claim must be accepted, not
+  secret-classed, not a consolidation, and asserted in the graph the same routing
+  rule picks for this sender (own user graph or worldview), with the same
+  subject, predicate and object. An Evidence record (source span, session, time)
+  is added to that claim; no second claim and no second triple. With episodic
+  memory off a duplicate is skipped exactly as before.
+- **Already known.** If the worldview holds an accepted claim for the triple that
+  is not one of the episodes' own claims, nothing is promoted (counted as
+  `alreadyKnown`).
+- **Retraction cascade.** `memory_retract` also hard-deletes the retracting
+  user's own `consolidation-episodic` copy of the same triple (triple, claim,
+  evidence) in the user graph of that user's cognitive key, then rebuilds the
+  inferred graph. Other users' graphs are never touched. The
+  `consolidation-promoted` episode stays, so the ledger still blocks a
+  re-promotion.
+
+Pattern 3 (user preference, "accepted X over Y") is not built. It needs a capture
+of the offered alternatives (which options were on the table and which one was
+chosen), and no episode records that yet, so it cannot be detected
+deterministically.
 
 ---
 

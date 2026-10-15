@@ -77,6 +77,12 @@ export interface PerceptionSource {
     objectUri?: string;
   }>;
   /**
+   * Claims of facts this message re-asserted (already stored earlier). Only
+   * filled while episodic memory is on; they are linked from the episode
+   * (`hasClaim`) and nothing else: no working-memory entry, no entity.
+   */
+  reassertedClaims?: string[];
+  /**
    * Number of facts the ingestion report says were stored for this message
    * (the metacognition marker's `newKnowledge`). Absent when no ingestion ran.
    */
@@ -391,7 +397,10 @@ export function buildPerception(input: PerceptionInput, source?: PerceptionSourc
     nerAt,
     nerCount: ner.length,
     tags: [intent],
-    hasClaim: [...new Set((source?.storedClaims ?? []).map((c) => c.claimUri).filter(isSafeIri))],
+    hasClaim: [...new Set([
+      ...(source?.storedClaims ?? []).map((c) => c.claimUri),
+      ...(source?.reassertedClaims ?? []),
+    ].filter(isSafeIri))],
     ...(source?.transcriptLine !== undefined ? { transcriptLine: source.transcriptLine } : {}),
   };
 }

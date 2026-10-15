@@ -755,6 +755,8 @@ If a greeting or onboarding template is written in another language, translate a
       const storedClaims: PerceptionSource['storedClaims'] = [];
       // Facts the ingestion report says were stored for this message.
       let storedFactCount = 0;
+      // Claims re-asserted by this message (episodic memory on only).
+      const reassertedClaims: string[] = [];
 
       // NER on user text → load entity-specific facts
       if (this.entityMatcher && this.knowledgeEngine) {
@@ -803,10 +805,16 @@ If a greeting or onboarding template is written in another language, translate a
             // ── Ingest: store storable facts in ABox ──
             if (this.ingestionService) {
               try {
+                // A re-assertion is recorded only while the cycle and episodic
+                // memory are on. With the cycle off the episodic flag is not read.
+                const recordReassertion =
+                  (await this.cognitiveConfig?.isCycleManagerEnabled().catch(() => false)) === true &&
+                  (await this.cognitiveConfig?.isEpisodicMemoryEnabled().catch(() => false)) === true;
                 const ingestionReport = await this.ingestionService.ingest(parseResult, {
                   agentId: this.agentId,
                   sessionId: session.sessionId,
                   isOwner: envelope.sender.isOwner,
+                  ...(recordReassertion ? { recordReassertion: true } : {}),
                   // userId routes Person facts into the per-user graph that
                   // getSystemPromptContext() reads back; without it they land
                   // in the worldview graph and stay invisible across sessions.
@@ -819,6 +827,7 @@ If a greeting or onboarding template is written in another language, translate a
                 );
 
                 storedFactCount = ingestionReport.storedFacts.length;
+                for (const r of ingestionReport.reassertedClaims ?? []) reassertedClaims.push(r.claimUri);
                 for (const sf of ingestionReport.storedFacts) {
                   if (sf.result.claimUri) {
                     storedClaims.push({
@@ -1008,6 +1017,7 @@ Users can use these commands:
           entities: perceivedEntities,
           parseResult,
           storedClaims,
+          ...(reassertedClaims.length > 0 ? { reassertedClaims } : {}),
           storedFactCount,
           // The session store adds one transcript line per message, so its count
           // at the start of the turn is the line index the user entry will get.
@@ -2571,7 +2581,7 @@ Users can use these commands:
           return { text: 'Episodic consolidation is off (flagEpisodicConsolidation). Nothing was read or changed. Enable with /cog flag episodicconsolidation on.', sessionId: session.sessionId };
         }
         const x = r.report;
-        return { text: `🧩 Episodic consolidation: ${x.episodesScanned} episodes of ${x.users} user(s), ${x.qualified} qualified, ${x.promoted} promoted, ${x.alreadyPresent + x.alreadyPromoted} already known, ${x.conflicts} in conflict.`, sessionId: session.sessionId };
+        return { text: `🧩 Episodic consolidation: ${x.episodesScanned} episodes of ${x.users} user(s), ${x.qualified} qualified, ${x.promoted} promoted, ${x.alreadyPresent + x.alreadyKnown + x.alreadyPromoted} already known, ${x.conflicts} in conflict.`, sessionId: session.sessionId };
       }
       if (sub === 'cleanup') {
         const r = await this.runCogCleanup();

@@ -31,6 +31,12 @@ export interface IngestionReport {
   totalTimeMs: number;
   /** IRIs of the claims minted for the stored facts, in storage order. */
   claimUris: string[];
+  /**
+   * Duplicates that re-asserted an existing accepted claim (only when the
+   * context sets `recordReassertion`). These facts are still listed in
+   * `skippedFacts` as 'duplicate'; this adds the claim they re-assert.
+   */
+  reassertedClaims: Array<{ fact: ParsedFact; claimUri: string }>;
 }
 
 export interface StoredFactReport {
@@ -64,6 +70,7 @@ export class SemanticIngestionService {
     const start = Date.now();
     const storedFacts: StoredFactReport[] = [];
     const skippedFacts: SkippedFactReport[] = [];
+    const reassertedClaims: IngestionReport['reassertedClaims'] = [];
 
     // Ontology proposals surfaced by the parser (class/property suggestions).
     // These are informational — facts themselves are no longer staged.
@@ -71,7 +78,7 @@ export class SemanticIngestionService {
 
     // If parse was skipped (trivial message), return empty report
     if (parseResult.meta.skipped) {
-      return { storedFacts, skippedFacts, proposals, totalTimeMs: Date.now() - start, claimUris: [] };
+      return { storedFacts, skippedFacts, proposals, totalTimeMs: Date.now() - start, claimUris: [], reassertedClaims };
     }
 
     for (const fact of parseResult.facts) {
@@ -102,6 +109,7 @@ export class SemanticIngestionService {
         if (result.tripleCount === 0) {
           // Duplicate
           skippedFacts.push({ fact, reason: 'duplicate' });
+          if (result.reassertedClaimUri) reassertedClaims.push({ fact, claimUri: result.reassertedClaimUri });
         } else {
           storedFacts.push({ fact, result });
         }
@@ -131,6 +139,7 @@ export class SemanticIngestionService {
       proposals,
       totalTimeMs: Date.now() - start,
       claimUris: storedFacts.flatMap((s) => (s.result.claimUri ? [s.result.claimUri] : [])),
+      reassertedClaims,
     };
   }
 }

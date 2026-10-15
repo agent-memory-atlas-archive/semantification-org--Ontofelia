@@ -958,13 +958,15 @@ export class KnowledgeEngine {
   }
 
   /**
-   * Check if a fact (subject-predicate-object triple) already exists in the ABox.
-   *
-   * The predicate URI is resolved via the same label-lookup path as
-   * `resolveProperty` so the duplicate check targets the canonical URI a
-   * subsequent write would use — not a fresh, lowercased ad-hoc URI.
+   * The three terms {@link isDuplicate} compares: the canonical subject (user
+   * node, agent entity or slug, see canonicalSubjectUri), the predicate resolved
+   * like `resolveProperty` does, and the object as a rendered RDF term.
    */
-  async isDuplicate(fact: FactInput, agentId: string, context?: FactContext): Promise<boolean> {
+  private async duplicateTerms(
+    fact: FactInput,
+    agentId: string,
+    context?: FactContext,
+  ): Promise<{ subjectUri: string; predicateUri: string; objectClause: string }> {
     // Use the canonical subject URI when context is available, so the check
     // targets the SAME node storeFact() will actually write to (user node,
     // agent entity, or slug) — see canonicalSubjectUri (#1035 M3).
@@ -980,6 +982,18 @@ export class KnowledgeEngine {
     } else {
       objectClause = sparqlIri(this.toEntityUri(fact.object));
     }
+    return { subjectUri, predicateUri, objectClause };
+  }
+
+  /**
+   * Check if a fact (subject-predicate-object triple) already exists in the ABox.
+   *
+   * The predicate URI is resolved via the same label-lookup path as
+   * `resolveProperty` so the duplicate check targets the canonical URI a
+   * subsequent write would use — not a fresh, lowercased ad-hoc URI.
+   */
+  async isDuplicate(fact: FactInput, agentId: string, context?: FactContext): Promise<boolean> {
+    const { subjectUri, predicateUri, objectClause } = await this.duplicateTerms(fact, agentId, context);
 
     try {
       // Check the graph the fact would actually be written to; if no context
@@ -1689,6 +1703,64 @@ export class KnowledgeEngine {
   }
 
   /**
+   * A user stated a triple that already exists. Find the one existing claim it
+   * re-asserts and add an Evidence record for this statement to it (source span,
+   * session, time). No second claim is minted and no triple is written.
+   *
+   * The claim counts as "the same" only when ALL of these hold:
+   *  - it sits in the graph {@link resolveTargetGraph} picks for THIS sender
+   *    (`assertedInGraph`): their own user graph or the worldview, never
+   *    another user's graph;
+   *  - its subject, predicate and object are the terms the duplicate check used;
+   *  - its status is `accepted`;
+   *  - it is not `core:privacyClass "secret"`;
+   *  - it is not a consolidation (`sourceKind` `consolidation-episodic`), which
+   *    is a derived copy and not something a user stated.
+   * If several qualify, the oldest (`learnedAt`, then IRI) is used. Returns its
+   * IRI, or `undefined` when nothing qualifies (then nothing is written).
+   * Best effort: a failure here never turns a duplicate into an error.
+   */
+  private async recordReassertion(fact: FactInput, context: FactContext): Promise<string | undefined> {
+    try {
+      const { subjectUri, predicateUri, objectClause } = await this.duplicateTerms(fact, context.agentId, context);
+      const targetGraph = this.assertGraph(this.resolveTargetGraph(fact, context));
+      const claimsGraph = this.assertGraph(GraphUriResolver.getClaimsGraph(context.agentId));
+      const ONT = 'urn:shared:ontology#';
+      const res = await this.triplestore.query(`
+        SELECT ?c WHERE { GRAPH ${sparqlIri(claimsGraph)} {
+          ?c a <${ONT}Claim> ;
+             <${ONT}claimSubject> ${sparqlIri(subjectUri)} ;
+             <${ONT}claimPredicate> ${sparqlIri(predicateUri)} ;
+             <${ONT}claimObject> ${objectClause} ;
+             <${ONT}assertedInGraph> ${sparqlIri(targetGraph)} ;
+             <${ONT}status> "accepted" .
+          OPTIONAL { ?c <${ONT}learnedAt> ?learned . }
+          FILTER NOT EXISTS { ?c <${ONT}privacyClass> "secret" }
+          FILTER NOT EXISTS { ?c <${ONT}sourceKind> "consolidation-episodic" }
+        } } ORDER BY ?learned ?c LIMIT 1`);
+      const claimUri = res.bindings?.[0]?.c?.value;
+      if (!claimUri) return undefined;
+
+      const evidence = await this.claimService.createEvidence(context.agentId, {
+        evidenceType: fact.evidenceType ?? 'message-span',
+        sourceUri: fact.sourceUri,
+        contentHash: fact.contentHash,
+        sourceMessageId: fact.sourceMessageId,
+        sessionId: context.sessionId,
+        channel: fact.channel,
+        rawText: fact.sourceSpan,
+      });
+      await this.triplestore.update(`INSERT DATA { GRAPH ${sparqlIri(claimsGraph)} {
+        ${sparqlIri(claimUri)} <${ONT}hasEvidence> ${sparqlIri(evidence.uri)} .
+        ${sparqlIri(claimUri)} <${ONT}evidenceGraph> ${sparqlIri(evidence.graph)} .
+      } }`);
+      return claimUri;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Store a fact as real RDF triples in the ABox, with provenance.
    * Automatically resolves entities and properties (creating them if needed).
    * Skips storage if the exact triple already exists (duplicate detection).
@@ -1699,6 +1771,11 @@ export class KnowledgeEngine {
 
     // Duplicate check — skip if triple already exists
     if (await this.isDuplicate(fact, context.agentId, context)) {
+      // Only when the caller asks for it (episodic memory on): a re-assertion
+      // is recorded as evidence on the existing claim and its IRI is returned.
+      const reassertedClaimUri = context.recordReassertion === true
+        ? await this.recordReassertion(fact, context)
+        : undefined;
       return {
         success: true,
         subjectUri: this.toEntityUri(fact.subject),
@@ -1709,6 +1786,7 @@ export class KnowledgeEngine {
         newEntities: [],
         newProperties: [],
         tripleCount: 0,  // 0 = duplicate, not stored
+        ...(reassertedClaimUri ? { reassertedClaimUri } : {}),
       };
     }
 
@@ -1790,7 +1868,9 @@ export class KnowledgeEngine {
    * minted as an entity.
    *
    * Outcomes: `already-present` when the user graph already holds the triple or
-   * an accepted claim for it (nothing is written, no second claim); `conflict`
+   * an accepted claim for it (nothing is written, no second claim); `already-known`
+   * when the worldview holds an independent accepted claim for it (nothing is
+   * written); `conflict`
    * when the predicate is functional and the user graph already holds a
    * different accepted value (a count of earlier assertions never overrides what
    * the user's graph says now); otherwise `promoted`.
@@ -1809,7 +1889,7 @@ export class KnowledgeEngine {
     /** Deterministic hash of the promotion; stored as the claim's ingestion run. */
     claimHash: string;
     confidenceNumeric?: number;
-  }): Promise<{ outcome: 'promoted' | 'already-present' | 'conflict'; claimUri?: string; targetGraph: string }> {
+  }): Promise<{ outcome: 'promoted' | 'already-present' | 'already-known' | 'conflict'; claimUri?: string; targetGraph: string }> {
     if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
       throw new Error('promoteToUserGraph: a concrete user key is required');
     }
@@ -1832,6 +1912,25 @@ export class KnowledgeEngine {
            <urn:shared:ontology#status> "accepted" .
       } }`);
     if (present || claimed) return { outcome: 'already-present', targetGraph };
+
+    // The worldview already holds the triple as an accepted claim: a private
+    // copy would be redundant, so nothing is written. The claims the episodes
+    // themselves stored (`supportClaims`) are not "other knowledge" and are
+    // left out of this test; only an independent worldview claim counts.
+    const worldview = GraphUriResolver.getWorldviewGraph(p.agentId);
+    const support = new Set(p.supportClaims);
+    const known = await this.triplestore.query(`
+      SELECT ?c WHERE { GRAPH ${sparqlIri(claimsGraph)} {
+        ?c a <urn:shared:ontology#Claim> ;
+           <urn:shared:ontology#claimSubject> ${subjectIri} ;
+           <urn:shared:ontology#claimPredicate> ${predicateIri} ;
+           <urn:shared:ontology#claimObject> ${objectTriple} ;
+           <urn:shared:ontology#assertedInGraph> ${sparqlIri(worldview)} ;
+           <urn:shared:ontology#status> "accepted" .
+      } }`);
+    if ((known.bindings ?? []).some((b) => !support.has(b.c.value))) {
+      return { outcome: 'already-known', targetGraph };
+    }
 
     if (await this.isFunctionalProperty(p.predicateUri, p.agentId)) {
       const conflicting = await this.findConflictingClaims(
