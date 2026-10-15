@@ -288,14 +288,14 @@ export class Metacognition {
     now: Date = new Date(),
   ): Promise<void> {
     const graph = this.metaGraphUri();
+    // One update: the delete, then the insert.
     await this.triplestore.update(`
       DELETE { GRAPH <${graph}> {
         <${impasseId}> <${COGT}resolution> ?r . <${impasseId}> <${COGT}resolvedBy> ?b .
         <${impasseId}> <${COGT}resolvedAt> ?a . } }
       WHERE  { GRAPH <${graph}> {
         OPTIONAL { <${impasseId}> <${COGT}resolution> ?r } OPTIONAL { <${impasseId}> <${COGT}resolvedBy> ?b }
-        OPTIONAL { <${impasseId}> <${COGT}resolvedAt> ?a } } }`);
-    await this.triplestore.update(`
+        OPTIONAL { <${impasseId}> <${COGT}resolvedAt> ?a } } } ;
       INSERT DATA { GRAPH <${graph}> {
         <${impasseId}> <${COGT}resolution> "${escapeLiteral(resolution)}" .
         <${impasseId}> <${COGT}resolvedBy> "${escapeLiteral(by)}" .

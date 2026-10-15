@@ -486,22 +486,45 @@ export class GoalStack {
 
   /** Transition a goal's status, stamping the matching timestamp / reason. */
   async setStatus(goalId: GoalId, status: GoalStatus, reason?: string, now: Date = new Date()): Promise<void> {
+    const commit = await this.prepareSetStatus(goalId, status, reason, now);
+    if (commit) await commit();
+  }
+
+  /**
+   * The reads of {@link setStatus} first, the write later: resolves with a
+   * `commit` that stores the transition (one update for all its predicates) and
+   * emits the transition, or with undefined when the goal does not exist. The
+   * update is issued synchronously when `commit` is called, so a caller can
+   * prepare several writes and issue them together.
+   */
+  async prepareSetStatus(
+    goalId: GoalId,
+    status: GoalStatus,
+    reason?: string,
+    now: Date = new Date(),
+  ): Promise<(() => Promise<void>) | undefined> {
     const graph = await this.graphOf(goalId);
-    if (!graph) return;
+    if (!graph) return undefined;
     this.registry.assertWritable(graph);
     const before = this.onTransition ? await this.rawGoal(graph, goalId) : undefined;
     const ts = now.toISOString();
     const dt = (s: string) => `"${s}"^^<${XSD}dateTime>`;
 
-    await this.replaceOne(graph, goalId, `${COGT}goalStatus`, `"${status}"`);
-    await this.replaceOne(graph, goalId, `${COGT}updatedAt`, dt(ts));
-    if (status === 'resolved') await this.replaceOne(graph, goalId, `${COGT}resolvedAt`, dt(ts));
-    if (status === 'abandoned') await this.replaceOne(graph, goalId, `${COGT}abandonedAt`, dt(ts));
+    const pairs: Array<[string, string]> = [
+      [`${COGT}goalStatus`, `"${status}"`],
+      [`${COGT}updatedAt`, dt(ts)],
+    ];
+    if (status === 'resolved') pairs.push([`${COGT}resolvedAt`, dt(ts)]);
+    if (status === 'abandoned') pairs.push([`${COGT}abandonedAt`, dt(ts)]);
     if (status === 'blocked' && reason)
-      await this.replaceOne(graph, goalId, `${COGT}blockedReason`, `"${escapeLiteral(reason)}"`);
-    if (before && before.status !== status && (status === 'resolved' || status === 'abandoned' || status === 'blocked')) {
-      await this.emit(status, before, now, status === 'blocked' ? reason : undefined);
-    }
+      pairs.push([`${COGT}blockedReason`, `"${escapeLiteral(reason)}"`]);
+    const update = this.replaceOps(graph, goalId, pairs);
+    return async () => {
+      await this.triplestore.update(update);
+      if (before && before.status !== status && (status === 'resolved' || status === 'abandoned' || status === 'blocked')) {
+        await this.emit(status, before, now, status === 'blocked' ? reason : undefined);
+      }
+    };
   }
 
   /** Update the goal's current step (and optional progress marker). */
@@ -836,11 +859,24 @@ export class GoalStack {
     predicate: string,
     objectTerm: string,
   ): Promise<void> {
-    await this.triplestore.update(`
+    await this.triplestore.update(this.replaceOps(graph, uri, [[predicate, objectTerm]]));
+  }
+
+  /**
+   * The delete-then-insert of single-valued predicates as ONE update: for each
+   * pair, in order, the old value is deleted and the new one inserted. Same
+   * result as one {@link replaceOne} per pair, in one write.
+   */
+  private replaceOps(graph: string, uri: GoalId, pairs: Array<[predicate: string, objectTerm: string]>): string {
+    const ops: string[] = [];
+    for (const [predicate, objectTerm] of pairs) {
+      ops.push(`
       DELETE { GRAPH <${graph}> { <${uri}> <${predicate}> ?old } }
       WHERE  { GRAPH <${graph}> { <${uri}> <${predicate}> ?old } }`);
-    await this.triplestore.update(`
+      ops.push(`
       INSERT DATA { GRAPH <${graph}> { <${uri}> <${predicate}> ${objectTerm} . } }`);
+    }
+    return ops.join(' ;');
   }
 
   /** Delete every value of a single-valued predicate on a goal (clears it). */

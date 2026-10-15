@@ -269,6 +269,55 @@ export class WorkingMemory {
     const graph = this.graphUri();
     this.registry.assertWritable(graph);
 
+    const { id, lines } = this.entryLines(entry, writtenBy);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    await this.enforceCap();
+    return id;
+  }
+
+  /**
+   * Whether `n` more entries fit under the cap without any eviction: the count
+   * now is at most `capacity - n`. A bounded probe (at most one row), like the
+   * one {@link write} runs after each insert. When this holds, writing the `n`
+   * entries one by one would evict nothing, so {@link insertMany} stores exactly
+   * the same graph.
+   */
+  async hasRoomFor(n: number): Promise<boolean> {
+    if (n <= 0) return true;
+    const room = this.capacity - n;
+    if (room < 0) return false;
+    const probe = await this.triplestore.query(`
+      SELECT ?e WHERE {
+        GRAPH <${this.graphUri()}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s }
+      } LIMIT 1 OFFSET ${room}`);
+    return (probe.bindings ?? []).length === 0;
+  }
+
+  /**
+   * Write several entries with ONE update and no cap enforcement. The caller
+   * has checked {@link hasRoomFor} for every entry it is about to write and
+   * writes nothing else to this graph meanwhile; under that condition this is
+   * the same stored graph as `write()` per entry (which would evict nothing).
+   * Returns the entry IRIs in order. The update is issued synchronously when
+   * this is called.
+   */
+  insertMany(items: Array<{ entry: WMEntryInput; writtenBy: PhaseRef }>): Promise<WMEntryId[]> {
+    const graph = this.graphUri();
+    this.registry.assertWritable(graph);
+    const ids: WMEntryId[] = [];
+    const lines: string[] = [];
+    for (const it of items) {
+      const built = this.entryLines(it.entry, it.writtenBy);
+      ids.push(built.id);
+      lines.push(...built.lines);
+    }
+    if (lines.length === 0) return Promise.resolve(ids);
+    return this.triplestore
+      .update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`)
+      .then(() => ids);
+  }
+
+  private entryLines(entry: WMEntryInput, writtenBy: PhaseRef): { id: WMEntryId; lines: string[] } {
     const id = this.newEntryId();
     const salience = clamp01(entry.salience);
     const writtenAt = new Date().toISOString();
@@ -306,10 +355,7 @@ export class WorkingMemory {
     if (entry.durationMs !== undefined)
       lines.push(`<${id}> <${COGT}durationMs> "${Math.max(0, Math.trunc(entry.durationMs))}"^^<${XSD}integer> .`);
     if (this.forUser) lines.push(`<${id}> <${COGT}forUser> "${escapeLiteral(this.forUser)}" .`);
-
-    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
-    await this.enforceCap();
-    return id;
+    return { id, lines };
   }
 
   /** Read entries, optionally filtered by buffer / kind / minimum salience. */
@@ -435,6 +481,21 @@ export class WorkingMemory {
    * kind, payload and goal) is "refreshed" and is not copied again.
    */
   async carryForward(toCycleId: string, opts: CarryOptions = {}): Promise<number> {
+    const prepared = await this.prepareCarryForward(toCycleId, opts);
+    await prepared.commit();
+    return prepared.count;
+  }
+
+  /**
+   * The reads of {@link carryForward} first, the write later: `count` entries
+   * will be carried, and `commit()` stores them (one update, issued
+   * synchronously when called; a no-op when nothing carries).
+   */
+  async prepareCarryForward(
+    toCycleId: string,
+    opts: CarryOptions = {},
+  ): Promise<{ count: number; commit: () => Promise<void> }> {
+    const none = { count: 0, commit: async () => undefined };
     const target = GraphUriResolver.getCogWorkingGraph(this.agentId, this.sessionId, toCycleId);
     this.registry.assertWritable(target);
 
@@ -445,7 +506,7 @@ export class WorkingMemory {
         (e.buffer === 'goalBuffer' && e.forGoal !== undefined && opts.liveGoals?.has(e.forGoal) === true) ||
         (e.carryForward === true && (e.expiresAfter === undefined || e.expiresAfter > 0)),
     );
-    if (eligible.length === 0) return 0;
+    if (eligible.length === 0) return none;
 
     const present = await new WorkingMemory(
       this.triplestore,
@@ -459,7 +520,7 @@ export class WorkingMemory {
       `${e.buffer}\u0000${e.entryKind}\u0000${e.payload}\u0000${e.forGoal ?? ''}`;
     const have = new Set(present.map(sig));
     const todo = eligible.filter((e) => !have.has(sig(e)));
-    if (todo.length === 0) return 0;
+    if (todo.length === 0) return none;
 
     const lines: string[] = [];
     for (const e of todo) {
@@ -485,8 +546,12 @@ export class WorkingMemory {
       if (e.sourceGraph)
         lines.push(`<${id}> <${COGT}sourceGraph> "${escapeLiteral(e.sourceGraph)}" .`);
     }
-    await this.triplestore.update(`INSERT DATA { GRAPH <${target}> {\n${lines.join('\n')}\n} }`);
-    return todo.length;
+    return {
+      count: todo.length,
+      commit: async () => {
+        await this.triplestore.update(`INSERT DATA { GRAPH <${target}> {\n${lines.join('\n')}\n} }`);
+      },
+    };
   }
 
   /**
@@ -503,6 +568,17 @@ export class WorkingMemory {
    * read is bounded by the cap.
    */
   async attend(input: AttentionInput): Promise<AttentionReport> {
+    const prepared = await this.prepareAttend(input);
+    await prepared.commit();
+    return prepared.report;
+  }
+
+  /**
+   * The reads and the decisions of {@link attend} first, the write later:
+   * `report` says what will change and `commit()` stores it (one update, issued
+   * synchronously when called; a no-op when nothing changes).
+   */
+  async prepareAttend(input: AttentionInput): Promise<{ report: AttentionReport; commit: () => Promise<void> }> {
     const graph = this.graphUri();
     this.registry.assertWritable(graph);
     const report: AttentionReport = { boosted: 0, damped: 0, dropped: 0 };
@@ -511,6 +587,9 @@ export class WorkingMemory {
     const refreshed = new Set<string>();
     for (const e of entries) if (e.carriedFrom === undefined && e.refersTo) refreshed.add(e.refersTo);
 
+    // The deletions and salience changes go out as one update (one operation per
+    // entry, in entry order), so a pass over many entries is one write.
+    const ops: string[] = [];
     for (const e of entries) {
       let next = e.salience;
       if (e.refersTo && input.boostEntities.has(e.refersTo)) {
@@ -526,20 +605,26 @@ export class WorkingMemory {
         report.damped++;
       }
       if (e.carriedFrom !== undefined && next < floor) {
-        await this.triplestore.update(`
+        ops.push(`
           DELETE { GRAPH <${graph}> { <${e.id}> ?p ?o } }
           WHERE  { GRAPH <${graph}> { <${e.id}> ?p ?o } }`);
         report.dropped++;
         continue;
       }
       if (next !== e.salience) {
-        await this.triplestore.update(`
+        ops.push(`
           DELETE { GRAPH <${graph}> { <${e.id}> <${COGT}salience> ?old } }
           INSERT { GRAPH <${graph}> { <${e.id}> <${COGT}salience> "${next}"^^<${XSD}decimal> } }
           WHERE  { GRAPH <${graph}> { <${e.id}> <${COGT}salience> ?old } }`);
       }
     }
-    return report;
+    const update = ops.join(' ;\n');
+    return {
+      report,
+      commit: async () => {
+        if (ops.length > 0) await this.triplestore.update(update);
+      },
+    };
   }
 
   /**
@@ -550,12 +635,11 @@ export class WorkingMemory {
   async markClosed(at: Date = new Date()): Promise<void> {
     const graph = this.graphUri();
     this.registry.assertWritable(graph);
+    // One update: the delete, then the insert.
     await this.triplestore.update(`
       DELETE { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> ?old } }
-      WHERE  { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> ?old } }`);
-    await this.triplestore.update(
-      `INSERT DATA { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> "${at.toISOString()}"^^<${XSD}dateTime> } }`,
-    );
+      WHERE  { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> ?old } } ;
+      INSERT DATA { GRAPH <${graph}> { <${graph}> <${COGT}closedAt> "${at.toISOString()}"^^<${XSD}dateTime> } }`);
   }
 
   /** Apply the entry cap now (after a bulk copy such as a carry-over). */

@@ -337,12 +337,42 @@ cost of a write grows with the dataset size.
   same as before coalescing. If a flush fails, every caller that joined it gets
   the rejection and the next write tries again.
 - **Limit.** Coalescing only helps writes that are in flight at the same time.
-  Writers that await each write before issuing the next (the persist phase of a
-  turn today) still pay one dump per write: 9 dumps per turn with all flags on.
-  Delaying the dump (debouncing) would not help them either without letting a
-  caller's await resolve before its write is on disk, which the guarantee above
-  rules out. Reducing the dumps per turn means issuing the turn's writes
-  together or as fewer updates; that is a change in the writers, not the adapter.
+  Writers that await each write before issuing the next still pay one dump per
+  write. Delaying the dump (debouncing) would not help them either without
+  letting a caller's await resolve before its write is on disk, which the
+  guarantee above rules out. Reducing the dumps per turn means issuing the
+  turn's writes together or as fewer updates; that is a change in the writers,
+  not the adapter.
+- **Waves of the queued persist.** The persist of a turn writes in waves. Inside
+  a wave every task first does its reads and builds its statement; then all the
+  statements of the wave are issued in one synchronous pass, so they share one
+  flush, and the wave resolves when all of them are on disk. Several writes of
+  one helper are one update (the working-memory entries of a group, the episodes
+  of the turn, the skill traces and the adherence summary, the delete and insert
+  of a goal status or of an impasse resolution). A turn with every flag on is
+  dumped twice or three times instead of nine or more. The order that is kept,
+  and why:
+  - wave 1 (working memory, cycle record, skill traces, conflict goals, shadow
+    record, close mark of the previous working graph) comes before the carry-over,
+    which reads this cycle's working graph and the goal stack;
+  - the carry-over's own insert is written before the salience pass, which reads
+    the graph as the carry left it;
+  - the episodes of a turn are one chained batch, written in the order they were
+    once appended one by one (goal transitions, supersession, tool calls, reply,
+    initiative record, reflection): the chain (`precededBy`, sequence number) is
+    read once and threaded through in memory;
+  - the working-memory entries of the turn are written as groups only while they
+    fit under the entry cap together (nothing is evicted then); over the cap the
+    entries are written one by one so the eviction after each write decides what
+    stays;
+  - impasses are flagged one after the other (each flag reads how many of its
+    kind exist), and the prior cycle's satisfaction back-fill precedes the
+    turn's skill traces.
+  A failing write is reported on its own and does not stop the others in its
+  wave. If the combined episode update fails, the episodes are written one by one
+  so only the failing one is lost. The stored data is the same as with one write
+  at a time (`PersistWaves.test.ts` compares a scripted sequence with a reference
+  taken from the sequential persist).
 - **Measuring.** `scripts/bench-cog.ts --persist-only 1 --episodes N` prints
   dumps per turn, the p95 awaited turn time, and the dumps and time of a burst
   of 9 concurrent writes.

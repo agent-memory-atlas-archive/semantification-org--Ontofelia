@@ -9,7 +9,7 @@
  * straight away because they already write the goal.
  */
 
-import { EpisodicMemory } from '@ontofelia/semantic-memory';
+import { EpisodicMemory, type EpisodeInput } from '@ontofelia/semantic-memory';
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import type { GoalTransition, GoalTransitionKind, GoalTransitionSink } from './GoalStack.js';
 import { looksLikeSecret } from './privacyClass.js';
@@ -21,14 +21,13 @@ export const GOAL_EPISODE_TYPE: Readonly<Record<GoalTransitionKind, string>> = {
   blocked: 'goal-blocked',
 };
 
-/** Append the episode of one transition. Returns its IRI. */
-export async function writeGoalEpisode(
-  episodes: EpisodicMemory,
+/** The episode of one transition, ready to append. */
+export function goalEpisodeInput(
   t: GoalTransition,
   where: { sessionId?: string; cycleId?: string } = {},
-): Promise<string> {
+): EpisodeInput {
   const payload = t.reason ? `${t.goalLabel} (${t.reason})` : t.goalLabel;
-  return episodes.append({
+  return {
     episodeType: GOAL_EPISODE_TYPE[t.kind],
     occurredAt: t.at,
     ...(where.sessionId ? { sessionId: where.sessionId } : {}),
@@ -38,7 +37,16 @@ export async function writeGoalEpisode(
     payload,
     ...(looksLikeSecret(payload) ? { privacyClass: 'secret' as const } : {}),
     tags: [t.goalType.split('/').pop() ?? t.goalType],
-  });
+  };
+}
+
+/** Append the episode of one transition. Returns its IRI. */
+export async function writeGoalEpisode(
+  episodes: EpisodicMemory,
+  t: GoalTransition,
+  where: { sessionId?: string; cycleId?: string } = {},
+): Promise<string> {
+  return episodes.append(goalEpisodeInput(t, where));
 }
 
 /**

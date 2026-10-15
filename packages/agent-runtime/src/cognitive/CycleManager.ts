@@ -46,6 +46,8 @@ import {
   SelfModel,
   DERIVED_LABELS,
   type TraceInput,
+  type AdherenceSummaryInput,
+  type EpisodeInput,
   type SelfView,
 } from '@ontofelia/semantic-memory';
 import {
@@ -75,7 +77,7 @@ import {
   type GoalViewer,
 } from './GoalStack.js';
 import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from './GoalLifecycle.js';
-import { writeGoalEpisode } from './GoalEpisodes.js';
+import { goalEpisodeInput } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
 import { classifySatisfaction } from './Satisfaction.js';
 import { defaultArgRedactionRules, redactToolArgs, type MaskedArg } from './ArgRedaction.js';
@@ -382,6 +384,29 @@ export interface RunCycleOptions {
    */
   initiativeGoalUri?: string;
 }
+
+/** What the metacognitive half of Phase 6 needs to know about the cycle. */
+interface MetaCycleContext {
+    cycleId: string;
+    cycleUri: string;
+    status: 'completed' | 'aborted';
+    responseText?: string;
+    toolEvents: ToolEpisodeEvent[];
+    retrievalHits: number;
+    goalConflict: boolean;
+    selfModelEnabled: boolean;
+    wmOverflow?: { dropped: number; capacity: number };
+    userKey?: string;
+    sessionId?: string;
+    activeGoalUri?: string;
+    /** Episodes (`impasse-flagged`, `meta-reflected`) are written only when true. */
+    episodicEnabled?: boolean;
+    /** Conversational turn with the new signals; absent for an initiative cycle. */
+    signals?: TurnSignals;
+    intent?: string;
+    goalsResolved?: number;
+    conflictCount?: number;
+  }
 
 /** Goal lifecycle records a cycle collects for its queued persist. */
 interface GoalExtras {
@@ -1433,61 +1458,6 @@ export class CycleManager {
   }
 
   /**
-   * Off the reply path: the goal episodes of this turn, the `ChooseGoal` record
-   * and the end of the cycle's implicit goal. Best effort, each on its own.
-   */
-  private async finishGoals(
-    envelope: MessageEnvelope,
-    sessionId: string,
-    cycleId: string,
-    cycleUri: string,
-    episodicEnabled: boolean,
-    goal: GoalExtras,
-  ): Promise<void> {
-    const userKey = cogUserKey(envelope.sender);
-    if (episodicEnabled) {
-      const em = new EpisodicMemory(this.triplestore, this.agentId);
-      for (const t of goal.events) {
-        try {
-          await writeGoalEpisode(em, t, { sessionId, cycleId });
-        } catch (e) {
-          this.onError?.(e);
-        }
-      }
-    }
-    if (goal.choice) {
-      try {
-        await this.writeChooseGoal(sessionId, cycleUri, userKey, goal.choice);
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-    if (goal.supersede) {
-      try {
-        await this.supersedeIdleLosers(envelope, sessionId, cycleId, episodicEnabled, goal.supersede);
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-    if (goal.implicitUri) {
-      try {
-        // The implicit goal serves one cycle only (doc 07 §5.1), so sessions do
-        // not keep a zombie.
-        await new GoalStack(
-          this.triplestore,
-          this.registry,
-          this.agentId,
-          sessionId,
-          undefined,
-          this.viewerOf(envelope),
-        ).setStatus(goal.implicitUri, 'resolved');
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-  }
-
-  /**
    * Goal-competition losers (docs/cognitive-architecture/07 §5): a goal that
    * lost to a newer intent stays active until something closes it. One turn of
    * the session and user is counted per call. A substantive goal the user's
@@ -1504,10 +1474,8 @@ export class CycleManager {
   private async supersedeIdleLosers(
     envelope: MessageEnvelope,
     sessionId: string,
-    cycleId: string,
-    episodicEnabled: boolean,
     rule: { afterTurns: number; winner: string },
-  ): Promise<void> {
+  ): Promise<GoalTransition[]> {
     const userKey = cogUserKey(envelope.sender);
     const key = `${sessionId}\u0000${userKey}`;
     let track = this.goalTurns.get(key);
@@ -1554,16 +1522,8 @@ export class CycleManager {
       await gs.setStatus(g.uri, 'abandoned', SUPERSEDED_REASON);
       track.goals.delete(g.uri);
     }
-    if (episodicEnabled && transitions.length > 0) {
-      const em = new EpisodicMemory(this.triplestore, this.agentId);
-      for (const t of transitions) {
-        try {
-          await writeGoalEpisode(em, t, { sessionId, cycleId });
-        } catch (e) {
-          this.onError?.(e);
-        }
-      }
-    }
+    // The caller writes the episodes of these transitions, in its episode batch.
+    return transitions;
   }
 
   /** `cogt:ChooseGoal`: which goal won a competition, which lost, and why. */
@@ -1969,167 +1929,285 @@ export class CycleManager {
         this.onError?.(e);
       }
     }
-    if (record && episodicEnabled && inboundEpisodeUri) {
-      const late = record.about.filter((a) => !inboundAbout.includes(a));
-      if (late.length > 0) {
-        try {
-          await new EpisodicMemory(this.triplestore, this.agentId).addAbout(inboundEpisodeUri, late);
-        } catch (e) {
-          this.onError?.(e);
-        }
-      }
-    }
-    await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record, wmOpts);
-    // Phase 2 result (computed before the LLM call) onto the retrieval buffer.
-    // An empty recall writes nothing; the marker bit reads the entry count.
+    // The turn's records are written in waves. Inside a wave every write is
+    // independent of the others, so each task first does its reads and builds
+    // its statement, and then all of them are issued in one synchronous pass:
+    // the store flushes once for the whole wave. A wave ends only when all its
+    // writes are durable; the next wave starts after it. Ordering kept, and why:
+    //  - wave 1 -> carry-over: the carry reads this cycle's working graph (the
+    //    entries it must not copy again) and the goal stack (the conflict goals
+    //    pushed in wave 1);
+    //  - carry-over -> wave 2: the goal-stack reads of the supersession and of
+    //    the implicit goal's end must see the goals as the carry saw them;
+    //  - inside wave 2 the episodes are ONE chained batch in the order the
+    //    episodes were once appended one by one (goal transitions, supersession,
+    //    tool and reply, initiative, reflection): the chain (`precededBy`,
+    //    sequence number) is read once and threaded through in memory;
+    //  - impasses are flagged one after the other: each flag reads the density of
+    //    the earlier ones, and its episode follows the episodes of wave 2.
     const retrievalHits = comprehension?.entries.length ?? 0;
-    if (comprehension && retrievalHits > 0) {
-      await this.writeRecall(envelope, sessionId, cycleId, `${cycleUri}_2`, comprehension, wmOpts);
-    }
-    // Goal and self entries produced for the prompt assembler (Phase 3).
-    if (extras.wm.length > 0) {
-      try {
-        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_3`, extras.wm, wmOpts);
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-    // Action buffer: a masked proposal and a result per tool call (no entry on a turn without tools).
-    if (extras.actions && extras.actions.length > 0) {
-      try {
-        const wm = new WorkingMemory(
-          this.triplestore,
-          this.registry,
-          this.agentId,
-          sessionId,
-          cycleId,
-          cogUserKey(envelope.sender),
-          wmOpts,
-        );
-        for (const a of extras.actions) await wm.write(a.entry, `${cycleUri}_${a.phase}`);
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-    // Meta entries (metacognition on only): the "I don't know" nudge, the churn warning.
-    if (extras.meta && extras.meta.length > 0) {
-      try {
-        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_6`, extras.meta, wmOpts);
-      } catch (e) {
-        this.onError?.(e);
-      }
-    }
-    // Conflicts this turn surfaced in the sender's own data: a ResolveConflict goal each.
+    const userKeyOfCycle = mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender);
     const conflicts =
       extras.signals && comprehension ? conflictsOfTurn(comprehension.entries, startedAt.toISOString()) : [];
-    if (conflicts.length > 0 && extras.conflictGoals && extras.goal) {
-      await this.pushConflictGoals(envelope, sessionId, conflicts, extras.goal);
-    }
+    const goalExtras = extras.goal;
+
+    // --- Wave 1: working memory, cycle record, traces, conflict goals. -------
+    await this.runWave([
+      // Entities that were resolved late are added to the inbound episode (append-only).
+      async () => {
+        if (!(record && episodicEnabled && inboundEpisodeUri)) return undefined;
+        const late = record.about.filter((a) => !inboundAbout.includes(a));
+        if (late.length === 0) return undefined;
+        return () => new EpisodicMemory(this.triplestore, this.agentId).addAbout(inboundEpisodeUri, late);
+      },
+      () =>
+        this.prepareWorkingMemory(envelope, sessionId, cycleId, cycleUri, perceptionPhaseUri, record, comprehension, extras, wmOpts),
+      // Conflicts this turn surfaced in the sender's own data: a ResolveConflict goal each.
+      async () =>
+        conflicts.length > 0 && extras.conflictGoals && goalExtras
+          ? () => this.pushConflictGoals(envelope, sessionId, conflicts, goalExtras)
+          : undefined,
+      async () =>
+        proceduralEnabled
+          ? this.prepareProcedural(envelope, sessionId, cycleId, mode, toolEvents, activeGoalUri, activeGoalType, extras.suggestedTools)
+          : undefined,
+      async () => () =>
+        this.writeCycleAndPhases(sessionId, cycleUri, startedAt, endedAt, status, userKeyOfCycle, marks, toolEvents),
+      async () =>
+        extras.shadow
+          ? () => this.writePromptShadow(sessionId, cycleUri, cogUserKey(envelope.sender), extras.shadow as ShadowRecord)
+          : undefined,
+      async () => (extras.attention ? this.closePreviousGraph(envelope, sessionId, cycleId) : undefined),
+    ]);
+
     // Carry-over from the previous cycle and the goal-steered salience rules.
-    if (extras.attention) {
-      await this.carryAndAttend(envelope, sessionId, cycleId, activeGoalUri, extras.attention, extras.goalsEnabled === true, wmOpts);
-    }
-    if (extras.goal) await this.finishGoals(envelope, sessionId, cycleId, cycleUri, episodicEnabled, extras.goal);
-    if (episodicEnabled) {
-      await this.writeEpisodes(
-        envelope,
-        sessionId,
-        cycleId,
-        startedAt,
-        endedAt,
-        responseText,
-        toolEvents,
-        activeGoalUri,
-        inboundEpisodeUri,
-        record,
-      );
-    }
-    // Initiative episode (docs/initiative-architecture.md §6): one auditable
-    // record per unattended cycle — trigger, outcome and reason. Written only in
-    // initiative mode, so conversational persistence is byte-identical.
-    if (mode === 'initiative' && episodicEnabled) {
-      await this.writeInitiativeEpisode(
-        envelope,
-        sessionId,
-        cycleId,
-        startedAt,
-        endedAt,
-        status,
-        responseText,
-        toolEvents,
-        activeGoalUri ?? initiativeGoalUri,
-      );
-    }
-    if (proceduralEnabled) {
-      // E3 — judge the *previous* cycle from this turn's inbound text, then
-      // record this turn's traces. Order matters: backfill first so it targets
-      // only prior cycles (this cycle's traces aren't written yet, and we also
-      // exclude the current cycleId explicitly).
-      const traceUser = mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender);
-      // An initiative cycle has no user message to react to.
-      if (mode === 'conversational') {
-        await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '', traceUser);
-      }
-      const written = await this.writeSkillTraces(
-        sessionId,
-        cycleId,
-        toolEvents,
-        activeGoalUri,
-        activeGoalType,
-        traceUser,
-        extras.suggestedTools,
-      );
-      this.noteTracesWritten(written);
-    }
-    await this.writeCycleAndPhases(
-      sessionId,
-      cycleUri,
-      startedAt,
-      endedAt,
-      status,
-      mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
-      marks,
-      toolEvents,
-    );
-    if (extras.shadow) {
+    // The carry's own insert is written here (it reads what wave 1 wrote); the
+    // salience changes are written in the last wave.
+    const attend = extras.attention
+      ? await this.carryAndAttend(envelope, sessionId, cycleId, activeGoalUri, extras.attention, extras.goalsEnabled === true, wmOpts)
+      : undefined;
+
+    // --- Wave 2: episodes, goal records, reflection. --------------------------
+    // The supersession reads the goal stack before the implicit goal is ended;
+    // an idle loser it abandons is written here, its episode joins the batch.
+    let superseded: GoalTransition[] = [];
+    if (goalExtras?.supersede) {
       try {
-        await this.writePromptShadow(sessionId, cycleUri, cogUserKey(envelope.sender), extras.shadow);
+        superseded = await this.supersedeIdleLosers(envelope, sessionId, goalExtras.supersede);
       } catch (e) {
         this.onError?.(e);
+      }
+    }
+    const episodes: EpisodeInput[] = [];
+    if (episodicEnabled) {
+      for (const t of goalExtras?.events ?? []) episodes.push(goalEpisodeInput(t, { sessionId, cycleId }));
+      for (const t of superseded) episodes.push(goalEpisodeInput(t, { sessionId, cycleId }));
+      episodes.push(
+        ...this.episodeInputs(envelope, sessionId, cycleId, startedAt, endedAt, responseText, toolEvents, activeGoalUri, inboundEpisodeUri, record),
+      );
+      // Initiative episode (docs/initiative-architecture.md §6): one auditable
+      // record per unattended cycle — trigger, outcome and reason. Written only in
+      // initiative mode, so conversational persistence is byte-identical.
+      if (mode === 'initiative') {
+        episodes.push(
+          this.initiativeEpisodeInput(envelope, sessionId, cycleId, endedAt, status, responseText, toolEvents, activeGoalUri ?? initiativeGoalUri),
+        );
       }
     }
     // Phase 6 reflection. With metacognition ON, detect impasses, run the
     // S1–S4 subcycle for each, and write the *full* marker; OFF restores the
-    // minimal Phase B marker exactly (the flag-off equivalence guarantee).
+    // minimal Phase B marker exactly (the flag-off equivalence guarantee). A
+    // cycle without impasses has no subcycle, so its marker and reflection
+    // episode are known now and join this wave; with impasses the subcycle runs
+    // after the wave (see runMetacognition).
+    const metaCtx = {
+      cycleId,
+      cycleUri,
+      status,
+      responseText,
+      toolEvents,
+      retrievalHits,
+      goalConflict,
+      selfModelEnabled,
+      sessionId,
+      activeGoalUri,
+      episodicEnabled,
+      wmOverflow: overflow.dropped > 0 && extras.attention ? { dropped: overflow.dropped, capacity: extras.attention.capacity } : undefined,
+      userKey: userKeyOfCycle,
+      ...(extras.signals
+        ? {
+            signals: extras.signals,
+            intent: record?.intent,
+            goalsResolved: (goalExtras?.events ?? []).filter(
+              (t) => t.kind === 'resolved' && t.goalType !== RESPOND_TO_USER,
+            ).length,
+            conflictCount: conflicts.length,
+          }
+        : {}),
+    };
+    let reflection: ReflectiveMarkerInput | undefined;
+    let impassesToResolve = false;
     if (metacognitionEnabled) {
-      await this.runMetacognition({
-        cycleId,
-        cycleUri,
-        status,
-        responseText,
-        toolEvents,
-        retrievalHits,
-        goalConflict,
-        selfModelEnabled,
-        sessionId,
-        activeGoalUri,
-        episodicEnabled,
-        wmOverflow: overflow.dropped > 0 && extras.attention ? { dropped: overflow.dropped, capacity: extras.attention.capacity } : undefined,
-        userKey: mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
-        ...(extras.signals
-          ? {
-              signals: extras.signals,
-              intent: record?.intent,
-              goalsResolved: (extras.goal?.events ?? []).filter(
-                (t) => t.kind === 'resolved' && t.goalType !== RESPOND_TO_USER,
-              ).length,
-              conflictCount: conflicts.length,
-            }
-          : {}),
-      });
-    } else {
-      await this.writeReflectiveMarker(cycleUri, status);
+      if (this.detectImpasses(metaCtx).length === 0) {
+        const plan = this.planReflection(metaCtx, []);
+        reflection = plan.marker;
+        if (plan.episode) episodes.push(plan.episode);
+      } else {
+        impassesToResolve = true;
+      }
     }
+    await this.runWave([
+      async () => attend,
+      async () => {
+        if (episodes.length === 0) return undefined;
+        const batch = await new EpisodicMemory(this.triplestore, this.agentId).prepareAppendMany(episodes, (e) =>
+          this.onError?.(e),
+        );
+        return batch.commit;
+      },
+      async () => (goalExtras?.choice ? () => this.writeChooseGoal(sessionId, cycleUri, cogUserKey(envelope.sender), goalExtras.choice!) : undefined),
+      // The implicit goal serves one cycle only (doc 07 §5.1), so sessions do
+      // not keep a zombie.
+      async () =>
+        goalExtras?.implicitUri
+          ? new GoalStack(this.triplestore, this.registry, this.agentId, sessionId, undefined, this.viewerOf(envelope)).prepareSetStatus(
+              goalExtras.implicitUri,
+              'resolved',
+            )
+          : undefined,
+      async () => {
+        if (reflection) {
+          const marker = reflection;
+          return async () => {
+            await new Metacognition(this.triplestore, this.agentId).writeMarker(marker);
+          };
+        }
+        return metacognitionEnabled ? undefined : () => this.writeReflectiveMarker(cycleUri, status);
+      },
+    ]);
+    if (impassesToResolve) await this.runMetacognition(metaCtx);
+  }
+
+  /**
+   * Run one wave: every task does its reads and builds its writes (a failure is
+   * reported on its own), then all the writes are issued in one synchronous pass
+   * so the store flushes once for the wave, and the wave resolves when all of
+   * them are durable. A failing write is reported on its own and does not stop
+   * the others. A task returns the write (or writes) to issue, or nothing.
+   */
+  private async runWave(
+    tasks: Array<() => Promise<(() => Promise<unknown>) | Array<() => Promise<unknown>> | undefined>>,
+  ): Promise<void> {
+    const prepared = await Promise.all(
+      tasks.map(async (task) => {
+        try {
+          return await task();
+        } catch (e) {
+          this.onError?.(e);
+          return undefined;
+        }
+      }),
+    );
+    const commits = prepared.flatMap((c) => (c === undefined ? [] : Array.isArray(c) ? c : [c]));
+    // Each commit issues its update before its first await: all are in the
+    // store's queue before the flush starts.
+    await Promise.all(
+      commits.map(async (commit) => {
+        try {
+          await commit();
+        } catch (e) {
+          this.onError?.(e);
+        }
+      }),
+    );
+  }
+
+  /**
+   * The working-memory entries of the turn as writes: perception, recall, the
+   * entries for the prompt assembler, the action buffer and the meta entries,
+   * one write per group. When all of them fit under the entry cap together,
+   * nothing is evicted by any of them, so the groups are independent and go out
+   * together. Over the cap the eviction after each entry decides what stays, so
+   * the entries are written one by one in the original order.
+   */
+  private async prepareWorkingMemory(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    cycleUri: string,
+    perceptionPhaseUri: string,
+    record: Perception | undefined,
+    comprehension: ComprehensionResult | undefined,
+    extras: { wm: WMEntryInput[]; actions?: Array<{ phase: 4 | 5; entry: WMEntryInput }>; meta?: WMEntryInput[] },
+    wmOpts: WorkingMemoryOptions | undefined,
+  ): Promise<Array<() => Promise<unknown>> | undefined> {
+    const at = (entry: WMEntryInput, writtenBy: string) => ({ entry, writtenBy });
+    const groups: Array<Array<{ entry: WMEntryInput; writtenBy: string }>> = [
+      this.perceptionEntries(envelope, record).map((e) => at(e, perceptionPhaseUri)),
+      comprehension && comprehension.entries.length > 0
+        ? this.recallEntries(comprehension).map((e) => at(e, `${cycleUri}_2`))
+        : [],
+      extras.wm.map((e) => at(e, `${cycleUri}_3`)),
+      (extras.actions ?? []).map((a) => at(a.entry, `${cycleUri}_${a.phase}`)),
+      (extras.meta ?? []).map((e) => at(e, `${cycleUri}_6`)),
+    ].filter((g) => g.length > 0);
+    const total = groups.reduce((n, g) => n + g.length, 0);
+    if (total === 0) return undefined;
+    const wm = new WorkingMemory(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      sessionId,
+      cycleId,
+      cogUserKey(envelope.sender),
+      wmOpts,
+    );
+    if (await wm.hasRoomFor(total)) {
+      return groups.map((g) => async () => {
+        await wm.insertMany(g);
+      });
+    }
+    return [
+      async () => {
+        for (const g of groups) {
+          try {
+            for (const it of g) await wm.write(it.entry, it.writtenBy);
+          } catch (e) {
+            this.onError?.(e);
+          }
+        }
+      },
+    ];
+  }
+
+  /**
+   * E3 — the procedural records of the turn as one write. The prior cycle is
+   * judged first (a read-then-write on traces of EARLIER cycles; this cycle's
+   * traces are not written yet and are excluded by id as well), then this
+   * turn's traces and, when suggestions were shown, the adherence summary are
+   * written together.
+   */
+  private async prepareProcedural(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    mode: 'conversational' | 'initiative',
+    toolEvents: ToolEpisodeEvent[],
+    activeGoalUri: string | undefined,
+    activeGoalType: string | undefined,
+    suggestedTools: string[] | undefined,
+  ): Promise<(() => Promise<unknown>) | undefined> {
+    const traceUser = mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender);
+    // An initiative cycle has no user message to react to.
+    if (mode === 'conversational') {
+      await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '', traceUser);
+    }
+    const plan = await this.planSkillTraces(sessionId, cycleId, toolEvents, activeGoalUri, activeGoalType, traceUser, suggestedTools);
+    if (!plan) return undefined;
+    return async () => {
+      await new ProceduralMemory(this.triplestore, this.agentId).recordTraces(plan.traces, plan.summary);
+      this.noteTracesWritten(plan.traces.length);
+    };
   }
 
   /**
@@ -2138,27 +2216,7 @@ export class CycleManager {
    * writes the full `cogt:ReflectiveMarker` with the cycle's monitoring
    * signals. All best-effort: it never touches the (already-sent) user reply.
    */
-  private async runMetacognition(ctx: {
-    cycleId: string;
-    cycleUri: string;
-    status: 'completed' | 'aborted';
-    responseText?: string;
-    toolEvents: ToolEpisodeEvent[];
-    retrievalHits: number;
-    goalConflict: boolean;
-    selfModelEnabled: boolean;
-    wmOverflow?: { dropped: number; capacity: number };
-    userKey?: string;
-    sessionId?: string;
-    activeGoalUri?: string;
-    /** Episodes (`impasse-flagged`, `meta-reflected`) are written only when true. */
-    episodicEnabled?: boolean;
-    /** Conversational turn with the new signals; absent for an initiative cycle. */
-    signals?: TurnSignals;
-    intent?: string;
-    goalsResolved?: number;
-    conflictCount?: number;
-  }): Promise<void> {
+  private async runMetacognition(ctx: MetaCycleContext): Promise<void> {
     const meta = new Metacognition(this.triplestore, this.agentId);
 
     // --- Detect impasses from the cycle's vantage point (F2). ----------------
@@ -2166,7 +2224,9 @@ export class CycleManager {
 
     // --- S1–S4 subcycle per impasse (F3). The subcycle is a bounded policy
     // lookup plus two writes: it performs no LLM call and cannot itself raise
-    // an impasse, so there is no recursion and the cycle can never loop. ------
+    // an impasse, so there is no recursion and the cycle can never loop. The
+    // impasses are handled one after the other: flagging reads how many of the
+    // kind are already flagged. -----------------------------------------------
     const resolved: ResolvedImpasse[] = [];
     for (const input of impasses) {
       try {
@@ -2179,14 +2239,6 @@ export class CycleManager {
           { agent: this.agentId, kind: flagged.kind, chronic: flagged.chronic, phase: input.flaggedInPhase },
           `impasse flagged: ${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}`,
         );
-        // The episode of the impasse: the kind and the detector's context (tool
-        // name and error class, never user text). Episodic flag only.
-        await this.appendMetaEpisode(ctx, {
-          episodeType: 'impasse-flagged',
-          payload: `${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}: ${input.context}`,
-          tags: [flagged.kind],
-          forUser: input.forUser ?? ctx.userKey,
-        });
         const resolution = meta.pickResolution(flagged.kind, {
           attempt: 0,
           recentDensity: 0,
@@ -2195,14 +2247,49 @@ export class CycleManager {
         // S4 resume: ask-user is *recorded* but left for the human; everything
         // else is auto-resolved by the policy. Chronic always defers to user.
         const autoResolved = resolution !== 'ask-user';
-        if (autoResolved) await meta.resolveImpasse(flagged.id, resolution, 'metacog');
+        // The episode of the impasse (the kind and the detector's context: tool
+        // name and error class, never user text; episodic flag only) and the
+        // resolution stamp are independent writes and go out together.
+        await Promise.all([
+          this.appendMetaEpisode(ctx, {
+            episodeType: 'impasse-flagged',
+            payload: `${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}: ${input.context}`,
+            tags: [flagged.kind],
+            forUser: input.forUser ?? ctx.userKey,
+          }),
+          autoResolved ? meta.resolveImpasse(flagged.id, resolution, 'metacog') : undefined,
+        ]);
         resolved.push({ flaggedUri: flagged.id, resolved: autoResolved });
       } catch (e) {
         this.onError?.(e);
       }
     }
 
-    // --- Phase 6 full reflective marker (F4). --------------------------------
+    // --- Phase 6 full reflective marker (F4) and its episode. ----------------
+    const plan = this.planReflection(ctx, resolved);
+    await this.runWave([
+      async () => async () => {
+        await meta.writeMarker(plan.marker);
+      },
+      async () => {
+        if (!plan.episode) return undefined;
+        const batch = await new EpisodicMemory(this.triplestore, this.agentId).prepareAppendMany([plan.episode], (e) =>
+          this.onError?.(e),
+        );
+        return batch.commit;
+      },
+    ]);
+  }
+
+  /**
+   * The full reflective marker of a cycle and the episode of the reflection (a
+   * fixed-format line of the marker's counts; absent with the episodic flag off),
+   * from the cycle's context and its resolved impasses. Pure: nothing is written.
+   */
+  private planReflection(
+    ctx: MetaCycleContext,
+    resolved: ResolvedImpasse[],
+  ): { marker: ReflectiveMarkerInput; episode?: EpisodeInput } {
     const toolsUsed = new Set(ctx.toolEvents.map((e) => e.callId)).size;
     const toolErrors = ctx.toolEvents.filter(
       (e) => e.phase === 'completed' && e.outcome === 'error',
@@ -2233,7 +2320,7 @@ export class CycleManager {
       ? goalProgressOf({ stepUpdates, goalsResolved: ctx.goalsResolved ?? 0 })
       : undefined;
 
-    await meta.writeMarker({
+    const marker: ReflectiveMarkerInput = {
       cycleUri: ctx.cycleUri,
       cycleStatus,
       toolsUsed,
@@ -2254,9 +2341,9 @@ export class CycleManager {
             ...(sig.goalDrift !== undefined ? { goalDrift: sig.goalDrift } : {}),
           }
         : {}),
-    });
+    };
     // The episode of the reflection: a fixed-format line of the marker's counts.
-    await this.appendMetaEpisode(ctx, {
+    const episode = this.metaEpisodeInput(ctx, {
       episodeType: 'meta-reflected',
       payload:
         `cycle ${cycleStatus}; tools ${toolsUsed}, tool errors ${toolErrors}, ` +
@@ -2265,6 +2352,7 @@ export class CycleManager {
       tags: [cycleStatus],
       forUser: ctx.userKey,
     });
+    return { marker, ...(episode ? { episode } : {}) };
   }
 
   /**
@@ -2276,24 +2364,33 @@ export class CycleManager {
     ctx: { cycleId: string; sessionId?: string; activeGoalUri?: string; episodicEnabled?: boolean },
     ep: { episodeType: 'impasse-flagged' | 'meta-reflected'; payload: string; tags: string[]; forUser?: string },
   ): Promise<void> {
-    if (ctx.episodicEnabled === false) return;
     try {
-      await new EpisodicMemory(this.triplestore, this.agentId).append({
-        episodeType: ep.episodeType,
-        occurredAt: new Date(),
-        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-        cycleId: ctx.cycleId,
-        actor: `urn:${this.agentId}:self#${this.agentId}`,
-        ...(ep.forUser ? { forUser: ep.forUser } : {}),
-        ...(ctx.activeGoalUri ? { partOfGoal: ctx.activeGoalUri } : {}),
-        ...this.privacyOf(ep.payload),
-        payload: ep.payload,
-        tags: ep.tags,
-        salience: 0.3,
-      });
+      const input = this.metaEpisodeInput(ctx, ep);
+      if (input) await new EpisodicMemory(this.triplestore, this.agentId).append(input);
     } catch (e) {
       this.onError?.(e);
     }
+  }
+
+  /** The metacognition episode, or undefined with the episodic flag off. */
+  private metaEpisodeInput(
+    ctx: { cycleId: string; sessionId?: string; activeGoalUri?: string; episodicEnabled?: boolean },
+    ep: { episodeType: 'impasse-flagged' | 'meta-reflected'; payload: string; tags: string[]; forUser?: string },
+  ): EpisodeInput | undefined {
+    if (ctx.episodicEnabled === false) return undefined;
+    return {
+      episodeType: ep.episodeType,
+      occurredAt: new Date(),
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+      cycleId: ctx.cycleId,
+      actor: `urn:${this.agentId}:self#${this.agentId}`,
+      ...(ep.forUser ? { forUser: ep.forUser } : {}),
+      ...(ctx.activeGoalUri ? { partOfGoal: ctx.activeGoalUri } : {}),
+      ...this.privacyOf(ep.payload),
+      payload: ep.payload,
+      tags: ep.tags,
+      salience: 0.3,
+    };
   }
 
   /**
@@ -2452,7 +2549,8 @@ export class CycleManager {
       onlyUnjudged: true,
       maxGapMs: FOLLOWUP_MAX_GAP_MS,
     });
-    for (const uri of uris) await pm.backfillSatisfaction(uri, satisfied, FOLLOWUP_SATISFACTION_WEIGHT);
+    // Each trace is its own record: the back-fills are independent and go out together.
+    await Promise.all(uris.map((uri) => pm.backfillSatisfaction(uri, satisfied, FOLLOWUP_SATISFACTION_WEIGHT)));
   }
 
   /** Satisfaction read of an inbound message: true / false / null (ambiguous). */
@@ -2473,7 +2571,7 @@ export class CycleManager {
    * sequence position/length and `previousTrace` link are derived from call
    * order so the consolidation job can later detect tool sequences.
    */
-  private async writeSkillTraces(
+  private async planSkillTraces(
     sessionId: string,
     cycleId: string,
     toolEvents: ToolEpisodeEvent[],
@@ -2481,7 +2579,7 @@ export class CycleManager {
     activeGoalType?: string,
     userKey: string = OWNER_USER_KEY,
     suggestedTools?: string[],
-  ): Promise<number> {
+  ): Promise<{ traces: TraceInput[]; summary?: AdherenceSummaryInput } | undefined> {
     // Pair events by callId, preserving first-seen order.
     interface Call {
       callId: string;
@@ -2512,9 +2610,8 @@ export class CycleManager {
         call.errorClass = ev.errorClass;
       }
     }
-    if (order.length === 0) return 0;
+    if (order.length === 0) return undefined;
 
-    const pm = new ProceduralMemory(this.triplestore, this.agentId);
     const rules = await new CognitiveConfig(this.triplestore, this.agentId).argRedactionRules();
     // The key is fetched (and its file created) only when an argument is masked.
     let digestKey: Buffer | undefined;
@@ -2522,7 +2619,7 @@ export class CycleManager {
     const suggested = suggestedTools && suggestedTools.length > 0 ? new Set(suggestedTools) : undefined;
     let adhered = 0;
     const sequenceLen = order.length;
-    let previousTrace: string | undefined;
+    const traces: TraceInput[] = [];
     let pos = 0;
     for (const callId of order) {
       const c = calls.get(callId)!;
@@ -2561,17 +2658,18 @@ export class CycleManager {
         sessionId,
         sequencePos: pos,
         sequenceLen,
-        previousTrace,
         forUser: userKey,
         ...(redacted.masked.some((m) => m.digest !== undefined)
           ? { maskedArgs: redacted.masked.flatMap((m) => (m.digest !== undefined ? [{ path: m.path, digest: m.digest, scheme: m.scheme ?? ('hmac-sha256' as const) }] : [])) }
           : {}),
         ...(adherence !== undefined ? { proceduralAdherence: adherence } : {}),
       };
-      previousTrace = await pm.recordTrace(trace);
+      // `previousTrace` (the link to the call before) is set when the batch is written.
+      traces.push(trace);
     }
-    if (suggested) {
-      await pm.recordAdherenceSummary({
+    return {
+      traces,
+      ...(suggested ? { summary: {
         cycleId,
         sessionId,
         forUser: userKey,
@@ -2579,9 +2677,8 @@ export class CycleManager {
         suggestedTools: suggested.size,
         tracedCalls: order.length,
         adheredCalls: adhered,
-      });
-    }
-    return order.length;
+      } } : {}),
+    };
   }
 
   /** `core:privacyClass "secret"` for a payload that matches a credential shape. */
@@ -2602,6 +2699,20 @@ export class CycleManager {
     activeGoalUri?: string,
     perception?: Perception,
   ): Promise<string> {
+    return new EpisodicMemory(this.triplestore, this.agentId).append(
+      this.inboundEpisodeInput(envelope, sessionId, cycleId, occurredAt, activeGoalUri, perception),
+    );
+  }
+
+  /** The `message-received` episode of a turn, ready to append (see {@link appendInboundEpisode}). */
+  private inboundEpisodeInput(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    occurredAt: Date,
+    activeGoalUri?: string,
+    perception?: Perception,
+  ): EpisodeInput {
     const channel = envelope.channel ? String(envelope.channel) : undefined;
     const actor = envelope.sender?.id
       ? `urn:entity:agent-sender:${encodeURIComponent(envelope.sender.id)}`
@@ -2611,7 +2722,7 @@ export class CycleManager {
     // (initiative, scheduler, cron trigger, webhooks) also claim isOwner and are
     // excluded by isHumanOwnerTurn.
     const actorIsOwner = isHumanOwnerTurn(envelope);
-    return new EpisodicMemory(this.triplestore, this.agentId).append({
+    return {
       episodeType: 'message-received',
       occurredAt,
       sessionId,
@@ -2641,7 +2752,7 @@ export class CycleManager {
           }
         : {}),
       partOfGoal: activeGoalUri,
-    });
+    };
   }
 
   /** `{ factGraph }` for an inbound episode, or nothing when the sender has no usable id. */
@@ -2657,12 +2768,6 @@ export class CycleManager {
     }
   }
 
-  /**
-   * Write this turn's recall (Phase 2) onto the retrieval buffer, best first.
-   * Each entry carries its score as `retrievalScore` (and as salience) and the
-   * graph it was read from; the working memory stamps the sender's user key on
-   * every entry.
-   */
   /**
    * Attention and carry-over for one cycle (queued persist, conversational
    * turns). In order:
@@ -2682,7 +2787,7 @@ export class CycleManager {
     settings: AttentionSettings,
     goalsEnabled: boolean,
     wmOpts: WorkingMemoryOptions | undefined,
-  ): Promise<void> {
+  ): Promise<(() => Promise<void>) | undefined> {
     try {
       const userKey = cogUserKey(envelope.sender);
       // Scoping: the key holds session AND user, so a cycle never finds another
@@ -2714,40 +2819,55 @@ export class CycleManager {
       const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId, userKey, wmOpts);
       if (prevCycleId && prevCycleId !== cycleId) {
         const prev = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, prevCycleId, userKey);
-        const carried = await prev.carryForward(cycleId, { liveGoals });
-        if (carried > 0) await wm.enforce();
-        await prev.markClosed();
+        // The previous graph is marked closed in wave 1 (see closePreviousGraph).
+        const carry = await prev.prepareCarryForward(cycleId, { liveGoals });
+        await carry.commit();
+        if (carry.count > 0) await wm.enforce();
       }
-      await wm.attend({ boostEntities: boost, keepEntities: keep, theta: settings.theta });
-
-      this.lastCycle.delete(key);
-      this.lastCycle.set(key, cycleId);
-      if (this.lastCycle.size > LAST_CYCLE_MAX) {
-        const oldest = this.lastCycle.keys().next().value;
-        if (oldest !== undefined) this.lastCycle.delete(oldest);
-      }
+      // The salience changes read the graph as the carry left it, and are written
+      // in the last wave: nothing in that wave reads the working graph.
+      const attended = await wm.prepareAttend({ boostEntities: boost, keepEntities: keep, theta: settings.theta });
+      return async () => {
+        await attended.commit();
+        this.lastCycle.delete(key);
+        this.lastCycle.set(key, cycleId);
+        if (this.lastCycle.size > LAST_CYCLE_MAX) {
+          const oldest = this.lastCycle.keys().next().value;
+          if (oldest !== undefined) this.lastCycle.delete(oldest);
+        }
+      };
     } catch (e) {
       this.onError?.(e);
+      return undefined;
     }
   }
 
-  private async writeRecall(
+  /**
+   * Mark the previous cycle's working graph of this session and user closed
+   * (nothing is deleted; the age-based sweep takes it on its schedule). The mark
+   * is a statement about that graph and is independent of the carry, which only
+   * reads the graph's entries, so it goes out with the first wave.
+   */
+  private closePreviousGraph(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
-    phaseUri: string,
-    comprehension: ComprehensionResult,
-    wmOpts?: WorkingMemoryOptions,
-  ): Promise<void> {
-    const wm = new WorkingMemory(
-      this.triplestore,
-      this.registry,
-      this.agentId,
-      sessionId,
-      cycleId,
-      cogUserKey(envelope.sender),
-      wmOpts,
-    );
+  ): (() => Promise<void>) | undefined {
+    const userKey = cogUserKey(envelope.sender);
+    const prevCycleId = this.lastCycle.get(`${sessionId}\u0000${userKey}`);
+    if (!prevCycleId || prevCycleId === cycleId) return undefined;
+    return () =>
+      new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, prevCycleId, userKey).markClosed();
+  }
+
+  /**
+   * This turn's recall (Phase 2) as retrieval-buffer entries, best first. Each
+   * entry carries its score as `retrievalScore` (and as salience) and the graph
+   * it was read from; the working memory stamps the sender's user key on every
+   * entry.
+   */
+  private recallEntries(comprehension: ComprehensionResult): WMEntryInput[] {
+    const out: WMEntryInput[] = [];
     for (const e of comprehension.entries) {
       // The working memory writes the reference as a bare IRI: only a safe one is kept.
       let refersTo: string | undefined = e.refersTo;
@@ -2756,40 +2876,17 @@ export class CycleManager {
       } catch {
         refersTo = undefined;
       }
-      await wm.write(
-        {
-          buffer: 'retrievalBuffer',
-          entryKind: e.kind,
-          payload: e.payload,
-          salience: e.score,
-          retrievalScore: e.score,
-          sourceGraph: e.sourceGraph,
-          ...(refersTo ? { refersTo } : {}),
-        },
-        phaseUri,
-      );
+      out.push({
+        buffer: 'retrievalBuffer',
+        entryKind: e.kind,
+        payload: e.payload,
+        salience: e.score,
+        retrievalScore: e.score,
+        sourceGraph: e.sourceGraph,
+        ...(refersTo ? { refersTo } : {}),
+      });
     }
-  }
-
-  /** Write the goal and self entries produced for the prompt assembler (queued persist). */
-  private async writeQueuedWm(
-    envelope: MessageEnvelope,
-    sessionId: string,
-    cycleId: string,
-    phaseUri: string,
-    entries: WMEntryInput[],
-    wmOpts?: WorkingMemoryOptions,
-  ): Promise<void> {
-    const wm = new WorkingMemory(
-      this.triplestore,
-      this.registry,
-      this.agentId,
-      sessionId,
-      cycleId,
-      cogUserKey(envelope.sender),
-      wmOpts,
-    );
-    for (const e of entries) await wm.write(e, phaseUri);
+    return out;
   }
 
   /**
@@ -2836,7 +2933,7 @@ export class CycleManager {
    * Recall is not done here: it happens once, before the answer (Phase 2,
    * Comprehension.ts).
    */
-  private async writeEpisodes(
+  private episodeInputs(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
@@ -2847,21 +2944,21 @@ export class CycleManager {
     activeGoalUri?: string,
     inboundEpisodeUri?: string,
     perception?: Perception,
-  ): Promise<void> {
-    const em = new EpisodicMemory(this.triplestore, this.agentId);
+  ): EpisodeInput[] {
+    const out: EpisodeInput[] = [];
     const channel = envelope.channel ? String(envelope.channel) : undefined;
     const userKey = cogUserKey(envelope.sender);
 
     // C2 — perception episode (already written ahead of the core on a
     // conversational turn; see runCycle).
     if (!inboundEpisodeUri) {
-      await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri, perception);
+      out.push(this.inboundEpisodeInput(envelope, sessionId, cycleId, startedAt, activeGoalUri, perception));
     }
 
     // C3 — tool-called / tool-completed episodes, in arrival order.
     for (const ev of toolEvents) {
       if (ev.phase === 'called') {
-        await em.append({
+        out.push({
           episodeType: 'tool-called',
           occurredAt: ev.occurredAt,
           sessionId,
@@ -2872,7 +2969,7 @@ export class CycleManager {
           tags: [ev.callId],
         });
       } else {
-        await em.append({
+        out.push({
           episodeType: 'tool-completed',
           occurredAt: ev.occurredAt,
           sessionId,
@@ -2889,7 +2986,7 @@ export class CycleManager {
 
     // C3 (response half) — response-sent episode.
     if (responseText) {
-      await em.append({
+      out.push({
         episodeType: 'response-sent',
         occurredAt: endedAt,
         sessionId,
@@ -2904,6 +3001,7 @@ export class CycleManager {
         partOfGoal: activeGoalUri,
       });
     }
+    return out;
   }
 
   /**
@@ -2914,18 +3012,16 @@ export class CycleManager {
    * the agent did while nobody was watching. Reuses EpisodicMemory, so it lands
    * in the same `cog:episodic` graph as every other episode.
    */
-  private async writeInitiativeEpisode(
+  private initiativeEpisodeInput(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
-    startedAt: Date,
     endedAt: Date,
     status: 'completed' | 'aborted',
     responseText: string | undefined,
     toolEvents: ToolEpisodeEvent[],
     goalUri?: string,
-  ): Promise<void> {
-    const em = new EpisodicMemory(this.triplestore, this.agentId);
+  ): EpisodeInput {
     const toolCalls = new Set(
       toolEvents.filter((e) => e.phase === 'called').map((e) => e.callId),
     ).size;
@@ -2940,7 +3036,7 @@ export class CycleManager {
             : 'initiative cycle completed as a no-op';
     const trigger = (envelope.text || '').trim();
     const payload = `trigger: ${trigger || '(none)'} | outcome: ${reason} | tools: ${toolCalls}`;
-    await em.append({
+    return {
       episodeType: 'initiative',
       occurredAt: endedAt,
       sessionId,
@@ -2953,64 +3049,38 @@ export class CycleManager {
       outcome,
       partOfGoal: goalUri,
       salience: 0.8,
-    });
+    };
   }
 
   /**
    * B5 — Phase 1 perception onto the perception buffer. With a perception record
-   * its entries are written in order (message text, sender, channel, entities,
-   * claims, intent); without one (initiative turns) the earlier three entries.
+   * its entries in order (message text, sender, channel, entities, claims,
+   * intent); without one (initiative turns) the earlier three entries.
    */
-  private async writePerception(
-    envelope: MessageEnvelope,
-    sessionId: string,
-    cycleId: string,
-    phaseUri: string,
-    perception?: Perception,
-    wmOpts?: WorkingMemoryOptions,
-  ): Promise<void> {
-    const wm = new WorkingMemory(
-      this.triplestore,
-      this.registry,
-      this.agentId,
-      sessionId,
-      cycleId,
-      cogUserKey(envelope.sender),
-      wmOpts,
-    );
-    if (perception) {
-      for (const entry of perception.entries) await wm.write(entry, phaseUri);
-      return;
-    }
+  private perceptionEntries(envelope: MessageEnvelope, perception?: Perception): WMEntryInput[] {
+    if (perception) return [...perception.entries];
+    const out: WMEntryInput[] = [];
     const text = envelope.text || '';
     if (text) {
-      await wm.write(
-        { buffer: 'perceptionBuffer', entryKind: 'message-text', payload: text, salience: 1.0 },
-        phaseUri,
-      );
+      out.push({ buffer: 'perceptionBuffer', entryKind: 'message-text', payload: text, salience: 1.0 });
     }
     if (envelope.sender?.id) {
-      await wm.write(
-        {
-          buffer: 'perceptionBuffer',
-          entryKind: 'sender-id',
-          payload: envelope.sender.id,
-          salience: 1.0,
-        },
-        phaseUri,
-      );
+      out.push({
+        buffer: 'perceptionBuffer',
+        entryKind: 'sender-id',
+        payload: envelope.sender.id,
+        salience: 1.0,
+      });
     }
     if (envelope.channel) {
-      await wm.write(
-        {
-          buffer: 'perceptionBuffer',
-          entryKind: 'channel',
-          payload: String(envelope.channel),
-          salience: 0.6,
-        },
-        phaseUri,
-      );
+      out.push({
+        buffer: 'perceptionBuffer',
+        entryKind: 'channel',
+        payload: String(envelope.channel),
+        salience: 0.6,
+      });
     }
+    return out;
   }
 
   /** B4 — reify the cycle and its six phases into cog:cycles:<sess>. */
