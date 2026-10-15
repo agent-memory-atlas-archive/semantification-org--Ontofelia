@@ -88,6 +88,14 @@ cog:wm_<n> a cogt:WorkingMemoryEntry ;
 | `goal-parent` | goalBuffer | An ancestor goal still relevant |
 | `action-proposal` | actionBuffer | LLM's proposed next action |
 | `action-result` | actionBuffer | Tool result after execution |
+
+Implemented for tool calls (see doc 09 §12 for the differences from this
+schema): `action-proposal` carries `toolName`, `callId`, `toolArgs` (argument
+keys only, masked paths listed, never a value) and `forGoal` (the active goal,
+when the goal stack is on); `action-result` carries `callId`, `outcome`
+(`success` or `error`), `denialClass` and `durationMs`. Both are written by the
+queued persist with the sender's `forUser`, below the default threshold, so they
+are an audit trail and never prompt material.
 | `capability` | selfBuffer | A `cogt:Capability` relevant this cycle |
 | `constraint` | selfBuffer | A `cogt:Constraint` relevant this cycle |
 | `persona-fragment` | selfBuffer | Identity/style note for prompt |

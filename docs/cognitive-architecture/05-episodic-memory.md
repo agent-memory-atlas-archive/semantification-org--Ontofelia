@@ -45,6 +45,14 @@ matters for future recall. Concretely:
 | `meta-reflected` | Phase 6 writes the reflective marker | Phase 6 |
 | `consolidation-promoted` | A pattern was promoted from episodic to semantic | Background job |
 
+`impasse-flagged` and `meta-reflected` are written by the metacognition step of
+a cycle (`flagMetacognition`) and only when episodes are on
+(`flagEpisodicMemory`). Both carry `cogt:cycleId`, `cogt:forUser` and, where the
+turn had a goal, `cogt:partOfGoal`. `impasse-flagged` has one episode per impasse
+(payload: kind and detector context); `meta-reflected` has one per cycle
+(payload: a fixed line of the marker's counts). Impasses raised by the weekly
+cross-cycle scan are not written as episodes.
+
 Episodes are **always written**, even when uninteresting. The cost of
 "too many episodes" is solved by retention (§7), not by being selective at
 write time — that would create blind spots.

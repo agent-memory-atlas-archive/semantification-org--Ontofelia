@@ -3,6 +3,12 @@
 > **Scope:** how this concept lands in the existing codebase. What changes,
 > what is additive, what is touched at a minimum. A phased migration plan
 > with rollback points.
+>
+> **Implementation status (2026-10-15):** phases A to I and the later slices are
+> implemented behind the flags in §7. **All flags default to off**; no part of
+> the cognitive layer runs unless an operator switches it on. §7 lists every
+> flag with its default; §12 records where the code's names differ from this
+> specification.
 
 ---
 
@@ -244,22 +250,54 @@ have no episodic representation, which is fine.
 
 ## 7. Feature flags
 
-For staged rollout (in `urn:<agent>:setup`):
+For staged rollout. A flag is one boolean triple on the config subject
+`<urn:<agent>:setup:cognitive>` in the setup graph `urn:<agent>:setup`
+(namespace `cogt:` = `urn:shared:ontology#cog/`):
 
 ```turtle
 GRAPH <urn:ontofelia:setup> {
-  onto:setup#Environment cog:flagCycleManager    true ;
-                         cog:flagEpisodicMemory  true ;
-                         cog:flagGoalStack       true ;
-                         cog:flagProceduralMemory true ;
-                         cog:flagMetacognition   true ;
-                         cog:flagSelfModelQuery  true .
+  <urn:ontofelia:setup:cognitive> cogt:flagCycleManager   "true"^^xsd:boolean ;
+                                  cogt:flagEpisodicMemory "true"^^xsd:boolean .
 }
 ```
 
-Each phase from B onward respects its flag; flipping a flag off restores
-previous behaviour. This is what makes the migration safe to land
-incrementally on production.
+A missing, unparseable or unreadable triple counts as **off**. Flags are read
+per message, so they toggle without a restart. The owner lists them with
+`/cog flags` and sets one with `/cog flag <name> on|off` (a live owner turn);
+`/cog cycle on|off` sets the cycle flag. Each flag respects the previous
+behaviour when off: the legacy path runs and nothing is written.
+
+The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
+`CognitiveConfig.ts`; the test `CogDocsSync` keeps this table in step with it):
+
+| Flag | Short key | Default | What it switches on |
+|---|---|---|---|
+| `flagCycleManager` | `cycleManager` | off | Route messages through the six-phase cycle (cycle and phase records, working memory, action buffer, reflective marker). The other flags refine what the cycle does or what runs beside it. |
+| `flagEpisodicMemory` | `episodicMemory` | off | The cycle writes episodes (messages, tools, replies, goal transitions, `impasse-flagged`, `meta-reflected`); `arm_goal` needs this. |
+| `flagEpisodicRecall` | `episodicRecall` | off | Allow the recalled episodes and facts into the prompt; only the working-memory prompt mode renders them. The recall itself follows the cycle flag. |
+| `flagGoalStack` | `goalStack` | off | Manage an explicit goal stack in the cycle. |
+| `flagProceduralMemory` | `proceduralMemory` | off | Record skill traces per tool call and suggest skills. |
+| `flagMetacognition` | `metacognition` | off | Raise impasses, write the full reflective marker and its signals. |
+| `flagSelfModelQuery` | `selfModelQuery` | off | Add a self-model block to the prompt. |
+| `flagRetention` | `retention` | off | Let the retention sweep tier old episodes (destructive). |
+| `flagDebugPanel` | `debugPanel` | off | Expose the read-only inspection routes (`/api/cog/inspect/*`) and `/cog cycles`, `/cog explain`. |
+| `flagPromptShadow` | `promptShadow` | off | Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged. |
+| `flagWorkingMemoryPrompt` | `workingMemoryPrompt` | off | Build the cognitive prompt blocks from working memory instead of the legacy strings (wins over the shadow flag). |
+| `flagInitiative` | `initiative` | off | Allow self-started goal wakes (kill switch for unattended work). |
+| `flagEpisodicConsolidation` | `episodicConsolidation` | off | Daily, promote facts a user asserted in several independent episodes into that user's own graph (never the worldview). |
+
+Setup keys that are **not** feature flags (same config subject, same graph):
+
+| Key | Kind | Default | Effect |
+|---|---|---|---|
+| `unknownNudgeAllUsers` | boolean | `false` | The "I don't know" nudge reaches the live prompt of every user instead of the owner only. |
+| `argRedactionRules` | JSON literal | built-in rules | Extra key and value patterns for argument redaction; can only add to the built-ins. |
+| `salienceThreshold` | number 0..1 | `0.5` | θ of the global workspace. |
+| `recalledTokenCap` | integer | `600` | Cap of the recalled block, in estimated tokens. |
+| `promptTokenCap` | integer | `1200` | Cap of all cognitive prompt blocks together. |
+| `workingMemoryCapacity` | integer 1..10000 | `200` | Entries per cycle graph. |
+| `consolidationMinEpisodes` | integer 1..100 | `3` | Episodes needed to promote a fact. |
+| `consolidationMinGroups` | integer 1..100 | `2` | Independent groups needed to promote a fact. |
 
 ---
 
@@ -341,5 +379,40 @@ This concept is considered implemented when **all** of these hold:
 - [ ] `/cog/health` exposes the counts above.
 - [ ] Existing tests pass.
 - [ ] Documentation is updated (`docs/architecture.md` points here).
+
+## 12. Naming decisions: the specification versus the code
+
+Where the code's names differ from the specification, the difference is a
+decision recorded here, not an oversight. Stored data is **not** migrated: a
+name the code already wrote stays, unless a row says it was changed. Format:
+the doc says X, the code uses Y, because Z.
+
+**Changed to the doc's name (phase records).** Phases are written with
+`cogt:hasPhase` (from the cycle), `cogt:phaseIndex` and `cogt:phaseStatus`, as
+in doc 03 §1 and §10. Earlier cycles carry `cogt:ordinal` and no status; the
+inspector reads both shapes, so old cycles still display, and they are not
+rewritten. `cogt:partOfCycle` (the inverse link) is kept next to `hasPhase`.
+`phaseStatus` is written once, after the cycle: `completed`, or `aborted` for
+phases 4 and 5 (the delegated core) when the core threw. The `pending` and
+`running` states of doc 10 are not written, because phases are recorded after
+the fact. The cycle resource also carries `cogt:cycleId` and `cogt:sessionId`
+now (doc 03 §1), which joins a cycle to its episodes.
+
+**Kept as the code has it.**
+
+| The doc says | The code uses | Because |
+|---|---|---|
+| Phase kinds `action-selection`, `execution`, `learning` (doc 00, 03) | `action`, `response`, `reflection` in `cogt:phaseKind` | Phases 3 to 5 run inside the existing runtime core, so the code names what that core does; the stored kinds are not rewritten. Index and order are the doc's. |
+| `cycleId = cycle_<iso>_<seq>`, IRI `cog:cycle_...` | `cyc-<uuid>`, IRI `urn:<agent>:cog:cycle:cyc-<uuid>` | An id must be unique without a per-session counter on the reply path; every reader takes the id as it is. |
+| `cogt:status` on a cycle or goal | `cogt:cycleStatus`, `cogt:goalStatus` | Already stored under these names; renaming them would need a migration. |
+| `cogt:triggeredBy` from a cycle to an episode, and its inverse `cogt:triggers` | Episodes carry `cogt:cycleId` (a string); the cycle carries the same literal | The episode is written before the cycle resource exists; a literal joins them without ordering. |
+| `cogt:rawText` on an episode | `cogt:payload` | Already stored under this name; a payload that looks like a credential is class-marked as secret. |
+| `cogt:writtenTo cogt:actionBuffer` (an IRI) | `cogt:writtenTo "actionBuffer"` (a plain literal) | All buffers are stored and filtered as literals; an IRI would split the data. |
+| Proposal attributes `actionType`, `toolArgs` as the JSON arguments; a `text-response` proposal | Entry kind tells proposal from result; `toolArgs` is a **keys-only** brief with masked paths listed; only tool calls are written | A stored argument value could be a secret; the keys are enough to explain a call, and the reply text is the `response-sent` episode. |
+| The proposal is updated with its result (`actionBuffer.result`) | A separate `action-result` entry, paired by `callId`, with `outcome`, `denialClass`, `durationMs` | Working memory entries are append-only; an update would need a delete. |
+| Action salience 1.0 | 0.4 | Below the default threshold: the entries are an audit trail and must not enter the prompt or push other entries out of a capped cycle. At most 25 tool calls per cycle are written. |
+| `onto:setup#Environment cog:flag...` | `<urn:<agent>:setup:cognitive> cogt:flag...` | The subject and namespace the config reader uses (doc 09 §7). |
+| `EpisodicMemory.record`, `walkChain` (doc 05) | `append`, `chainFrom` | Already in use by every caller; `findByGoal` exists with the doc's name. |
+| Impasses of every phase become `impasse-flagged` episodes | Only impasses raised inside a cycle do; the weekly scan's chronic impasses do not | The scan has no cycle or turn goal to attach; to be revisited if the scan's findings should be recalled. |
 
 Continue with [`10-worked-example.md`](10-worked-example.md).

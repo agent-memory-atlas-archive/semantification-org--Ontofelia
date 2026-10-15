@@ -308,6 +308,14 @@ The exact projection rules:
 
 ### 5.2 Action-buffer schema
 
+> **Implemented (behind `flagCycleManager`):** one `action-proposal` and, once
+> the call finished, one `action-result` per **tool call** (a plain text reply
+> is not written as a proposal). Neither entry holds an argument value: the
+> proposal carries the tool name, the argument keys and the paths of the
+> arguments the redaction rules masked; the result carries `ok`/`error`, the
+> denial class and the duration. Differences from the schema below are listed
+> in doc 09 §12.
+
 ```turtle
 cog:wm_action_001 a cogt:WorkingMemoryEntry ;
     cogt:writtenTo  cogt:actionBuffer ;
@@ -452,13 +460,18 @@ architecture becomes the bottleneck instead of the LLM.
 
 ## 10. SPARQL: walk the cycle
 
-A complete behavioural trace of one cycle, queryable:
+A complete behavioural trace of one cycle, queryable. The identifiers are
+examples in the shape the runtime writes (`urn:<agent>:cog:cycle:cyc-<id>`).
+Both queries run against the data of a cycle written with the current phase
+predicates; a cycle stored before that (see §1 and doc 09 §12) has `ordinal`
+instead of `phaseIndex` and no `phaseStatus`, so the first query returns no
+rows for it (the inspector reads both shapes).
 
 ```sparql
 PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?phase ?idx ?started ?ended ?status WHERE {
   GRAPH <urn:ontofelia:cog:cycles:sess_2026-05-31_18-04> {
-    cog:cycle_2026-05-31T18-04-32Z_001 cogt:hasPhase ?phase .
+    <urn:ontofelia:cog:cycle:cyc-0001> cogt:hasPhase ?phase .
     ?phase cogt:phaseIndex ?idx ;
            cogt:startedAt  ?started ;
            cogt:endedAt    ?ended  ;
@@ -474,19 +487,33 @@ it, back to the WM entry, back to the episode, back to the message:
 PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?phase ?action ?episode ?messageText WHERE {
   GRAPH <urn:ontofelia:cog:goals:sess_2026-05-31_18-04> {
-    ?goal a cogt:Goal ; cogt:status "resolved" .
+    ?goal a cogt:Goal ; cogt:goalStatus "resolved" .
   }
-  GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cycle_2026-05-31T18-04-32Z_001> {
-    ?actionEntry cogt:writtenTo cogt:actionBuffer ;
+  GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cyc-0001> {
+    ?actionEntry cogt:writtenTo "actionBuffer" ;
                  cogt:forGoal   ?goal ;
                  cogt:writtenBy ?phase ;
                  cogt:payload   ?action .
   }
+  GRAPH <urn:ontofelia:cog:cycles:sess_2026-05-31_18-04> {
+    ?cycle cogt:hasPhase ?phase ;
+           cogt:cycleId  ?cycleId .
+  }
   GRAPH <urn:ontofelia:cog:episodic> {
-    ?episode cogt:triggers ?phase ;       # inverse of cogt:triggeredBy
-             cogt:rawText  ?messageText .
+    ?episode cogt:cycleId ?cycleId ;
+             cogt:episodeType "message-received" ;
+             cogt:payload  ?messageText .
   }
 }
 ```
+
+What was corrected against the first draft of these queries (the draft did not
+run against the stored data): the cycle and graph identifiers are written out
+as IRIs (the draft used a `cog:` prefix it never declared); the goal status
+predicate is `cogt:goalStatus`; the buffer is the plain literal `"actionBuffer"`
+(not an IRI); the episode joins the cycle through `cogt:cycleId` (the draft's
+`cogt:triggers` does not exist) and its text is `cogt:payload` (not
+`cogt:rawText`). The cycle resource carries `cogt:cycleId` for that join. Each
+correction is listed as a decision in doc 09 §12.
 
 Continue with [`04-working-memory.md`](04-working-memory.md).
