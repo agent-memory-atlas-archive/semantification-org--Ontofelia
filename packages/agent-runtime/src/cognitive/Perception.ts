@@ -12,7 +12,7 @@
  *
  *   message text   1.0
  *   sender         0.9, +0.1 when the sender is the owner
- *   NER result     0.7 per resolved entity, at most {@link MAX_NER_ENTRIES}
+ *   NER result     0.7 per resolved entity node, at most {@link MAX_NER_ENTRIES}
  *   parsed claim   0.6 (the "+0.1 if it contradicts a stored fact" modifier is
  *                  not applied: contradiction is only known after the store
  *                  lookup that belongs to Comprehension)
@@ -48,10 +48,18 @@ export const SALIENCE = {
   channel: 0.6,
 } as const;
 
-/** What the runtime already knows about the turn when perception runs. */
+/**
+ * What the runtime already knows about the turn when perception runs.
+ *
+ * Entity IRIs are never guessed from a name. A mentioned entity gets its IRI
+ * from (1) a fact stored in this turn, whose subject/object IRI is the one the
+ * store actually used, or (2) a read-only lookup of the existing node that the
+ * queued persist performs ({@link resolvePerception}). Until then the entity is
+ * pending and appears neither in `about` nor in a ner-result entry.
+ */
 export interface PerceptionSource {
-  /** Entities found in the message; only `known` ones with a `uri` count as resolved. */
-  entities: Array<{ name: string; source: 'known' | 'ner'; uri?: string }>;
+  /** Entities found in the message; only `known` matches are candidates. */
+  entities: Array<{ name: string; source: 'known' | 'ner' }>;
   /** The semantic parser's result, when a parser ran. */
   parseResult?: {
     facts: Array<{ kind: string; subject: string; predicate: string; object: string }>;
@@ -59,7 +67,15 @@ export interface PerceptionSource {
     meta?: { skipped?: boolean };
   };
   /** Stored facts of this message with the claim IRI minted for each. */
-  storedClaims: Array<{ subject: string; predicate: string; object: string; claimUri: string }>;
+  storedClaims: Array<{
+    subject: string;
+    predicate: string;
+    object: string;
+    claimUri: string;
+    /** IRI the store used for the subject / for an entity object (absent for a literal). */
+    subjectUri?: string;
+    objectUri?: string;
+  }>;
   /**
    * Zero-based line index of the user entry in the session's JSONL transcript:
    * the session store's message count when the turn began (every append adds
@@ -80,8 +96,15 @@ export interface Perception {
   intent: IntentLabel;
   /** Perception-buffer entries in write order. */
   entries: WMEntryInput[];
+  /** Known mentioned entities with the node IRIs resolved so far (possibly none yet). */
+  entities: Array<{ name: string; iris: string[] }>;
+  /** Names of known entities still to resolve (done in the queued persist). */
+  pending: string[];
   /** Resolved entity IRIs (episode `about`), sorted and de-duplicated. */
   about: string[];
+  /** Position and count of the ner-result entries inside `entries`. */
+  nerAt: number;
+  nerCount: number;
   /** Episode `tags`: the intent label. */
   tags: string[];
   /** Claim IRIs stored from this message (episode `hasClaim`). */
@@ -247,25 +270,63 @@ function byCodePoint(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function nerEntries(entities: Perception['entities']): WMEntryInput[] {
+  const out: WMEntryInput[] = [];
+  for (const e of entities) {
+    for (const iri of e.iris) {
+      if (out.length >= MAX_NER_ENTRIES) return out;
+      out.push({
+        buffer: 'perceptionBuffer',
+        entryKind: 'ner-result',
+        payload: `entity=${e.name} (resolved)`,
+        salience: SALIENCE.ner,
+        refersTo: iri,
+      });
+    }
+  }
+  return out;
+}
+
+function aboutOf(entities: Perception['entities']): string[] {
+  return [...new Set(entities.flatMap((e) => e.iris))].sort(byCodePoint);
+}
+
 /**
  * Build the perception record for a turn. Deterministic: the same input gives
- * the same entries in the same order (entities are ordered by name, then by IRI,
- * so the matcher's result order does not matter).
+ * the same entries in the same order (entities are ordered by name, so the
+ * matcher's result order does not matter). Entities that no fact stored this
+ * turn names stay pending; see {@link resolvePerception}.
  */
 export function buildPerception(input: PerceptionInput, source?: PerceptionSource): Perception {
-  const resolved = (source?.entities ?? [])
-    .filter((e) => e.source === 'known' && typeof e.uri === 'string' && isSafeIri(e.uri))
-    .map((e) => ({ name: e.name, uri: e.uri as string }))
-    .sort((a, b) => byCodePoint(a.name, b.name) || byCodePoint(a.uri, b.uri));
-  // One entry per distinct IRI.
-  const seen = new Set<string>();
-  const entities = resolved.filter((e) => (seen.has(e.uri) ? false : (seen.add(e.uri), true)));
+  // Known mentions, one per name (case-insensitive), ordered by name.
+  const seenNames = new Set<string>();
+  const names = (source?.entities ?? [])
+    .filter((e) => e.source === 'known')
+    .map((e) => e.name)
+    .sort(byCodePoint)
+    .filter((n) => (seenNames.has(n.toLowerCase()) ? false : (seenNames.add(n.toLowerCase()), true)));
+  // IRIs the store used for the subjects/objects of the facts stored this turn.
+  const stored = new Map<string, Set<string>>();
+  const note = (name: string, iri?: string) => {
+    if (!iri || !isSafeIri(iri)) return;
+    const k = name.toLowerCase();
+    if (!stored.has(k)) stored.set(k, new Set());
+    stored.get(k)!.add(iri);
+  };
+  for (const c of source?.storedClaims ?? []) {
+    note(c.subject, c.subjectUri);
+    note(c.object, c.objectUri);
+  }
+  const entities = names.map((name) => ({
+    name,
+    iris: [...(stored.get(name.toLowerCase()) ?? [])].sort(byCodePoint),
+  }));
 
   const parse = source?.parseResult;
   const facts = parse && !parse.meta?.skipped ? parse.facts.filter((f) => f.kind === 'fact') : [];
   const intent = classifyIntent(input.text, {
     questionIntent: !!parse && !parse.meta?.skipped && !!parse.questionIntent,
-    resolvedEntities: entities.length,
+    resolvedEntities: names.length,
   });
 
   const entries: WMEntryInput[] = [];
@@ -293,15 +354,9 @@ export function buildPerception(input: PerceptionInput, source?: PerceptionSourc
       salience: SALIENCE.channel,
     });
   }
-  for (const e of entities.slice(0, MAX_NER_ENTRIES)) {
-    entries.push({
-      buffer: 'perceptionBuffer',
-      entryKind: 'ner-result',
-      payload: `entity=${e.name} (resolved)`,
-      salience: SALIENCE.ner,
-      refersTo: e.uri,
-    });
-  }
+  const nerAt = entries.length;
+  const ner = nerEntries(entities);
+  entries.push(...ner);
   const claimOf = new Map(
     (source?.storedClaims ?? []).map((c) => [`${c.subject}\u0000${c.predicate}\u0000${c.object}`, c.claimUri]),
   );
@@ -325,9 +380,40 @@ export function buildPerception(input: PerceptionInput, source?: PerceptionSourc
   return {
     intent,
     entries,
-    about: entities.map((e) => e.uri),
+    entities,
+    pending: entities.filter((e) => e.iris.length === 0).map((e) => e.name),
+    about: aboutOf(entities),
+    nerAt,
+    nerCount: ner.length,
     tags: [intent],
     hasClaim: [...new Set((source?.storedClaims ?? []).map((c) => c.claimUri).filter(isSafeIri))],
     ...(source?.transcriptLine !== undefined ? { transcriptLine: source.transcriptLine } : {}),
+  };
+}
+
+/**
+ * Fill in the pending entities from a read-only lookup (`resolved`: lower-cased
+ * name -> existing node IRIs) and return the completed record. Names the lookup
+ * did not find stay unresolved: no `about`, no ner-result entry. The input
+ * record is not modified.
+ */
+export function resolvePerception(p: Perception, resolved: Map<string, string[]>): Perception {
+  const entities = p.entities.map((e) =>
+    e.iris.length > 0
+      ? e
+      : {
+          name: e.name,
+          iris: [...new Set(resolved.get(e.name.toLowerCase()) ?? [])].filter(isSafeIri).sort(byCodePoint),
+        },
+  );
+  const ner = nerEntries(entities);
+  const entries = [...p.entries.slice(0, p.nerAt), ...ner, ...p.entries.slice(p.nerAt + p.nerCount)];
+  return {
+    ...p,
+    entries,
+    entities,
+    pending: entities.filter((e) => e.iris.length === 0).map((e) => e.name),
+    about: aboutOf(entities),
+    nerCount: ner.length,
   };
 }

@@ -165,14 +165,37 @@ export class KnowledgeEngine {
   }
 
   /**
-   * The entity IRI a name maps to (the slug mapping `getFactsAbout` reads by).
-   * Pure string work, no store access; `undefined` for a name that is not a safe IRI.
+   * Read-only: the existing nodes a mentioned name denotes for this agent/user.
+   * Every entity whose `rdfs:label` equals `name` (case-insensitive) in the
+   * graphs the sender may read (worldview + the sender's own user graph, never
+   * another user's) is returned, sorted, at most 10. It reports what exists and
+   * creates nothing; a name with no label match yields an empty list, never a
+   * guessed slug IRI. A name shared by several nodes (e.g. a person and a place)
+   * yields all of them: the mention alone does not say which was meant.
    */
-  entityUriFor(name: string): string | undefined {
+  async lookupExistingEntityUris(
+    name: string,
+    scope: { agentId: string; userId?: string },
+  ): Promise<string[]> {
+    const needle = this.escapeLiteral(name.trim().toLowerCase());
+    if (!needle) return [];
     try {
-      return this.toEntityUri(name);
+      const res = await this.triplestore.query(`
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT DISTINCT ?e WHERE {
+          ${this.graphValuesClause(this.knowledgeGraphsFor(scope.agentId, scope.userId), '?g')}
+          GRAPH ?g { ?e rdfs:label ?l }
+          FILTER(isIRI(?e) && LCASE(STR(?l)) = "${needle}")
+        } LIMIT 50
+      `);
+      if (res.type !== 'bindings' || !res.bindings) return [];
+      return res.bindings
+        .map((b: Record<string, { value: string }>) => b['e']?.value)
+        .filter((u): u is string => !!u)
+        .sort()
+        .slice(0, 10);
     } catch {
-      return undefined;
+      return [];
     }
   }
 

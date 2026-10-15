@@ -11,7 +11,7 @@ import { ToolRegistry, AuditLog } from '@ontofelia/tools';
 import { ToolPolicyEngine } from '@ontofelia/security';
 import { SkillRegistry, SkillExecutor } from '@ontofelia/skills';
 import { PluginRegistry } from '@ontofelia/plugins';
-import { OxigraphAdapter, KnowledgeEngine, GraphRegistry } from '@ontofelia/semantic-memory';
+import { OxigraphAdapter, KnowledgeEngine, GraphRegistry, GraphUriResolver } from '@ontofelia/semantic-memory';
 import * as os from 'os';
 import * as path from 'path';
 import { promises as fs } from 'fs';
@@ -49,13 +49,13 @@ interface Probe {
 /** Answers the semantic parser (no tools) with scripted JSON and the answer call with fixed text. */
 class MockProvider implements ProviderAdapter {
   name = 'stub';
-  constructor(private readonly probe: Probe, private readonly delayMs = 0) {}
+  constructor(private readonly probe: Probe, private readonly delayMs = 0, private readonly parsed = PARSED) {}
   async initialize() {}
   async healthCheck() { return { healthy: true, component: 'stub', checkedAt: new Date().toISOString() }; }
   private async pause() { if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs)); }
   async chat(r: ChatRequest): Promise<ChatResponse> {
     await this.pause();
-    if (!r.tools) return { id: 'p', content: PARSED, finishReason: 'stop', toolCalls: [], usage: USAGE };
+    if (!r.tools) return { id: 'p', content: this.parsed, finishReason: 'stop', toolCalls: [], usage: USAGE };
     this.probe.answerCalls.push({ writesBefore: this.probe.writes(), stream: false });
     return { id: 'a', content: ANSWER, finishReason: 'stop', toolCalls: [], usage: USAGE };
   }
@@ -90,7 +90,7 @@ describe('Phase 1 perceives before answering', () => {
   const made: Env[] = [];
 
   /** A fresh store seeded with a known entity "Anna", and a runtime over it. */
-  async function setup(opts: { cycle: boolean; delayMs?: number }): Promise<Env> {
+  async function setup(opts: { cycle: boolean; delayMs?: number; parsed?: string; seed?: (ke: KnowledgeEngine, store: TriplestoreAdapter) => Promise<void> }): Promise<Env> {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'perception-store-'));
     const sessDir = await fs.mkdtemp(path.join(os.tmpdir(), 'perception-sess-'));
     const raw = new OxigraphAdapter();
@@ -114,6 +114,7 @@ describe('Phase 1 perceives before answering', () => {
       { subject: 'Anna', subjectType: 'Person', predicate: 'livesIn', object: 'Berlin', objectType: 'Place', confidenceLabel: 'high', status: 'accepted' } as never,
       { agentId: AGENT, sessionId: 'seed', isOwner: true, userId: 'owner' } as never,
     );
+    await opts.seed?.(ke, store);
     const cfg = new CognitiveConfig(store, AGENT);
     if (opts.cycle) {
       await cfg.setCycleManagerEnabled(true);
@@ -123,7 +124,7 @@ describe('Phase 1 perceives before answering', () => {
     const sessions = new SessionStore(sessDir);
     const toolRegistry = new ToolRegistry();
     const runtime = new AgentRuntime(
-      AGENT, config, new MockProvider(probe, opts.delayMs ?? 0), sessions,
+      AGENT, config, new MockProvider(probe, opts.delayMs ?? 0, opts.parsed), sessions,
       toolRegistry, new ToolPolicyEngine({ allow: [], deny: [] }),
       new AuditLog(`/tmp/perception-ws-${Math.random().toString(36).slice(2)}`), new SkillRegistry(),
       new SkillExecutor(new SkillRegistry()), new PluginRegistry(), undefined, ke, undefined,
@@ -320,5 +321,114 @@ describe('Phase 1 perceives before answering', () => {
     // The earlier predicates are still there.
     const legacy = await rows(e.store, `SELECT ?p WHERE { GRAPH ?g { ?p <${COGT}partOfCycle> ?c } }`);
     expect(legacy).toHaveLength(6);
+  });
+
+  // ── entity resolution: the real node, never a slug guess ──────────────────
+
+  const NO_FACTS = JSON.stringify({ facts: [], proposals: [], confidence: 'high' });
+  const objFact = (object: string, objectType: string) =>
+    ({ subject: 'Tom', subjectType: 'Person', predicate: objectType === 'Place' ? 'visited' : 'knows', object, objectType, confidenceLabel: 'high', status: 'accepted' }) as never;
+  const ctxOf = (userId: string) => ({ agentId: AGENT, sessionId: 'seed', isOwner: userId === 'owner', userId }) as never;
+  const labelNodes = async (e: Env, label: string) =>
+    (await rows(e.store, `SELECT DISTINCT ?n WHERE { GRAPH ?g { ?n <http://www.w3.org/2000/01/rdf-schema#label> ?l } FILTER(LCASE(STR(?l)) = "${label.toLowerCase()}") }`))
+      .map((r) => r.n.value).sort();
+  const nerRefs = async (e: Env) =>
+    (await wmEntries(e)).filter((x) => x.kind === 'ner-result').map((x) => x.refers).sort();
+  const ASK = 'Tell me what is new with this one today';
+
+  it('a disambiguated entity (same label, two types): about holds the real node IRIs, not the slug guess', async () => {
+    const e = await setup({
+      cycle: true, parsed: NO_FACTS,
+      seed: async (ke) => {
+        // Objects are resolved by label and type, so the second Paris gets a minted node.
+        await ke.storeFact(objFact('Paris', 'Person'), ctxOf('owner'));
+        await ke.storeFact(objFact('Paris', 'Place'), ctxOf('owner'));
+      },
+    });
+    await send(e, `${ASK} Paris`);
+    const nodes = await labelNodes(e, 'Paris');
+    expect(nodes).toHaveLength(2);
+    expect(nodes.some((n) => !n.endsWith('/Paris') && !n.endsWith(':Paris'))).toBe(true); // one is a minted, non-slug node
+    const [ep] = await inboundEpisodes(e);
+    expect(ep.abouts).toEqual(nodes);
+    expect(await nerRefs(e)).toEqual(nodes);
+    const resp = await rows(e.store, `SELECT ?a WHERE { GRAPH ?g { ?ep <${COGT}episodeType> "response-sent" ; <${COGT}about> ?a } }`);
+    expect(resp.map((r) => r.a.value).sort()).toEqual(nodes);
+  });
+
+  it('a label-matched entity whose URI differs from the slug: about holds that node and the inbound episode is only added to', async () => {
+    const custom = 'urn:ontofelia:entity:custom-zoe-7';
+    const e = await setup({
+      cycle: true, parsed: NO_FACTS,
+      seed: async (_ke, store) => {
+        await store.update(`INSERT DATA { GRAPH <${GraphUriResolver.getWorldviewGraph(AGENT)}> {
+          <${custom}> a <urn:shared:ontology#Person> ; <http://www.w3.org/2000/01/rdf-schema#label> "Zoe" . } }`);
+      },
+    });
+    await send(e, `${ASK} Zoe`);
+    const [ep] = await inboundEpisodes(e);
+    expect(ep.abouts).toEqual([custom]);
+    expect(await nerRefs(e)).toEqual([custom]);
+    expect(JSON.stringify(e.updates)).not.toContain('entity:Zoe>'); // no slug guess stored anywhere
+    // The episode was written once, before the tool loop, and extended in the persist.
+    const eps = await rows(e.store, `SELECT ?ep WHERE { GRAPH ?g { ?ep <${COGT}episodeType> "message-received" } }`);
+    expect(eps).toHaveLength(1);
+    const writes = e.updates.filter((q) => q.includes('"message-received"'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).not.toContain(`${COGT}about`);
+    expect(e.updates.some((q) => q.startsWith('INSERT DATA') && q.includes(`${COGT}about> <${custom}>`) && !q.includes('"message-received"'))).toBe(true);
+    // The write before the answer call is still just the inbound episode.
+    expect(e.probe.answerCalls[0].writesBefore).toBeGreaterThan(0);
+    expect(e.updates.slice(0, e.probe.answerCalls[0].writesBefore).some((q) => q.includes(`${COGT}about> <${custom}>`))).toBe(false);
+  });
+
+  it('a name no node carries produces no about and no ner-result', async () => {
+    const e = await setup({ cycle: true, parsed: NO_FACTS });
+    await send(e, `${ASK} Quentin`);
+    const [ep] = await inboundEpisodes(e);
+    expect(ep.abouts).toEqual([]);
+    expect(await nerRefs(e)).toEqual([]);
+  });
+
+  it('user scoping: another user\'s private entity is not resolved into this user\'s episode', async () => {
+    const e = await setup({
+      cycle: true, parsed: NO_FACTS,
+      seed: async (ke) => {
+        await ke.storeFact(
+          { subject: 'Bruno', subjectType: 'Person', predicate: 'knows', object: 'Berlin', objectType: 'Place', confidenceLabel: 'high', status: 'accepted' } as never,
+          ctxOf('bob'),
+        );
+      },
+    });
+    const ke = new KnowledgeEngine(e.store, undefined, GraphRegistry.create([AGENT]));
+    // Positive control: bob's own scope finds the node; the owner's scope does not.
+    expect((await ke.lookupExistingEntityUris('Bruno', { agentId: AGENT, userId: 'bob' })).length).toBeGreaterThan(0);
+    expect(await ke.lookupExistingEntityUris('Bruno', { agentId: AGENT, userId: 'owner' })).toEqual([]);
+    await send(e, `${ASK} Bruno`);
+    const [ep] = await inboundEpisodes(e);
+    expect(ep.abouts).toEqual([]);
+    expect(await nerRefs(e)).toEqual([]);
+  });
+
+  it('an entity named by a fact stored this turn gets the IRI storeFact used (minted, disambiguated node)', async () => {
+    const parsed = JSON.stringify({
+      facts: [{ subject: 'Tom', subjectType: 'Person', predicate: 'visited', object: 'Paris', objectType: 'Place', confidence: 'high', sourceSpan: 'Tom visited Paris', kind: 'fact' }],
+      proposals: [], confidence: 'high',
+    });
+    const e = await setup({
+      cycle: true, parsed,
+      seed: async (ke) => { await ke.storeFact(objFact('Paris', 'Person'), ctxOf('owner')); },
+    });
+    await send(e, 'Tom visited Paris last week');
+    const nodes = await labelNodes(e, 'Paris');
+    expect(nodes).toHaveLength(2);
+    const [ep] = await inboundEpisodes(e);
+    // Tom is a pinned subject node; Paris is the minted node, not the older person node.
+    const minted = nodes.find((n) => /Paris_/.test(n))!;
+    expect(minted).toBeDefined();
+    expect(ep.abouts).toContain(minted);
+    expect(ep.abouts).not.toContain(nodes.find((n) => !/Paris_/.test(n))!);
+    // Written with the inbound episode itself, before the tool loop.
+    expect(e.updates.filter((q) => q.includes('"message-received"'))[0]).toContain(`${COGT}about> <${minted}>`);
   });
 });

@@ -318,6 +318,17 @@ export class EpisodicMemory {
   }
 
   /**
+   * Add `cogt:about` links to an existing episode. Append-only: nothing already
+   * stored is changed or removed, and an IRI the episode already has is simply
+   * stated again (a set of triples, so no duplicate arises).
+   */
+  async addAbout(episodeUri: EpisodeId, about: string[]): Promise<void> {
+    if (about.length === 0) return;
+    const lines = about.map((a) => `<${episodeUri}> <${COGT}about> ${sparqlIri(a)} .`);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${this.graphUri()}> {\n${lines.join('\n')}\n} }`);
+  }
+
+  /**
    * The size of a session's episode chain and its newest episode, from a query
    * that selects only the two columns needed (no payloads, no `about`/`tags`).
    * "Newest" follows {@link findInSession}: the greatest `episodeId`.

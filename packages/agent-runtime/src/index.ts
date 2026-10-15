@@ -810,6 +810,11 @@ If a greeting or onboarding template is written in another language, translate a
                       predicate: sf.fact.predicate,
                       object: sf.fact.object,
                       claimUri: sf.result.claimUri,
+                      // The nodes storeFact actually used, not a guess from the name.
+                      subjectUri: sf.result.subjectUri,
+                      ...(sf.fact.objectType && sf.fact.objectType !== 'literal'
+                        ? { objectUri: sf.result.objectUri }
+                        : {}),
                     });
                   }
                 }
@@ -1122,6 +1127,24 @@ Users can use these commands:
     return approved;
   }
 
+  /**
+   * Read-only entity lookup for the cycle's queued persist: the existing nodes
+   * a mentioned name denotes, visible to this sender only (worldview and the
+   * sender's own graph). Undefined without a knowledge engine.
+   */
+  private entityResolverFor(
+    envelope: MessageEnvelope,
+  ): ((names: string[]) => Promise<Map<string, string[]>>) | undefined {
+    const ke = this.knowledgeEngine;
+    if (!ke) return undefined;
+    const scope = { agentId: this.agentId, userId: envelope.sender.id };
+    return async (names) => {
+      const out = new Map<string, string[]>();
+      for (const name of names) out.set(name.toLowerCase(), await ke.lookupExistingEntityUris(name, scope));
+      return out;
+    };
+  }
+
   async handleMessage(envelope: MessageEnvelope): Promise<AgentResponse> {
     this.activeRuns++;
     this.totalRuns++;
@@ -1193,6 +1216,7 @@ Users can use these commands:
           (r) => r.text,
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
+            resolveEntities: this.entityResolverFor(envelope),
             // Surface the cognitive phases on the live debug stream so the
             // status UI can show them explicitly alongside tool usage.
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
@@ -2061,6 +2085,7 @@ Users can use these commands:
                 : undefined,
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
+            resolveEntities: this.entityResolverFor(envelope),
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
           },
         );

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildPerception,
   classifyIntent,
+  resolvePerception,
   MAX_NER_ENTRIES,
   type IntentLabel,
   type PerceptionSource,
@@ -69,16 +70,15 @@ describe('classifyIntent', () => {
 });
 
 describe('buildPerception', () => {
-  const entity = (name: string) => ({
-    name,
-    source: 'known' as const,
-    uri: `urn:shared:entity:${encodeURIComponent(name)}`,
-  });
-  const source = (entities: PerceptionSource['entities']): PerceptionSource => ({
-    entities,
-    storedClaims: [
-      { subject: 'Anna', predicate: 'worksAt', object: 'Acme', claimUri: 'urn:ontofelia:claim:c1' },
-    ],
+  const known = (name: string) => ({ name, source: 'known' as const });
+  const iri = (name: string) => `urn:ontofelia:entity:${encodeURIComponent(name)}`;
+  const claim = {
+    subject: 'Anna', predicate: 'worksAt', object: 'Acme', claimUri: 'urn:ontofelia:claim:c1',
+    subjectUri: 'urn:ontofelia:entity:Anna_Person', objectUri: 'urn:ontofelia:entity:Acme',
+  };
+  const source = (names: string[], withClaim = true): PerceptionSource => ({
+    entities: names.map(known),
+    storedClaims: withClaim ? [claim] : [],
     parseResult: {
       facts: [
         { kind: 'fact', subject: 'Anna', predicate: 'worksAt', object: 'Acme' },
@@ -90,7 +90,7 @@ describe('buildPerception', () => {
   const input = { text: 'Anna works at Acme', senderId: 'u1', senderIsOwner: false, channel: 'webchat' };
 
   it('writes the doc 04 salience values and the owner bonus', () => {
-    const p = buildPerception(input, source([entity('Anna')]));
+    const p = buildPerception(input, source(['Anna']));
     const sal = (kind: string) => p.entries.filter((e) => e.entryKind === kind).map((e) => e.salience);
     expect(sal('message-text')).toEqual([1.0]);
     expect(sal('sender-id')).toEqual([0.9]);
@@ -101,25 +101,60 @@ describe('buildPerception', () => {
     expect(owner.entries.find((e) => e.entryKind === 'sender-id')?.salience).toBe(1.0);
   });
 
-  it('one ner-result per resolved entity only, at most five, ordered by name regardless of input order', () => {
+  it('takes the IRI of an entity named by a stored fact from the store result, never from the name', () => {
+    const p = buildPerception(input, source(['Anna', 'Acme']));
+    expect(p.about).toEqual(['urn:ontofelia:entity:Acme', 'urn:ontofelia:entity:Anna_Person']);
+    expect(p.pending).toEqual([]);
+    expect(p.entries.filter((e) => e.entryKind === 'ner-result').map((e) => e.refersTo)).toEqual([
+      'urn:ontofelia:entity:Acme', 'urn:ontofelia:entity:Anna_Person',
+    ]);
+  });
+
+  it('keeps other known entities pending: no about and no ner-result before resolution (no slug guess)', () => {
+    const p = buildPerception(input, source(['Anna', 'Berlin']));
+    expect(p.pending).toEqual(['Berlin']);
+    expect(p.about).toEqual(['urn:ontofelia:entity:Anna_Person']);
+    expect(JSON.stringify(p)).not.toContain(iri('Berlin'));
+    // Pattern-only matches are never candidates.
+    const none = buildPerception(input, { ...source([], false), entities: [{ name: 'Acme', source: 'ner' }] });
+    expect(none.pending).toEqual([]);
+    expect(none.about).toEqual([]);
+  });
+
+  it('resolvePerception fills pending entities (all nodes of an ambiguous name), leaves unfound ones out, and does not mutate', () => {
+    const p = buildPerception(input, source(['Anna', 'Paris', 'Nowhere']));
+    const before = JSON.stringify(p);
+    const r = resolvePerception(
+      p,
+      new Map([['paris', ['urn:x:Paris_Place', 'urn:x:Paris']]]),
+    );
+    expect(JSON.stringify(p)).toBe(before);
+    expect(r.about).toEqual(['urn:ontofelia:entity:Anna_Person', 'urn:x:Paris', 'urn:x:Paris_Place']);
+    expect(r.pending).toEqual(['Nowhere']);
+    const ner = r.entries.filter((e) => e.entryKind === 'ner-result');
+    expect(ner.map((e) => e.refersTo)).toEqual([
+      'urn:ontofelia:entity:Anna_Person', 'urn:x:Paris', 'urn:x:Paris_Place',
+    ]);
+    // Entry order is preserved around the ner block: intent stays last.
+    expect(r.entries[r.entries.length - 1].entryKind).toBe('intent');
+  });
+
+  it('orders entities by name regardless of input order and caps ner-result entries at five', () => {
     const names = ['Zeta', 'Alpha', 'Gamma', 'Beta', 'Delta', 'Epsilon', 'Eta'];
-    const a = buildPerception(input, source(names.map(entity)));
-    const b = buildPerception(input, source([...names].reverse().map(entity)));
+    const map = new Map(names.map((n) => [n.toLowerCase(), [iri(n)]]));
+    const a = resolvePerception(buildPerception(input, source(names, false)), map);
+    const b = resolvePerception(buildPerception(input, source([...names].reverse(), false)), map);
     const ner = a.entries.filter((e) => e.entryKind === 'ner-result');
     expect(ner).toHaveLength(MAX_NER_ENTRIES);
     expect(ner.map((e) => e.payload)).toEqual(
       ['Alpha', 'Beta', 'Delta', 'Epsilon', 'Eta'].map((n) => `entity=${n} (resolved)`),
     );
     expect(b).toEqual(a);
-    // Pattern-only matches and matches without an IRI are not resolved.
-    const none = buildPerception(input, source([{ name: 'Acme', source: 'ner' }, { name: 'X', source: 'known' }]));
-    expect(none.entries.some((e) => e.entryKind === 'ner-result')).toBe(false);
-    expect(none.about).toEqual([]);
+    expect(a.about).toHaveLength(7);
   });
 
-  it('exposes about, tags, hasClaim and the transcript line for the episode; questions are not claims', () => {
-    const p = buildPerception(input, source([entity('Anna')]));
-    expect(p.about).toEqual(['urn:shared:entity:Anna']);
+  it('exposes tags, hasClaim and the transcript line for the episode; questions are not claims', () => {
+    const p = buildPerception(input, source(['Anna']));
     expect(p.tags).toEqual([p.intent]);
     expect(p.hasClaim).toEqual(['urn:ontofelia:claim:c1']);
     expect(p.transcriptLine).toBe(4);
@@ -129,8 +164,11 @@ describe('buildPerception', () => {
   });
 
   it('drops an IRI that cannot be written safely into SPARQL', () => {
-    const p = buildPerception(input, source([{ name: 'Bad', source: 'known', uri: 'urn:x:a>b' }]));
+    const bad = { ...claim, subjectUri: 'urn:x:a>b', objectUri: undefined };
+    const p = buildPerception(input, { ...source(['Anna']), storedClaims: [bad] });
     expect(p.about).toEqual([]);
+    const r = resolvePerception(p, new Map([['anna', ['urn:x:b c']]]));
+    expect(r.about).toEqual([]);
   });
 
   it('works without a source (envelope only)', () => {

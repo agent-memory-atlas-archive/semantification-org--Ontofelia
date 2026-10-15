@@ -3,8 +3,6 @@ import { KnowledgeEngine } from '../KnowledgeEngine.js';
 export interface EntityMatch {
   name: string;
   source: 'known' | 'ner';
-  /** Entity IRI of a `known` match (slug mapping); absent for pattern-only `ner` matches. */
-  uri?: string;
 }
 
 /**
@@ -60,7 +58,7 @@ export class EntityMatcher {
       if (entity.length < 2) continue; // Skip very short labels
       if (text.toLowerCase().includes(entity.toLowerCase())) {
         if (!seen.has(entity.toLowerCase())) {
-          results.push({ name: entity, source: 'known', uri: this.knowledgeEngine.entityUriFor?.(entity) });
+          results.push({ name: entity, source: 'known' });
           seen.add(entity.toLowerCase());
         }
       }

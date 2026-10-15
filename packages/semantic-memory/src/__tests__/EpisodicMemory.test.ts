@@ -68,6 +68,15 @@ describe('EpisodicMemory', () => {
     expect((res.bindings ?? []).map((b) => b.c.value).sort()).toEqual(['urn:claim:a', 'urn:claim:b']);
   });
 
+  it('addAbout appends links without touching the rest of the episode', async () => {
+    const uri = await em.append({ episodeType: 'message-received', sessionId: SESS, payload: 'x', about: ['urn:e:1'] });
+    await em.addAbout(uri, ['urn:e:1', 'urn:e:2']);
+    await em.addAbout(uri, []);
+    const [hit] = await em.findInSession(SESS, 'all');
+    expect([...hit.about].sort()).toEqual(['urn:e:1', 'urn:e:2']);
+    expect(hit.payload).toBe('x');
+  });
+
   it('chains precededBy to the previous episode of the session', async () => {
     const e1 = await em.append({ episodeType: 'message-received', sessionId: SESS, payload: 'one' });
     const e2 = await em.append({ episodeType: 'response-sent', sessionId: SESS, payload: 'two' });

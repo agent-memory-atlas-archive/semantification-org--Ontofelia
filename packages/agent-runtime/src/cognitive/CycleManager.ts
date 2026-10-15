@@ -41,7 +41,7 @@ import {
 import { WorkingMemory } from './WorkingMemory.js';
 import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
 import { looksLikeSecret } from './privacyClass.js';
-import { buildPerception, type Perception, type PerceptionSource } from './Perception.js';
+import { buildPerception, resolvePerception, type Perception, type PerceptionSource } from './Perception.js';
 import {
   Metacognition,
   type ImpasseInput,
@@ -178,6 +178,13 @@ export interface RunCycleOptions {
    * it to read the records straight after the call.
    */
   awaitPersist?: boolean;
+  /**
+   * Read-only lookup of the existing nodes the given mentioned entity names
+   * denote for this turn's sender (lower-cased name -> node IRIs). Called only
+   * from the queued persist, never on the reply path; a failure is reported to
+   * `onError` and leaves the names unresolved.
+   */
+  resolveEntities?: (names: string[]) => Promise<Map<string, string[]>>;
   /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
@@ -536,6 +543,8 @@ export class CycleManager {
     // only) so tools can reference it as a goal mandate. persist() reuses it
     // instead of writing a second one.
     let inboundEpisodeUri: string | undefined;
+    // The `about` the inbound episode was written with (before resolution).
+    let inboundAbout: string[] = [];
     const recordInbound: InboundEpisodeRecorder = async (sessionId) => {
       if (mode !== 'conversational') return undefined;
       if (options.episodicEnabled === false) return undefined;
@@ -549,6 +558,7 @@ export class CycleManager {
           activeGoalUri,
           perception,
         );
+        inboundAbout = perception?.about ?? [];
       } catch (e) {
         this.onError?.(e);
       }
@@ -591,6 +601,8 @@ export class CycleManager {
           options.episodicEnabled !== false,
           perception,
           { ...marks, coreEnd: endedAt },
+          options.resolveEntities,
+          inboundAbout,
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
@@ -800,12 +812,14 @@ export class CycleManager {
     episodicEnabled = true,
     perception?: Perception,
     marks: PhaseMarks = { cycleStart: startedAt, coreEnd: endedAt },
+    resolveEntities?: RunCycleOptions['resolveEntities'],
+    inboundAbout: string[] = [],
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     // Conversational turns write the perception record (computed before the LLM
     // call); a turn whose core never reached the hook (the context build threw)
     // gets the envelope-only record. Initiative turns keep the earlier write.
-    const record =
+    let record =
       mode === 'initiative'
         ? undefined
         : (perception ??
@@ -815,6 +829,27 @@ export class CycleManager {
             senderIsOwner: envelope.sender?.isOwner === true,
             channel: envelope.channel ? String(envelope.channel) : undefined,
           }));
+    // Entities no stored fact named are resolved here, off the reply path, with
+    // a read-only lookup. The result feeds the ner-result entries, the response
+    // episode and (append-only) the inbound episode written before the tool loop.
+    if (record && record.pending.length > 0 && resolveEntities) {
+      try {
+        const found = await resolveEntities(record.pending);
+        record = resolvePerception(record, found);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
+    if (record && episodicEnabled && inboundEpisodeUri) {
+      const late = record.about.filter((a) => !inboundAbout.includes(a));
+      if (late.length > 0) {
+        try {
+          await new EpisodicMemory(this.triplestore, this.agentId).addAbout(inboundEpisodeUri, late);
+        } catch (e) {
+          this.onError?.(e);
+        }
+      }
+    }
     await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record);
     const { retrievalHits } = episodicEnabled
       ? await this.writeEpisodicAndRetrieval(
