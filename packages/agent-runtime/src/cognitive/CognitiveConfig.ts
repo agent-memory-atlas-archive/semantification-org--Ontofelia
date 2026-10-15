@@ -15,6 +15,7 @@ import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
 import { DEFAULT_CAPACITY, DEFAULT_THETA } from './WorkingMemory.js';
 import { DEFAULT_RECALLED_TOKEN_CAP, DEFAULT_TOTAL_TOKEN_CAP } from './PromptAssembler.js';
+import { defaultArgRedactionRules, parseArgRedactionRules, type ArgRedactionRules } from './ArgRedaction.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 
@@ -268,6 +269,25 @@ export class CognitiveConfig {
       return await this.isFlagEnabled('unknownNudgeAllUsers');
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Argument-redaction rules of the procedural traces: the built-in rules plus
+   * the JSON literal `cog:argRedactionRules` on the config subject, when set
+   * (see ArgRedaction.ts). A missing, broken or unreadable value gives the
+   * built-in rules; configured rules can only add to them.
+   */
+  async argRedactionRules(): Promise<ArgRedactionRules> {
+    try {
+      const graph = GraphUriResolver.getSetupGraph(this.agentId);
+      const res = await this.triplestore.query(`
+        SELECT ?v WHERE {
+          GRAPH <${graph}> { <${configSubject(this.agentId)}> <${COGT}argRedactionRules> ?v }
+        } LIMIT 1`);
+      return parseArgRedactionRules(res.bindings?.[0]?.v?.value);
+    } catch {
+      return defaultArgRedactionRules();
     }
   }
 

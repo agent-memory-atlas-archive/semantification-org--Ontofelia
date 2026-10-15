@@ -38,6 +38,8 @@ export interface CleanupReport {
   cyclesDropped: number;
   /** Candidate graphs kept because no timestamp could be read. */
   undated: number;
+  /** Present only when procedural memory is on: the 90-day trace sweep. */
+  procedural?: { tracesDropped: number; summariesDropped: number };
 }
 
 export class CogCleanup {

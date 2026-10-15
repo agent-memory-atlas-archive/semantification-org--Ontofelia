@@ -1331,11 +1331,25 @@ Users can use these commands:
       undated: 0,
     };
     if (!this.knowledgeEngine) return empty;
-    const report = await new CogCleanup(
+    const report: CleanupReport = await new CogCleanup(
       this.knowledgeEngine['triplestore'],
       this.knowledgeEngine.registry,
       this.agentId,
     ).run(now);
+    // Procedural traces older than 90 days go too, with procedural memory on
+    // only; with it off nothing is read or deleted here.
+    if (this.cognitiveConfig && (await this.cognitiveConfig.isProceduralMemoryEnabled())) {
+      const t = await new ProceduralMemory(
+        this.knowledgeEngine['triplestore'],
+        this.agentId,
+        this.knowledgeEngine.registry,
+      ).purgeOldTraces(now);
+      report.procedural = { tracesDropped: t.tracesDropped, summariesDropped: t.summariesDropped };
+      this.logger.info(
+        { job: 'cog.cleanup', ...t },
+        `cog cleanup: dropped ${t.tracesDropped} procedural trace(s) older than ${t.cutoff}`,
+      );
+    }
     this.logger.info(
       { job: 'cog.cleanup', ...report },
       `cog cleanup: dropped ${report.workingDropped} working and ${report.cyclesDropped} cycle graph(s)`,
@@ -1976,6 +1990,7 @@ Users can use these commands:
             callId: toolCall.id,
             occurredAt: new Date(),
             argsBrief,
+            args: toolArgs,
           });
 
           const approved = await this.ensureToolApproved(toolCall, toolArgs, toolContext);
@@ -2323,6 +2338,7 @@ Users can use these commands:
               callId: toolCall.id,
               occurredAt: new Date(),
               argsBrief: Object.keys(toolArgs).join(', '),
+              args: toolArgs,
             });
             
             const approved = await this.ensureToolApproved(toolCall, toolArgs, toolContext);
@@ -2518,7 +2534,8 @@ Users can use these commands:
       }
       if (sub === 'cleanup') {
         const r = await this.runCogCleanup();
-        return { text: `🧹 Cleanup: dropped ${r.workingDropped}/${r.workingScanned} working graph(s) and ${r.cyclesDropped}/${r.cyclesScanned} cycle graph(s).`, sessionId: session.sessionId };
+        const traces = r.procedural ? ` ${r.procedural.tracesDropped} procedural trace(s) older than 90 days dropped.` : '';
+        return { text: `🧹 Cleanup: dropped ${r.workingDropped}/${r.workingScanned} working graph(s) and ${r.cyclesDropped}/${r.cyclesScanned} cycle graph(s).${traces}`, sessionId: session.sessionId };
       }
       if (sub === 'scan') {
         const r = await this.runMetacognitiveScan();

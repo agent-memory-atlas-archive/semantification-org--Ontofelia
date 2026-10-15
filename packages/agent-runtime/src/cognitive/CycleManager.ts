@@ -38,6 +38,10 @@ import {
   EpisodicMemory,
   sparqlIri,
   ProceduralMemory,
+  FOLLOWUP_SATISFACTION_WEIGHT,
+  FOLLOWUP_MAX_GAP_MS,
+  SUGGESTION_MIN_SUCCESS_RATE,
+  SUGGESTION_MIN_SAMPLES,
   SelfModel,
   DERIVED_LABELS,
   type TraceInput,
@@ -69,6 +73,9 @@ import {
 import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from './GoalLifecycle.js';
 import { writeGoalEpisode } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
+import { classifySatisfaction } from './Satisfaction.js';
+import { redactToolArgs } from './ArgRedaction.js';
+import { CognitiveConfig } from './CognitiveConfig.js';
 import { neutraliseQuoted } from './untrustedText.js';
 import {
   comprehend,
@@ -140,6 +147,12 @@ export interface ToolEpisodeEvent {
   occurredAt: Date;
   /** Redacted, value-free summary of the arguments — never raw secrets. */
   argsBrief?: string;
+  /**
+   * The raw arguments, held in memory for the cycle only so the procedural
+   * trace can hash the masked ones. Never persisted as is (see ArgRedaction.ts)
+   * and dropped at once when procedural memory is off.
+   */
+  args?: Record<string, unknown>;
   outcome?: 'success' | 'error';
   durationMs?: number;
   errorClass?: string;
@@ -665,6 +678,11 @@ export class CycleManager {
     // per-cycle, so concurrent cycles never share state.
     const toolEvents: ToolEpisodeEvent[] = [];
     const recordTool: ToolEpisodeRecorder = (ev) => {
+      if (ev.args !== undefined && options.proceduralEnabled !== true) {
+        const { args: _dropped, ...rest } = ev;
+        toolEvents.push(rest);
+        return;
+      }
       toolEvents.push(ev);
     };
 
@@ -783,6 +801,10 @@ export class CycleManager {
     // Goal / skill / self entries of the in-memory working-memory view.
     const phaseView: WorkspaceEntry[] = [];
     let shadow: ShadowRecord | undefined;
+    // Suggestions the Phase 3 hook produced, and the tools among them that the
+    // final prompt really shows (decided in prepareGoals).
+    let suggestionItems: Array<{ text: string; tools: string[] }> = [];
+    let shownTools: string[] | undefined;
     const prepareGoalsInner: GoalContextProvider = async (sessionId) => {
       if (!options.goalsEnabled) return undefined;
       try {
@@ -830,6 +852,7 @@ export class CycleManager {
           );
           if (skillsText) {
             sections.push(skillsText.text);
+            suggestionItems = skillsText.items.map((it) => ({ text: it.text, tools: it.tools }));
             if (promptMode !== 'off') {
               // Written to working memory by surfaceSkillSuggestions as before.
               for (const it of skillsText.items) {
@@ -867,18 +890,33 @@ export class CycleManager {
         return undefined;
       }
     };
+    // The suggested tools whose line is in the prompt that goes out.
+    const noteShown = (promptText: string | undefined): void => {
+      const tools = new Set<string>();
+      if (promptText) {
+        for (const it of suggestionItems) {
+          if (promptText.includes(`• ${it.text}`)) for (const t of it.tools) tools.add(t);
+        }
+      }
+      shownTools = tools.size > 0 ? [...tools] : undefined;
+    };
     const prepareGoals: GoalContextProvider = async (sessionId) => {
       marks.goalStart = new Date();
+      suggestionItems = [];
+      shownTools = undefined;
       try {
         const legacy = await prepareGoalsInner(sessionId);
-        if (promptMode === 'off') return legacy;
+        if (promptMode === 'off') {
+          noteShown(legacy);
+          return legacy;
+        }
         // The "I don't know" nudge: recorded in shadow for every user; in live
         // mode it reaches the prompt of the owner, or of everyone when the
         // setup key says so (canary).
         const unknown = mcOn && isUnknownQuestion(perception?.intent, comprehension);
         const unknownNudge =
           unknown && (promptMode === 'shadow' || userKey === OWNER_USER_KEY || options.unknownNudgeAllUsers === true);
-        return this.composeCognitivePrompt(promptMode, legacy, {
+        const composed = this.composeCognitivePrompt(promptMode, legacy, {
           perception,
           comprehension,
           phaseView,
@@ -890,6 +928,8 @@ export class CycleManager {
           },
           cycleId,
         });
+        noteShown(composed);
+        return composed;
       } finally {
         marks.goalEnd = new Date();
       }
@@ -977,6 +1017,7 @@ export class CycleManager {
           comprehension,
           {
             wm: queuedWm,
+            ...(shownTools ? { suggestedTools: shownTools } : {}),
             meta: metaEntries,
             ...(mcOn ? { signals, conflictGoals: options.goalsEnabled === true } : {}),
             shadow,
@@ -1383,11 +1424,18 @@ export class CycleManager {
     cycleUri: string,
     goalType: string,
     userKey: string,
-  ): Promise<{ text: string; items: Array<{ kind: string; text: string; score: number }> } | undefined> {
+  ): Promise<{ text: string; items: Array<{ kind: string; text: string; score: number; tools: string[] }> } | undefined> {
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
+    // Only skills that have worked: a success rate of at least 0.7 over at
+    // least 3 recorded calls (a low-success tool is never suggested).
     const [skills, sequences] = await Promise.all([
-      pm.suggestSkills(goalType, SKILL_SUGGESTION_K),
-      pm.suggestSequenceSkills(goalType, SEQUENCE_SUGGESTION_K),
+      pm.suggestSkills(goalType, SKILL_SUGGESTION_K, {
+        minSuccessRate: SUGGESTION_MIN_SUCCESS_RATE,
+        minSamples: SUGGESTION_MIN_SAMPLES,
+      }),
+      pm.suggestSequenceSkills(goalType, SEQUENCE_SUGGESTION_K, {
+        minSuccessRate: SUGGESTION_MIN_SUCCESS_RATE,
+      }),
     ]);
     if (skills.length === 0 && sequences.length === 0) return undefined;
 
@@ -1397,7 +1445,7 @@ export class CycleManager {
     const pct = (n: number) => `${Math.round(n * 100)}%`;
 
     const lines: string[] = ['[Skills that worked before for this kind of goal]'];
-    const items: Array<{ kind: string; text: string; score: number }> = [];
+    const items: Array<{ kind: string; text: string; score: number; tools: string[] }> = [];
     for (const s of skills) {
       await wm.write(
         {
@@ -1415,7 +1463,7 @@ export class CycleManager {
       if (s.satisfactionRate > 0) parts.push(`satisfied ${pct(s.satisfactionRate)}`);
       if (s.meanDurationMs > 0) parts.push(`~${Math.round(s.meanDurationMs)} ms avg`);
       lines.push(`• ${s.toolName} — ${parts.join(', ')}`);
-      items.push({ kind: 'skill-suggestion', text: lines[lines.length - 1].slice(2), score: s.score });
+      items.push({ kind: 'skill-suggestion', text: lines[lines.length - 1].slice(2), score: s.score, tools: [s.toolName] });
     }
     for (const seq of sequences) {
       await wm.write(
@@ -1432,7 +1480,12 @@ export class CycleManager {
       );
       const chain = seq.steps.map((st) => st.toolName).join(' → ');
       lines.push(`• [sequence] ${chain} (${seq.successCount}×, ${pct(seq.successRate)} success)`);
-      items.push({ kind: 'sequence-suggestion', text: lines[lines.length - 1].slice(2), score: seq.successRate });
+      items.push({
+        kind: 'sequence-suggestion',
+        text: lines[lines.length - 1].slice(2),
+        score: seq.successRate,
+        tools: seq.steps.map((st) => st.toolName),
+      });
     }
     return { text: lines.join('\n'), items };
   }
@@ -1536,6 +1589,8 @@ export class CycleManager {
     comprehension?: ComprehensionResult,
     extras: {
       wm: WMEntryInput[];
+      /** Tools named by the suggestions the prompt showed this turn; absent when none. */
+      suggestedTools?: string[];
       /** Metacognition entries for the `metaBuffer` (the nudge, the churn warning). */
       meta?: WMEntryInput[];
       /** Per-turn observations; present only with metacognition on. */
@@ -1664,13 +1719,19 @@ export class CycleManager {
       // record this turn's traces. Order matters: backfill first so it targets
       // only prior cycles (this cycle's traces aren't written yet, and we also
       // exclude the current cycleId explicitly).
-      await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '');
+      const traceUser = mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender);
+      // An initiative cycle has no user message to react to.
+      if (mode === 'conversational') {
+        await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '', traceUser);
+      }
       const written = await this.writeSkillTraces(
         sessionId,
         cycleId,
         toolEvents,
         activeGoalUri,
         activeGoalType,
+        traceUser,
+        extras.suggestedTools,
       );
       this.noteTracesWritten(written);
     }
@@ -1979,29 +2040,24 @@ export class CycleManager {
     sessionId: string,
     cycleId: string,
     text: string,
+    userKey: string,
   ): Promise<void> {
     const satisfied = this.classifySatisfaction(text);
     if (satisfied === null) return;
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
-    const uris = await pm.findPriorCycleTraceUris(sessionId, cycleId);
-    for (const uri of uris) await pm.backfillSatisfaction(uri, satisfied);
+    // Only this user's own, not yet judged traces of the latest earlier cycle,
+    // and only while that cycle is recent enough to be what the user reacts to.
+    const uris = await pm.findPriorCycleTraceUris(sessionId, cycleId, {
+      forUser: userKey,
+      onlyUnjudged: true,
+      maxGapMs: FOLLOWUP_MAX_GAP_MS,
+    });
+    for (const uri of uris) await pm.backfillSatisfaction(uri, satisfied, FOLLOWUP_SATISFACTION_WEIGHT);
   }
 
-  /** Crude satisfaction read of an inbound message: true / false / null (ambiguous). */
+  /** Satisfaction read of an inbound message: true / false / null (ambiguous). */
   private classifySatisfaction(text: string): boolean | null {
-    const t = text.trim().toLowerCase();
-    if (!t) return null;
-    const positive =
-      /\b(thanks|thank you|thx|danke|perfect|perfekt|great|super|awesome|nice|exactly|genau|correct|richtig|stimmt|spot on|works?|funktioniert|top)\b/.test(
-        t,
-      ) || /(^|\s)(👍|🙏|✅)/.test(text);
-    const negative =
-      /\b(no|nope|nein|wrong|falsch|incorrect|stop|stopp|not what|that'?s wrong|not right|nicht richtig|quatsch|leider nicht)\b/.test(
-        t,
-      ) || /(^|\s)(👎|❌)/.test(text);
-    if (positive && !negative) return true;
-    if (negative && !positive) return false;
-    return null;
+    return classifySatisfaction(text);
   }
 
   /**
@@ -2023,12 +2079,15 @@ export class CycleManager {
     toolEvents: ToolEpisodeEvent[],
     activeGoalUri?: string,
     activeGoalType?: string,
+    userKey: string = OWNER_USER_KEY,
+    suggestedTools?: string[],
   ): Promise<number> {
     // Pair events by callId, preserving first-seen order.
     interface Call {
       callId: string;
       toolName: string;
       argsBrief?: string;
+      args?: Record<string, unknown>;
       startedAt: Date;
       outcome?: 'success' | 'error';
       durationMs?: number;
@@ -2046,6 +2105,7 @@ export class CycleManager {
       if (ev.phase === 'called') {
         call.startedAt = ev.occurredAt;
         if (ev.argsBrief !== undefined) call.argsBrief = ev.argsBrief;
+        if (ev.args !== undefined) call.args = ev.args;
       } else {
         call.outcome = ev.outcome;
         call.durationMs = ev.durationMs;
@@ -2055,13 +2115,25 @@ export class CycleManager {
     if (order.length === 0) return 0;
 
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
+    const rules = await new CognitiveConfig(this.triplestore, this.agentId).argRedactionRules();
+    const suggested = suggestedTools && suggestedTools.length > 0 ? new Set(suggestedTools) : undefined;
+    let adhered = 0;
     const sequenceLen = order.length;
     let previousTrace: string | undefined;
     let pos = 0;
     for (const callId of order) {
       const c = calls.get(callId)!;
       pos++;
-      const brief = c.argsBrief ?? '';
+      // The brief is keys only; a masked value is kept as its sha256 alone.
+      const redacted =
+        c.args !== undefined
+          ? redactToolArgs(c.args, rules)
+          : { brief: looksLikeSecret(c.argsBrief) ? '' : (c.argsBrief ?? ''), masked: [] };
+      const brief = redacted.brief;
+      // Adherence is recorded on every traced call, but only when the prompt
+      // showed suggestions this turn; otherwise it is left unset.
+      const adherence = suggested ? suggested.has(c.toolName) : undefined;
+      if (adherence) adhered++;
       // No `completed` event => the call never resolved (e.g. aborted cycle);
       // a trace is still written per the DoD, recorded as a partial outcome.
       const outcome: TraceInput['outcome'] = c.outcome ?? 'partial';
@@ -2080,8 +2152,22 @@ export class CycleManager {
         sequencePos: pos,
         sequenceLen,
         previousTrace,
+        forUser: userKey,
+        ...(redacted.masked.length > 0 ? { maskedArgs: redacted.masked } : {}),
+        ...(adherence !== undefined ? { proceduralAdherence: adherence } : {}),
       };
       previousTrace = await pm.recordTrace(trace);
+    }
+    if (suggested) {
+      await pm.recordAdherenceSummary({
+        cycleId,
+        sessionId,
+        forUser: userKey,
+        executedAt: calls.get(order[0])!.startedAt,
+        suggestedTools: suggested.size,
+        tracedCalls: order.length,
+        adheredCalls: adhered,
+      });
     }
     return order.length;
   }
