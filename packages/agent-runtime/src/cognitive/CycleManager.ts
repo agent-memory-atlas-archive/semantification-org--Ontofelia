@@ -122,6 +122,13 @@ export type CoreFn<T> = (
   recordInbound: InboundEpisodeRecorder,
 ) => Promise<T>;
 
+/** The delegated streaming core: yields the consumer's chunks as they happen. */
+export type StreamCoreFn<C> = (
+  recordTool: ToolEpisodeRecorder,
+  prepareGoals: GoalContextProvider,
+  recordInbound: InboundEpisodeRecorder,
+) => AsyncIterable<C>;
+
 export interface RunCycleOptions {
   /** When true, Phase 3 manages an explicit goal stack (cog.flagGoalStack). */
   goalsEnabled?: boolean;
@@ -317,6 +324,95 @@ export class CycleManager {
     responseTextOf?: (result: T) => string | undefined,
     options: RunCycleOptions = {},
   ): Promise<T> {
+    const cycle = this.openCycle(envelope, options);
+    let result: T;
+    let coreError: unknown;
+    let status: 'completed' | 'aborted' = 'completed';
+    try {
+      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound);
+    } catch (e) {
+      status = 'aborted';
+      coreError = e;
+      result = undefined as unknown as T;
+    }
+    let sessionId = 'unknown';
+    let responseText: string | undefined;
+    try {
+      sessionId =
+        (status === 'completed' && result !== undefined ? sessionIdOf(result) : undefined) ||
+        envelope.routingHints?.sessionId ||
+        'unknown';
+      responseText =
+        status === 'completed' && result !== undefined ? responseTextOf?.(result) : undefined;
+    } catch (extractErr) {
+      this.onError?.(extractErr);
+    }
+    await cycle.finish(status, sessionId, responseText);
+
+    if (coreError) throw coreError;
+    return result;
+  }
+
+  /**
+   * Run one cognitive cycle around a streaming core. Every chunk the core
+   * yields is passed on unchanged and as it arrives; the cycle only observes
+   * it. The cycle is closed after the stream ends: `completed` when the core
+   * finished or the consumer stopped after the final chunk, `aborted` when the
+   * core threw or the consumer stopped iterating (or aborted) before it. The
+   * records are queued like a non-stream cycle's. A core error is re-thrown to
+   * the consumer after the cycle is closed.
+   *
+   * `describe` reads a chunk and reports the session id it carries, the final
+   * response text, and whether the chunk is the final one; the last value seen
+   * for each wins.
+   */
+  async *runCycleStream<C>(
+    envelope: MessageEnvelope,
+    core: StreamCoreFn<C>,
+    describe: (chunk: C) => { sessionId?: string; text?: string; final?: boolean } | undefined,
+    options: RunCycleOptions = {},
+  ): AsyncGenerator<C> {
+    const cycle = this.openCycle(envelope, options);
+    let sessionId: string | undefined;
+    let responseText: string | undefined;
+    let sawFinal = false;
+    let coreDone = false;
+    let coreFailed = false;
+    let status: 'completed' | 'aborted';
+    const inner = core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound);
+    try {
+      for await (const chunk of inner) {
+        try {
+          const d = describe(chunk);
+          if (d?.sessionId) sessionId = d.sessionId;
+          if (d?.text !== undefined) responseText = d.text;
+          if (d?.final) sawFinal = true;
+        } catch (extractErr) {
+          this.onError?.(extractErr);
+        }
+        yield chunk;
+      }
+      coreDone = true;
+    } catch (e) {
+      coreFailed = true;
+      throw e;
+    } finally {
+      // Reached on normal end, on a core error and when the consumer stops early.
+      status = !coreFailed && (coreDone || sawFinal) ? 'completed' : 'aborted';
+      await cycle.finish(
+        status,
+        sessionId || envelope.routingHints?.sessionId || 'unknown',
+        status === 'completed' ? responseText : undefined,
+      );
+    }
+  }
+
+  /**
+   * Set up one cycle: the per-cycle tool sink, the goal hook and the inbound
+   * episode recorder, plus `finish`, which closes the cycle and queues its
+   * records. Shared by {@link runCycle} and {@link runCycleStream}.
+   */
+  private openCycle(envelope: MessageEnvelope, options: RunCycleOptions) {
     const cycleId = `cyc-${newId()}`;
     const cycleUri = `urn:${this.agentId}:cog:cycle:${cycleId}`;
     const startedAt = new Date();
@@ -407,64 +503,46 @@ export class CycleManager {
       return inboundEpisodeUri;
     };
 
-    let result: T;
-    let coreError: unknown;
-    let status: 'completed' | 'aborted' = 'completed';
-    try {
-      result = await core(recordTool, prepareGoals, recordInbound);
-    } catch (e) {
-      status = 'aborted';
-      coreError = e;
-      result = undefined as unknown as T;
-    }
-    const endedAt = new Date();
-    const durationMs = endedAt.getTime() - startedAt.getTime();
-    if (status === 'aborted') {
-      this.logger.error({ agent: this.agentId, cycleId, durationMs }, `cycle ${cycleId} aborted`);
-    } else {
-      this.logger.info({ agent: this.agentId, cycleId, phase: 'reflection', durationMs }, `cycle ${cycleId} completed in ${durationMs}ms`);
-      emitPhase('reflection', 'Reflection');
-    }
+    const finish = async (
+      status: 'completed' | 'aborted',
+      sessionId: string,
+      responseText: string | undefined,
+    ): Promise<void> => {
+      const endedAt = new Date();
+      const durationMs = endedAt.getTime() - startedAt.getTime();
+      if (status === 'aborted') {
+        this.logger.error({ agent: this.agentId, cycleId, durationMs }, `cycle ${cycleId} aborted`);
+      } else {
+        this.logger.info({ agent: this.agentId, cycleId, phase: 'reflection', durationMs }, `cycle ${cycleId} completed in ${durationMs}ms`);
+        emitPhase('reflection', 'Reflection');
+      }
+      const queued = this.enqueuePersist(sessionId, () =>
+        this.persist(
+          envelope,
+          sessionId,
+          cycleId,
+          cycleUri,
+          startedAt,
+          endedAt,
+          status,
+          responseText,
+          toolEvents,
+          activeGoalUri,
+          activeGoalType,
+          options.proceduralEnabled === true,
+          options.metacognitionEnabled === true,
+          goalConflict,
+          options.selfModelEnabled === true,
+          mode,
+          options.initiativeGoalUri,
+          inboundEpisodeUri,
+          options.episodicEnabled !== false,
+        ),
+      );
+      if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
+    };
 
-    let sessionId = 'unknown';
-    let responseText: string | undefined;
-    try {
-      sessionId =
-        (status === 'completed' && result !== undefined ? sessionIdOf(result) : undefined) ||
-        envelope.routingHints?.sessionId ||
-        'unknown';
-      responseText =
-        status === 'completed' && result !== undefined ? responseTextOf?.(result) : undefined;
-    } catch (extractErr) {
-      this.onError?.(extractErr);
-    }
-    const queued = this.enqueuePersist(sessionId, () =>
-      this.persist(
-        envelope,
-        sessionId,
-        cycleId,
-        cycleUri,
-        startedAt,
-        endedAt,
-        status,
-        responseText,
-        toolEvents,
-        activeGoalUri,
-        activeGoalType,
-        options.proceduralEnabled === true,
-        options.metacognitionEnabled === true,
-        goalConflict,
-        options.selfModelEnabled === true,
-        mode,
-        options.initiativeGoalUri,
-        inboundEpisodeUri,
-        options.episodicEnabled !== false,
-      ),
-    );
-    if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
-
-    if (coreError) throw coreError;
-    return result;
+    return { recordTool, prepareGoals, recordInbound, finish };
   }
 
   /**

@@ -463,7 +463,7 @@ the gateway wires them to `InitiativeService`.
   verified owner and the turn is conversational. The initiative cycle's synthetic
   envelope (sender `initiative`, `isOwner: true`) and any non-owner sender get no
   marker, so neither can serve as a mandate. The episode exists only on the cycle manager path, so without
-  `flagCycleManager`, and on streamed replies, the tool refuses and names the
+  `flagCycleManager` the tool refuses and names the
   flag; it does not switch any flag on. Initiative cycles record no such
   episode ahead of the tool loop.
 - *Writes.* A new goal is pushed with mandate and wake and then moved with

@@ -25,12 +25,10 @@ on (mandate, guards, allow-list, notification).
   explicit phrasing that works with most models; if the model still does not call
   the tool, the demo cannot continue from chat (there is no command that arms a
   goal) and you have learned something about that model.
-- **The web chat cannot arm a goal.** The web chat streams the reply, and a
-  streamed turn records no mandate episode, so `arm_goal` refuses there and says
-  so. Send the request in step 3 through a non-streaming path instead: your
-  Telegram chat with the agent, or `POST /api/chat` (shown below). The commands
-  (`/cog cycle on`, `/initiative on`, `/goals`, `/initiative`) work in every
-  client, the web chat included.
+- **The web chat can arm a goal.** The web chat streams the reply; with the cycle
+  manager on, a streamed turn records the same mandate episode as any other
+  owner turn. The commands (`/cog cycle on`, `/initiative on`, `/goals`,
+  `/initiative`) work in every client.
 - **The reply of an initiative cycle is shown to nobody.** You learn what
   happened from `/initiative`, `/goals`, the web panel, the API and, if
   configured, a Telegram notification. What the model does during the cycle is
@@ -85,7 +83,7 @@ the report has the line `Cycle manager: OFF (flagCycleManager). arm_goal needs
 
 ### 3. Ask the agent to work on something later
 
-Send a plain request with a short delay through a non-streaming path. In
+Send a plain request with a short delay. In the web chat or
 Telegram, write it as a normal message. With the API (the token comes from
 `ontofelia auth token`):
 
@@ -196,8 +194,6 @@ Expected: `Initiative disabled (flagInitiative = false).` and `Cycle manager dis
 - A recurring goal (`every`, for example `PT30M`, `PT2H` or `P1D`) cannot be
   shorter than 30 minutes. Ask for one in plain words ("every 2 hours"); the
   wake then repeats until you abandon the goal or switch initiative off.
-- Streamed replies (the web chat) carry no mandate episode: `arm_goal` refuses
-  there even with the cycle manager on.
 - Trying to make the agent do something outside the allow-list during a cycle
   (for example writing a file) is refused with the rule
   `initiative-restricted-tool` and logged in the tool audit log.

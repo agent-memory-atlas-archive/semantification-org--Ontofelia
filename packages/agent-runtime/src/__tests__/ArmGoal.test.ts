@@ -246,6 +246,8 @@ describe('arm_goal', () => {
     const res = await tool.execute({ newGoal: 'No record', wakeIn: 'PT2H' }, toolCtx({}));
     expect(res.success).toBe(false);
     expect(String(res.output)).toContain('cog.flagCycleManager');
+    // streamed replies join the cycle now, so the refusal no longer blames streaming
+    expect(String(res.output)).not.toContain('streamed');
     expect(await allGoals()).toHaveLength(0);
     expect(scheduler.jobs).toHaveLength(0);
   });

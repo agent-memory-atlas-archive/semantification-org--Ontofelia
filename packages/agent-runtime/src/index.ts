@@ -2009,9 +2009,66 @@ Users can use these commands:
         return;
       }
 
+      // Cognitive cycle path for streamed turns: same flags and hooks as
+      // handleMessage, chunks pass through unchanged. Flag off: the core runs
+      // directly, exactly as before.
+      if (this.cognitiveConfig && this.cycleManager && (await this.cognitiveConfig.isCycleManagerEnabled())) {
+        const goalsEnabled = await this.cognitiveConfig.isGoalStackEnabled();
+        const proceduralEnabled = await this.cognitiveConfig.isProceduralMemoryEnabled();
+        const metacognitionEnabled = await this.cognitiveConfig.isMetacognitionEnabled();
+        const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
+        const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
+        yield* this.cycleManager.runCycleStream<StreamChunk>(
+          envelope,
+          (recordTool, prepareGoals, recordInbound) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound),
+          (chunk) =>
+            chunk.type === 'stream_start'
+              ? { sessionId: chunk.sessionId }
+              : chunk.type === 'stream_end'
+                ? { sessionId: chunk.sessionId, text: chunk.text, final: true }
+                : undefined,
+          {
+            goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
+            onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
+          },
+        );
+        return;
+      }
+      yield* this.streamCore(envelope);
+    } finally {
+      this.activeRuns--;
+    }
+  }
+
+  /**
+   * The streaming message core: build context, stream from the provider with
+   * tools, run the tool loop, apply fallbacks. Shared by the legacy stream path
+   * and the CycleManager path (the optional hooks are absent on the legacy one).
+   */
+  private async *streamCore(
+    envelope: MessageEnvelope,
+    recordTool?: ToolEpisodeRecorder,
+    prepareGoals?: GoalContextProvider,
+    recordInbound?: InboundEpisodeRecorder,
+  ): AsyncGenerator<StreamChunk> {
+    {
       const ctx = await this.buildContext(envelope);
       const { session, origin, messages, resolvedWorkspace, currentModel, providerName } = ctx;
-      
+
+      // Same goal / skill / self prompt splice as runCore.
+      if (prepareGoals) {
+        const goalSection = await prepareGoals(session.sessionId);
+        if (goalSection && messages[0]?.role === 'system' && typeof messages[0].content === 'string') {
+          messages[0] = {
+            ...messages[0],
+            content: insertSectionBeforeBinding(messages[0].content, goalSection, ctx.bindingSection),
+          };
+        }
+      }
+
+      // Inbound-message episode before any tool runs (cycle path only).
+      const inboundEpisodeUri = recordInbound ? await recordInbound(session.sessionId) : undefined;
+
       await this.sessionStore.appendTranscript(session.sessionId, {
         timestamp: new Date().toISOString(),
         role: 'user',
@@ -2026,6 +2083,7 @@ Users can use these commands:
       let finalContent = '';
       let usage = undefined;
       const toolContext = this.buildToolContext(session, envelope, resolvedWorkspace);
+      if (inboundEpisodeUri) toolContext.inboundEpisodeUri = inboundEpisodeUri;
       
       let doStream = true;
       let primaryStreamError: string | undefined;
@@ -2097,10 +2155,28 @@ Users can use these commands:
             } catch {
               toolArgs = {};
             }
+
+            const toolStart = Date.now();
+            recordTool?.({
+              phase: 'called',
+              toolName: toolCall.name,
+              callId: toolCall.id,
+              occurredAt: new Date(),
+              argsBrief: Object.keys(toolArgs).join(', '),
+            });
             
             const approved = await this.ensureToolApproved(toolCall, toolArgs, toolContext);
             if (!approved) {
               this.emitDebug('guardian_denied', 'Command denied by user or timed out');
+              recordTool?.({
+                phase: 'completed',
+                toolName: toolCall.name,
+                callId: toolCall.id,
+                occurredAt: new Date(),
+                outcome: 'error',
+                durationMs: Date.now() - toolStart,
+                errorClass: 'guardian-denied',
+              });
               const errOut = this.guardianDeniedPayload();
               yield { type: 'tool_result', name: toolCall.name, success: false, output: errOut };
               toolResults.push(this.guardianDeniedMessage(toolCall));
@@ -2110,6 +2186,15 @@ Users can use these commands:
             const result = await this.toolExecutor.execute(toolCall, toolContext);
             
             this.emitDebug('tool_result', `${toolCall.name} → ${result.success ? '✔' : '✘'}`, { success: result.success, output: result.output });
+            recordTool?.({
+              phase: 'completed',
+              toolName: toolCall.name,
+              callId: toolCall.id,
+              occurredAt: new Date(),
+              outcome: result.success ? 'success' : 'error',
+              durationMs: Date.now() - toolStart,
+              errorClass: result.success ? undefined : (result.error ? 'tool-error' : undefined),
+            });
             yield { type: 'tool_result', name: toolCall.name, success: result.success, output: result.output };
             
             toolResults.push({
@@ -2211,8 +2296,6 @@ Users can use these commands:
 
         yield { type: 'stream_end', text: finalContent, sessionId: session.sessionId, model: currentModel, provider: providerName, usage };
       }
-    } finally {
-      this.activeRuns--;
     }
   }
 
