@@ -3,7 +3,8 @@
  * facts in that user's own graph (docs/cognitive-architecture/05 §6.1, pattern 1).
  *
  * Privacy rule (binding): a fact is promoted ONLY into the graph
- * `urn:<agent>:user:<key>` of the user whose episodes assert it. It never goes
+ * `urn:<agent>:user:<key>` of the user whose episodes assert it, namely the
+ * graph recorded on the episode (`factGraph`); episodes without one are skipped. It never goes
  * to the worldview and never to another user's graph; there is no parameter or
  * code path that selects a different target. Episodes are read per user and the
  * evidence of one (user, s, p, o) never mixes users: user A's episodes count
@@ -19,7 +20,7 @@
  * A (user, s, p, o) is promoted when it has at least K distinct episodes
  * ({@link EpisodicConsolidationSettings.minEpisodes}) in at least Q distinct evidence
  * groups ({@link EpisodicConsolidationSettings.minGroups}); a group is one session
- * (transcriptRef, else sessionId) on one UTC day. One session on one day is one
+ * (transcriptRef without its line index, else sessionId) on one UTC day. One session on one day is one
  * group however many episodes it holds.
  *
  * Idempotence: the promotion is keyed by a claim hash over (user, s, p, o). A
@@ -86,7 +87,7 @@ export interface EpisodicConsolidationReport {
   conflicts: number;
   /** Qualified but cut by a per-run bound. */
   deferred: number;
-  excluded: { untrustedEpisodes: number; secretEpisodes: number; claims: number };
+  excluded: { untrustedEpisodes: number; secretEpisodes: number; claims: number; noFactGraphEpisodes: number };
 }
 
 /** A candidate fact of one user. */
@@ -112,7 +113,7 @@ function emptyReport(now: Date): EpisodicConsolidationReport {
     alreadyKnown: 0,
     conflicts: 0,
     deferred: 0,
-    excluded: { untrustedEpisodes: 0, secretEpisodes: 0, claims: 0 },
+    excluded: { untrustedEpisodes: 0, secretEpisodes: 0, claims: 0, noFactGraphEpisodes: 0 },
   };
 }
 
@@ -128,11 +129,17 @@ export function consolidationClaimHash(
     .digest('hex');
 }
 
-/** The evidence group of an episode: its session (transcriptRef, else sessionId) on its UTC day. */
+/**
+ * The evidence group of an episode: its session on its UTC day. The session is
+ * the transcript reference WITHOUT its line index (`<session>.jsonl:line_12`
+ * names a message, not a session), else the session id. Every message of one
+ * session on one day therefore falls into one group.
+ */
 function groupOf(ep: ClaimEpisode): string {
   const t = Date.parse(ep.occurredAt);
   const day = Number.isNaN(t) ? 'unknown-day' : new Date(t).toISOString().slice(0, 10);
-  return `${ep.transcriptRef ?? ep.sessionId ?? 'no-session'}|${day}`;
+  const session = ep.transcriptRef?.replace(/:line_\d+$/, '') ?? ep.sessionId ?? 'no-session';
+  return `${session}|${day}`;
 }
 
 export class EpisodicConsolidation {
@@ -202,9 +209,43 @@ export class EpisodicConsolidation {
       }
     }
 
+    // Promote only into the graph recorded on the episode (the graph the
+    // ingestion wrote the sender's own facts to). An episode without a usable
+    // one (legacy, or not one of this agent's user graphs) is not guessed about.
+    const prefix = `urn:${this.agentId}:user:`;
+    const groups = new Map<string, ClaimEpisode[]>();
+    for (const ep of usable) {
+      const g = ep.factGraph;
+      const key = g !== undefined && g.startsWith(prefix) ? g.slice(prefix.length) : '';
+      if (g === undefined || !this.usableUserKey(key) || GraphUriResolver.getUserGraph(this.agentId, key) !== g) {
+        report.excluded.noFactGraphEpisodes++;
+        continue;
+      }
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g)!.push(ep);
+    }
+    let written = 0;
+    for (const [graph, eps] of [...groups.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      written += await this.runGraph(userKey, graph, graph.slice(prefix.length), eps, k, q, promotionBudget - written, now, report);
+    }
+    return written;
+  }
+
+  /** One fact graph of one user: count, qualify and promote into exactly that graph. */
+  private async runGraph(
+    userKey: string,
+    graph: string,
+    graphKey: string,
+    usable: ClaimEpisode[],
+    k: number,
+    q: number,
+    promotionBudget: number,
+    now: Date,
+    report: EpisodicConsolidationReport,
+  ): Promise<number> {
     const claimTerms = await this.readAcceptedClaims(
       [...new Set(usable.flatMap((e) => e.claims))],
-      GraphUriResolver.getUserGraph(this.agentId, userKey),
+      graph,
     );
 
     const candidates = new Map<string, Candidate>();
@@ -238,7 +279,9 @@ export class EpisodicConsolidation {
     // depends on the store's row order.
     const latest = (c: Candidate) =>
       [...c.episodes.values()].map((e) => e.occurredAt).sort(compareIso).pop() as string;
-    const withHash = qualified.map((c) => ({ c, hash: consolidationClaimHash(userKey, c.subject, c.predicate, c.object) }));
+    // The hash names the user, or the graph when it is not the cognitive user's own.
+    const hashKey = graph === GraphUriResolver.getUserGraph(this.agentId, userKey) ? userKey : graph;
+    const withHash = qualified.map((c) => ({ c, hash: consolidationClaimHash(hashKey, c.subject, c.predicate, c.object) }));
     withHash.sort(
       (a, b) =>
         b.c.episodes.size - a.c.episodes.size ||
@@ -260,7 +303,7 @@ export class EpisodicConsolidation {
       const sources = [...c.episodes.keys()].sort();
       const res = await this.engine.promoteToUserGraph({
         agentId: this.agentId,
-        userKey,
+        userKey: graphKey,
         subjectUri: c.subject,
         predicateUri: c.predicate,
         object: c.object,
@@ -284,6 +327,7 @@ export class EpisodicConsolidation {
         episodeType: 'consolidation-promoted',
         occurredAt: now,
         forUser: userKey,
+        factGraph: graph,
         about: [c.subject],
         hasClaim: res.claimUri ? [res.claimUri] : [],
         tags: ['consolidation', `${CLAIM_HASH_TAG}${hash}`],

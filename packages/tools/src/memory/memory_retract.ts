@@ -1,4 +1,4 @@
-import { ToolDefinition, ToolContext, ToolResult, ToolPermission, ToolCategory, cogUserKey } from '@ontofelia/core';
+import { ToolDefinition, ToolContext, ToolResult, ToolPermission, ToolCategory } from '@ontofelia/core';
 import { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver, GraphRegistry, GraphPolicyError, KnowledgeEngine, sparqlIri, sparqlStringLiteral } from '@ontofelia/semantic-memory';
 
@@ -103,15 +103,13 @@ export class MemoryRetractTool implements ToolDefinition {
     }
 
     // The retracting user's own copy made by the episodic consolidation
-    // (`sourceKind "consolidation-episodic"`) goes too, in the user graph of the
-    // user's cognitive key and nowhere else. Another user's graph is never in
-    // this list; the target graph itself is handled by the full delete below.
+    // (`sourceKind "consolidation-episodic"`) goes too: in exactly the graph the
+    // ingestion writes this sender's own facts to (`urn:<agent>:user:<senderId>`,
+    // the same graph this tool allows), and nowhere else. Another user's graph is
+    // never in this list; the target graph itself is handled by the full delete.
     const cascadeGraphs: string[] = [];
     try {
-      const own = GraphUriResolver.getUserGraph(
-        context.agentId,
-        cogUserKey({ id: context.senderId, isOwner: (context as { isOwner?: boolean }).isOwner === true }),
-      );
+      const own = GraphUriResolver.getUserGraph(context.agentId, context.senderId ?? '');
       if (context.senderId && own !== targetGraph) {
         this.registry.assertWritable(own);
         const ownIri = sparqlIri(own);

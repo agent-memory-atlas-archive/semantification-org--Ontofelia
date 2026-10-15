@@ -99,6 +99,13 @@ export interface EpisodeInput {
    * counts an episode of such a session.
    */
   sessionUntrusted?: boolean;
+  /**
+   * IRI of the graph the sender's own facts go to (`urn:<agent>:user:<id>`, the
+   * ingestion routing by sender id), recorded at write time as `cogt:factGraph`.
+   * The episodic consolidation promotes into exactly this graph; an episode
+   * without it is never promoted from.
+   */
+  factGraph?: string;
   /** Explicit predecessor; when omitted, append() chains to the session's last. */
   precededBy?: string;
   partOfGoal?: string;
@@ -148,6 +155,8 @@ export interface ClaimEpisode {
   secret: boolean;
   /** The episode itself is flagged `cogt:sessionUntrusted`. */
   untrusted: boolean;
+  /** The sender's fact graph recorded on the episode (`cogt:factGraph`); absent on legacy episodes. */
+  factGraph?: string;
 }
 
 /** Tag prefix of a `consolidation-promoted` episode: the promotion's claim hash. */
@@ -324,6 +333,7 @@ export class EpisodicMemory {
       lines.push(`<${uri}> <${CORE}privacyClass> "secret" .`);
     for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> ${sparqlIri(a)} .`);
     for (const c of ep.hasClaim ?? []) lines.push(`<${uri}> <${COGT}hasClaim> ${sparqlIri(c)} .`);
+    if (ep.factGraph) lines.push(`<${uri}> <${COGT}factGraph> ${sparqlIri(ep.factGraph)} .`);
     if (ep.sessionUntrusted === true)
       lines.push(`<${uri}> <${COGT}sessionUntrusted> "true"^^<${XSD}boolean> .`);
     if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> ${sparqlIri(precededBy)} .`);
@@ -855,7 +865,7 @@ export class EpisodicMemory {
     for (let i = 0; i < list.length; i += MULTI_VALUE_CHUNK) {
       const chunk = list.slice(i, i + MULTI_VALUE_CHUNK).map((u) => sparqlIri(u));
       const res = await this.triplestore.query(`
-        SELECT ?ep ?when ?forUser ?sessionId ?transcriptRef ?privacy ?untrusted WHERE {
+        SELECT ?ep ?when ?forUser ?sessionId ?transcriptRef ?privacy ?untrusted ?factGraph WHERE {
           GRAPH <${graph}> {
             VALUES ?ep { ${chunk.join(' ')} }
             ?ep <${COGT}occurredAt> ?when .
@@ -864,6 +874,7 @@ export class EpisodicMemory {
             OPTIONAL { ?ep <${COGT}transcriptRef> ?transcriptRef . }
             OPTIONAL { ?ep <${CORE}privacyClass> ?privacy . }
             OPTIONAL { ?ep <${COGT}sessionUntrusted> ?untrusted . }
+            OPTIONAL { ?ep <${COGT}factGraph> ?factGraph . }
           }
         }`);
       const claims = await this.multiValued(`<${COGT}hasClaim>`, list.slice(i, i + MULTI_VALUE_CHUNK));
@@ -883,6 +894,7 @@ export class EpisodicMemory {
         };
         if (r.sessionId) rec.sessionId = r.sessionId.value;
         if (r.transcriptRef) rec.transcriptRef = r.transcriptRef.value;
+        if (r.factGraph) rec.factGraph = r.factGraph.value;
         episodes.push(rec);
       }
     }

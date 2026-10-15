@@ -86,7 +86,7 @@ describe('/cog consolidate-episodes', () => {
           <${CORE}sourceKind> "user" . } }`);
       await em.append({
         episodeType: 'message-received', forUser: 'anna', sessionId: `cmd${i}`,
-        occurredAt: new Date(T0 + i * DAY), hasClaim: [claim],
+        occurredAt: new Date(T0 + i * DAY), hasClaim: [claim], factGraph: `urn:${AGENT}:user:anna`,
       });
     }
   });

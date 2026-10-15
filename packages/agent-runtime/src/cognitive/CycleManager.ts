@@ -2208,6 +2208,10 @@ export class CycleManager {
       actor,
       ...(actorIsOwner ? { actorIsOwner: true } : {}),
       forUser: cogUserKey(envelope.sender),
+      // The graph the ingestion writes this sender's own facts to (it routes by
+      // the raw sender id, not by the cognitive key); the consolidation promotes
+      // into exactly this graph.
+      ...this.factGraphOf(envelope),
       ...this.privacyOf(envelope.text),
       payload: envelope.text || '',
       // Without a perception record (no hook ran) the episode is as before.
@@ -2226,6 +2230,19 @@ export class CycleManager {
         : {}),
       partOfGoal: activeGoalUri,
     });
+  }
+
+  /** `{ factGraph }` for an inbound episode, or nothing when the sender has no usable id. */
+  private factGraphOf(envelope: MessageEnvelope): { factGraph?: string } {
+    const id = envelope.sender?.id;
+    if (typeof id !== 'string' || id === '') return {};
+    try {
+      const graph = GraphUriResolver.getUserGraph(this.agentId, id);
+      sparqlIri(graph);
+      return { factGraph: graph };
+    } catch {
+      return {};
+    }
   }
 
   /**

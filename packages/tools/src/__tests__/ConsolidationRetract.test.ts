@@ -49,7 +49,7 @@ async function seedWorldviewClaim(): Promise<string> {
 async function promoteFor(user: string, fresh = false) {
   if (fresh || !shared) shared = await seedWorldviewClaim();
   for (let i = 0; i < 3; i++) {
-    await em.append({ episodeType: 'message-received', forUser: user, sessionId: `${user}${i}`, occurredAt: new Date(T0 + i * DAY), hasClaim: [shared] });
+    await em.append({ episodeType: 'message-received', forUser: user, sessionId: `${user}${i}`, occurredAt: new Date(T0 + i * DAY), hasClaim: [shared], factGraph: userGraph(user) });
   }
   return new EpisodicConsolidation(store, AGENT, engine).run();
 }
@@ -122,10 +122,19 @@ describe('memory_retract cascade into the consolidation copy', () => {
     expect(await holds(userGraph('anna'))).toBe(true);
   });
 
-  it('the owner\'s copy lives under the owner key and goes with the owner\'s retraction', async () => {
-    expect((await promoteFor('owner')).promoted).toBe(1);
-    await retract.execute({ subject: S, predicate: P, object: O }, ctx('u-owner-7', true));
+  it('an owner whose sender id is not "owner": copy and cascade use user:<id>, never user:owner', async () => {
+    shared = await seedWorldviewClaim();
+    for (let i = 0; i < 3; i++) {
+      // forUser is the cognitive key; the fact graph is the ingestion routing by sender id.
+      await em.append({ episodeType: 'message-received', forUser: 'owner', sessionId: `o${i}`, occurredAt: new Date(T0 + i * DAY), hasClaim: [shared], factGraph: userGraph('u-owner-7') });
+    }
+    expect((await new EpisodicConsolidation(store, AGENT, engine).run()).promoted).toBe(1);
+    expect(await holds(userGraph('u-owner-7'))).toBe(true);
     expect(await holds(userGraph('owner'))).toBe(false);
+    await retract.execute({ subject: S, predicate: P, object: O }, ctx('u-owner-7', true));
+    expect(await holds(userGraph('u-owner-7'))).toBe(false);
+    const inOwner = await store.query(`SELECT ?s WHERE { GRAPH <${userGraph('owner')}> { ?s ?p ?o } } LIMIT 1`);
+    expect(inOwner.bindings ?? []).toEqual([]);
   });
 
   it('promoteToUserGraph reports already-known when the worldview holds an independent accepted claim', async () => {

@@ -175,7 +175,7 @@ describe('re-assertion of an existing triple', () => {
           <${CORE}claimSubject> <urn:ontofelia:entity:Anna> ; <${CORE}claimPredicate> <urn:ontofelia:core#worksAt> ;
           <${CORE}claimObject> <urn:ontofelia:entity:Acme> ; <${CORE}status> "accepted" ;
           <${CORE}assertedInGraph> <${WORLDVIEW}> ; <${CORE}sourceKind> "user" } }`);
-        await em.append({ episodeType: 'message-received', forUser: 'anna', sessionId: `a${i}`, occurredAt: new Date(T0 + i * 86_400_000), hasClaim: [c] });
+        await em.append({ episodeType: 'message-received', forUser: 'anna', factGraph: userGraph('anna'), sessionId: `a${i}`, occurredAt: new Date(T0 + i * 86_400_000), hasClaim: [c] });
       }
       expect(w.claimUri).toBeDefined();
       const before = await quads();

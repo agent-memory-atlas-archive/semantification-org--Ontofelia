@@ -37,10 +37,11 @@ const PARSED = JSON.stringify({
 
 class MockProvider implements ProviderAdapter {
   name = 'stub';
+  constructor(private readonly parsed = PARSED) {}
   async initialize() {}
   async healthCheck() { return { healthy: true, component: 'stub', checkedAt: new Date().toISOString() }; }
   async chat(r: ChatRequest): Promise<ChatResponse> {
-    return { id: 'x', content: r.tools ? 'Noted.' : PARSED, finishReason: 'stop', toolCalls: [], usage: USAGE };
+    return { id: 'x', content: r.tools ? 'Noted.' : this.parsed, finishReason: 'stop', toolCalls: [], usage: USAGE };
   }
   async *chatStream(r: ChatRequest): AsyncIterable<StreamEvent> { yield { type: 'done', response: await this.chat(r) } as StreamEvent; }
 }
@@ -54,9 +55,9 @@ const config: AgentConfig = {
 };
 
 const CHANNELS = ['webchat', 'telegram', 'discord'] as ChannelType[];
-const envelope = (channel: ChannelType): MessageEnvelope => ({
+const envelope = (channel: ChannelType, sender: MessageEnvelope['sender'] = OWNER): MessageEnvelope => ({
   id: `m-${channel}`, channel, accountId: 'none', chatType: 'dm',
-  sender: OWNER, timestamp: new Date().toISOString(), text: TEXT, mentions: [], attachments: [],
+  sender, timestamp: new Date().toISOString(), text: TEXT, mentions: [], attachments: [],
 } as MessageEnvelope);
 
 const rows = async (store: TriplestoreAdapter, q: string) => (await store.query(q)).bindings ?? [];
@@ -65,21 +66,22 @@ describe('a restated fact through the real ingestion path', () => {
   let store: TriplestoreAdapter;
   let runtime: AgentRuntime;
   let cfg: CognitiveConfig;
+  let ke: KnowledgeEngine;
   let dirs: string[];
 
-  async function setup(episodic: boolean) {
+  async function setup(episodic: boolean, parsed = PARSED) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'reassert-store-'));
     const sessDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reassert-sess-'));
     dirs = [dir, sessDir];
     store = new OxigraphAdapter();
     await store.initialize({ backend: 'oxigraph', type: 'embedded', dataDir: dir, port: 0, endpoint: '' });
-    const ke = new KnowledgeEngine(store, undefined, GraphRegistry.create([AGENT]));
+    ke = new KnowledgeEngine(store, undefined, GraphRegistry.create([AGENT]));
     cfg = new CognitiveConfig(store, AGENT);
     await cfg.setCycleManagerEnabled(true);
     await cfg.setEpisodicMemoryEnabled(episodic);
     await cfg.setEnabled({ name: 'flagEpisodicConsolidation', key: 'episodicConsolidation', description: '' }, true);
     runtime = new AgentRuntime(
-      AGENT, config, new MockProvider(), new SessionStore(sessDir),
+      AGENT, config, new MockProvider(parsed), new SessionStore(sessDir),
       new ToolRegistry(), new ToolPolicyEngine({ allow: [], deny: [] }),
       new AuditLog(`/tmp/reassert-ws-${Math.random().toString(36).slice(2)}`), new SkillRegistry(),
       new SkillExecutor(new SkillRegistry()), new PluginRegistry(), undefined, ke, undefined,
@@ -90,9 +92,9 @@ describe('a restated fact through the real ingestion path', () => {
     await (runtime as unknown as { cycleManager?: CycleManager }).cycleManager?.flushPending();
     await runtime.flushCognitiveWrites();
   };
-  async function sayThrice() {
-    for (const ch of CHANNELS) {
-      await runtime.handleMessage(envelope(ch));
+  async function sayThrice(channels: ChannelType[] = CHANNELS, sender: MessageEnvelope['sender'] = OWNER) {
+    for (const ch of channels) {
+      await runtime.handleMessage(envelope(ch, sender));
       await flush();
     }
   }
@@ -150,5 +152,42 @@ describe('a restated fact through the real ingestion path', () => {
     const r = await runtime.runEpisodicConsolidation();
     expect(r.report?.promoted).toBe(0);
     expect(await holders()).toEqual([WORLDVIEW]);
+  });
+
+  it('three restatements in ONE session on one day do not promote (one evidence group)', async () => {
+    await setup(true);
+    await sayThrice(['webchat', 'webchat', 'webchat']);
+    // The restatements are linked as before: three episodes, one claim.
+    expect(await episodeClaims()).toHaveLength(3);
+    const r = await runtime.runEpisodicConsolidation();
+    expect(r.report?.qualified).toBe(0);
+    expect(r.report?.promoted).toBe(0);
+    expect(await holders()).toEqual([WORLDVIEW]);
+  });
+
+  it('an owner whose sender id is not "owner": own facts, promotion and cascade key all use user:<id>, nothing in user:owner', async () => {
+    await setup(true);
+    const sender = { id: 'u-7', channelPrefix: 'webchat', isOwner: true };
+    await sayThrice(CHANNELS, sender);
+    const graphHas = (g: string, needle: string) =>
+      rows(store, `SELECT ?o WHERE { GRAPH <urn:${AGENT}:${g}> { ?s ?p ?o . FILTER (CONTAINS(STR(?o), "${needle}")) } }`).then((r) => r.length > 0);
+    // The owner's own fact goes where the ingestion routes by sender id.
+    await ke.storeFact(
+      { subject: 'User', predicate: 'likes', object: 'Tea', objectType: 'literal', confidenceLabel: 'high', status: 'accepted' },
+      { agentId: AGENT, userId: sender.id, sessionId: 'x', isOwner: true },
+    );
+    expect(await graphHas('user:u-7', 'Tea')).toBe(true);
+    expect(await graphHas('user:owner', 'Tea')).toBe(false);
+    expect(await graphHas('user:u-7', 'Acme')).toBe(false);
+
+    const r = await runtime.runEpisodicConsolidation();
+    expect(r.report?.promoted).toBe(1);
+    expect(await graphHas('user:u-7', 'Acme')).toBe(true);
+    const inOwner = await rows(store, `SELECT ?s WHERE { GRAPH <urn:${AGENT}:user:owner> { ?s ?p ?o } } LIMIT 1`);
+    expect(inOwner).toEqual([]);
+    // The episodes keep the cognitive key for scoping and name the fact graph.
+    const eps = await rows(store, `SELECT ?u ?g WHERE { GRAPH ?x { ?ep a <${COGT}Episode> ; <${COGT}episodeType> "message-received" ; <${COGT}forUser> ?u ; <${COGT}factGraph> ?g } }`);
+    expect(eps).toHaveLength(3);
+    expect(new Set(eps.map((e) => `${e.u.value} ${e.g.value}`))).toEqual(new Set([`owner urn:${AGENT}:user:u-7`]));
   });
 });

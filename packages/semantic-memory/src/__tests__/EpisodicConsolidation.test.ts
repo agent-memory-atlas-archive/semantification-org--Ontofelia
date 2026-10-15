@@ -73,6 +73,8 @@ describe('EpisodicConsolidation', () => {
       sessionId: session,
       occurredAt: new Date(T0 + day * DAY),
       hasClaim: claims,
+      // The graph the ingestion wrote this user's own facts to.
+      factGraph: userGraph(user),
       ...extra,
     });
   }
@@ -195,10 +197,40 @@ describe('EpisodicConsolidation', () => {
 
   it('a legacy episode without forUser counts for the owner only', async () => {
     for (let i = 0; i < 3; i++) {
-      await em.append({ episodeType: 'message-received', sessionId: `leg${i}`, occurredAt: new Date(T0), hasClaim: [await seedClaim()] });
+      await em.append({ episodeType: 'message-received', sessionId: `leg${i}`, occurredAt: new Date(T0), hasClaim: [await seedClaim()], factGraph: userGraph('owner') });
     }
     await job.run();
     expect(await graphsHolding(S, P, O)).toEqual([userGraph('owner')]);
+  });
+
+  it('episodes without a recorded fact graph are never promoted from (no guessing)', async () => {
+    for (let i = 0; i < 3; i++) {
+      await em.append({ episodeType: 'message-received', forUser: 'anna', sessionId: `nf${i}`, occurredAt: new Date(T0), hasClaim: [await seedClaim()] });
+    }
+    const r = await job.run();
+    expect(r.promoted).toBe(0);
+    expect(r.excluded.noFactGraphEpisodes).toBe(3);
+    expect(await graphsHolding(S, P, O)).toEqual([]);
+  });
+
+  it('promotes into the recorded fact graph, not into the cognitive key\'s graph', async () => {
+    for (let i = 0; i < 3; i++) await episode('owner', `fg${i}`, 0, [await seedClaim()], { factGraph: userGraph('u-7') });
+    expect((await job.run()).promoted).toBe(1);
+    expect(await graphsHolding(S, P, O)).toEqual([userGraph('u-7')]);
+  });
+
+  it('a fact graph that is not one of this agent\'s user graphs is refused', async () => {
+    for (let i = 0; i < 3; i++) await episode('anna', `bg${i}`, 0, [await seedClaim()], { factGraph: `urn:other:user:anna` });
+    const r = await job.run();
+    expect(r.promoted).toBe(0);
+    expect(r.excluded.noFactGraphEpisodes).toBe(3);
+  });
+
+  it('many messages of one session on one day are one group, however many transcript lines', async () => {
+    for (let i = 0; i < 4; i++) await episode('anna', 'one', 0, [await seedClaim()], { transcriptRef: `one.jsonl:line_${i * 2}` });
+    const r = await job.run();
+    expect(r.qualified).toBe(0);
+    expect(await graphsHolding(S, P, O)).toEqual([]);
   });
 
   it('a retracted claim does not count and a retracted promotion is not resurrected', async () => {

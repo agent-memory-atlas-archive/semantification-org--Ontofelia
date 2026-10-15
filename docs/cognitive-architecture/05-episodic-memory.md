@@ -298,12 +298,19 @@ owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
   the user whose episodes assert it. There is no worldview promotion path and no
   parameter that selects another graph. The owner's key is `owner`, so the
   owner's episodes promote into `urn:<agent>:user:owner`.
+- **Which graph.** The inbound episode records the graph the ingestion writes the
+  sender's own facts to (`cogt:factGraph`, `urn:<agent>:user:<sender id>`). The
+  promotion and the retraction cascade use exactly that graph, not the
+  cognitive user key (`cogt:forUser`, which only scopes the cognitive records;
+  for the owner it is always `owner`, whatever the sender id). Episodes without
+  `cogt:factGraph` (written before it existed) are never promoted from.
 - **Evidence never mixes users.** Episodes are read per user and counted only
   towards promotions into that user's graph.
 - **Count.** From the claims an episode stored (`cogt:hasClaim`): a triple
   `(s, p, o)` qualifies with at least K distinct episodes in at least Q distinct
-  evidence groups. A group is one session (transcriptRef, else sessionId) on one
-  UTC day. Setup keys on `urn:<agent>:setup:cognitive`:
+  evidence groups. A group is one session on one UTC day; the session is the
+  transcript reference without its line index, else the session id, so all
+  messages of one session on one day are one group. Setup keys on `urn:<agent>:setup:cognitive`:
   `cog:consolidationMinEpisodes` (K, default 3) and `cog:consolidationMinGroups`
   (Q, default 2); integers 1..100.
 - **Exclusions.** A claim that is not `accepted` (retracted claims no longer
@@ -342,7 +349,7 @@ owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
   `alreadyKnown`).
 - **Retraction cascade.** `memory_retract` also hard-deletes the retracting
   user's own `consolidation-episodic` copy of the same triple (triple, claim,
-  evidence) in the user graph of that user's cognitive key, then rebuilds the
+  evidence) in the user graph of that user (`urn:<agent>:user:<sender id>`), then rebuilds the
   inferred graph. Other users' graphs are never touched. The
   `consolidation-promoted` episode stays, so the ledger still blocks a
   re-promotion.
