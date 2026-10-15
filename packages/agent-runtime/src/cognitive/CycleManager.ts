@@ -41,6 +41,7 @@ import {
 import { WorkingMemory } from './WorkingMemory.js';
 import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
 import { looksLikeSecret } from './privacyClass.js';
+import { buildPerception, type Perception, type PerceptionSource } from './Perception.js';
 import {
   Metacognition,
   type ImpasseInput,
@@ -115,11 +116,20 @@ export type GoalContextProvider = (sessionId: string) => Promise<string | undefi
  */
 export type InboundEpisodeRecorder = (sessionId: string) => Promise<string | undefined>;
 
+/**
+ * Phase 1 hook. The core calls it once per turn with what it already computed
+ * (resolved entities, parse result, stored claims) and before the LLM call. It
+ * is pure and synchronous: the perception record is kept in memory for the later
+ * phases and written to the store only by the queued persist.
+ */
+export type PerceptionRecorder = (source: PerceptionSource) => Perception;
+
 /** The delegated core; receives the tool sink and the goal-context hook. */
 export type CoreFn<T> = (
   recordTool: ToolEpisodeRecorder,
   prepareGoals: GoalContextProvider,
   recordInbound: InboundEpisodeRecorder,
+  perceive: PerceptionRecorder,
 ) => Promise<T>;
 
 /** The delegated streaming core: yields the consumer's chunks as they happen. */
@@ -127,6 +137,7 @@ export type StreamCoreFn<C> = (
   recordTool: ToolEpisodeRecorder,
   prepareGoals: GoalContextProvider,
   recordInbound: InboundEpisodeRecorder,
+  perceive: PerceptionRecorder,
 ) => AsyncIterable<C>;
 
 export interface RunCycleOptions {
@@ -181,6 +192,21 @@ export interface RunCycleOptions {
    * conversational mode.
    */
   initiativeGoalUri?: string;
+}
+
+/**
+ * Instants measured in memory while a cycle runs; they become the phase
+ * boundaries (see {@link CycleManager.writeCycleAndPhases}).
+ */
+interface PhaseMarks {
+  cycleStart: Date;
+  /** The perception record was computed (end of Phase 1). */
+  perceivedAt?: Date;
+  /** The goal hook started / returned (Phase 3). */
+  goalStart?: Date;
+  goalEnd?: Date;
+  /** The core returned (end of Phase 5). */
+  coreEnd?: Date;
 }
 
 /** A flagged impasse paired with the resolution its subcycle chose (F3). */
@@ -329,7 +355,7 @@ export class CycleManager {
     let coreError: unknown;
     let status: 'completed' | 'aborted' = 'completed';
     try {
-      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound);
+      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive);
     } catch (e) {
       status = 'aborted';
       coreError = e;
@@ -379,7 +405,7 @@ export class CycleManager {
     let coreDone = false;
     let coreFailed = false;
     let status: 'completed' | 'aborted';
-    const inner = core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound);
+    const inner = core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive);
     try {
       for await (const chunk of inner) {
         try {
@@ -440,7 +466,24 @@ export class CycleManager {
     // goal-conflict impasse signal for the metacognitive subcycle (F2).
     let goalConflict = false;
     const mode = options.mode ?? 'conversational';
-    const prepareGoals: GoalContextProvider = async (sessionId) => {
+    // Phase 1 (perception) in memory, plus the phase boundaries measured as the
+    // hooks run. `perceivedAt` closes Phase 1; the goal hook brackets Phase 3.
+    let perception: Perception | undefined;
+    const marks: PhaseMarks = { cycleStart: startedAt };
+    const perceive: PerceptionRecorder = (source) => {
+      perception = buildPerception(
+        {
+          text: envelope.text || '',
+          senderId: envelope.sender?.id,
+          senderIsOwner: envelope.sender?.isOwner === true,
+          channel: envelope.channel ? String(envelope.channel) : undefined,
+        },
+        source,
+      );
+      marks.perceivedAt = new Date();
+      return perception;
+    };
+    const prepareGoalsInner: GoalContextProvider = async (sessionId) => {
       if (!options.goalsEnabled) return undefined;
       try {
         const gs = new GoalStack(
@@ -480,6 +523,14 @@ export class CycleManager {
         return undefined;
       }
     };
+    const prepareGoals: GoalContextProvider = async (sessionId) => {
+      marks.goalStart = new Date();
+      try {
+        return await prepareGoalsInner(sessionId);
+      } finally {
+        marks.goalEnd = new Date();
+      }
+    };
 
     // The inbound episode is written ahead of the core (conversational turns
     // only) so tools can reference it as a goal mandate. persist() reuses it
@@ -496,6 +547,7 @@ export class CycleManager {
           cycleId,
           startedAt,
           activeGoalUri,
+          perception,
         );
       } catch (e) {
         this.onError?.(e);
@@ -537,12 +589,14 @@ export class CycleManager {
           options.initiativeGoalUri,
           inboundEpisodeUri,
           options.episodicEnabled !== false,
+          perception,
+          { ...marks, coreEnd: endedAt },
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
     };
 
-    return { recordTool, prepareGoals, recordInbound, finish };
+    return { recordTool, prepareGoals, recordInbound, perceive, finish };
   }
 
   /**
@@ -744,9 +798,24 @@ export class CycleManager {
     initiativeGoalUri?: string,
     inboundEpisodeUri?: string,
     episodicEnabled = true,
+    perception?: Perception,
+    marks: PhaseMarks = { cycleStart: startedAt, coreEnd: endedAt },
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
-    await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri);
+    // Conversational turns write the perception record (computed before the LLM
+    // call); a turn whose core never reached the hook (the context build threw)
+    // gets the envelope-only record. Initiative turns keep the earlier write.
+    const record =
+      mode === 'initiative'
+        ? undefined
+        : (perception ??
+          buildPerception({
+            text: envelope.text || '',
+            senderId: envelope.sender?.id,
+            senderIsOwner: envelope.sender?.isOwner === true,
+            channel: envelope.channel ? String(envelope.channel) : undefined,
+          }));
+    await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record);
     const { retrievalHits } = episodicEnabled
       ? await this.writeEpisodicAndRetrieval(
       envelope,
@@ -759,6 +828,7 @@ export class CycleManager {
       toolEvents,
       activeGoalUri,
       inboundEpisodeUri,
+      record,
     )
       : { retrievalHits: 0 };
     // Initiative episode (docs/initiative-architecture.md §6): one auditable
@@ -799,6 +869,8 @@ export class CycleManager {
       endedAt,
       status,
       mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
+      marks,
+      toolEvents,
     );
     // Phase 6 reflection. With metacognition ON, detect impasses, run the
     // S1–S4 subcycle for each, and write the *full* marker; OFF restores the
@@ -1123,6 +1195,7 @@ export class CycleManager {
     cycleId: string,
     occurredAt: Date,
     activeGoalUri?: string,
+    perception?: Perception,
   ): Promise<string> {
     const channel = envelope.channel ? String(envelope.channel) : undefined;
     const actor = envelope.sender?.id
@@ -1144,7 +1217,20 @@ export class CycleManager {
       forUser: cogUserKey(envelope.sender),
       ...this.privacyOf(envelope.text),
       payload: envelope.text || '',
-      transcriptRef: `${sessionId}.jsonl`,
+      // Without a perception record (no hook ran) the episode is as before.
+      // With one, the transcript reference carries the line index of the user
+      // entry in the session JSONL (zero-based), e.g. `<session>.jsonl:line_12`.
+      transcriptRef:
+        perception?.transcriptLine !== undefined
+          ? `${sessionId}.jsonl:line_${perception.transcriptLine}`
+          : `${sessionId}.jsonl`,
+      ...(perception
+        ? {
+            about: perception.about,
+            tags: perception.tags,
+            hasClaim: perception.hasClaim,
+          }
+        : {}),
       partOfGoal: activeGoalUri,
     });
   }
@@ -1173,6 +1259,7 @@ export class CycleManager {
     toolEvents: ToolEpisodeEvent[] = [],
     activeGoalUri?: string,
     inboundEpisodeUri?: string,
+    perception?: Perception,
   ): Promise<{ retrievalHits: number }> {
     let retrievalHits = 0;
     const em = new EpisodicMemory(this.triplestore, this.agentId);
@@ -1184,7 +1271,7 @@ export class CycleManager {
     // conversational turn; see runCycle).
     const perceptionEpUri =
       inboundEpisodeUri ??
-      (await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri));
+      (await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri, perception));
 
     // C4 — pull relevant *past* episodes into the retrieval buffer (excluding
     // the one we just wrote for this turn).
@@ -1264,6 +1351,7 @@ export class CycleManager {
         ...this.privacyOf(responseText),
         payload: responseText,
         transcriptRef: `${sessionId}.jsonl`,
+        ...(perception ? { about: perception.about } : {}),
         partOfGoal: activeGoalUri,
       });
     }
@@ -1320,12 +1408,17 @@ export class CycleManager {
     });
   }
 
-  /** B5 — Phase 1 perception: message text and sender onto the perception buffer. */
+  /**
+   * B5 — Phase 1 perception onto the perception buffer. With a perception record
+   * its entries are written in order (message text, sender, channel, entities,
+   * claims, intent); without one (initiative turns) the earlier three entries.
+   */
   private async writePerception(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
     phaseUri: string,
+    perception?: Perception,
   ): Promise<void> {
     const wm = new WorkingMemory(
       this.triplestore,
@@ -1335,6 +1428,10 @@ export class CycleManager {
       cycleId,
       cogUserKey(envelope.sender),
     );
+    if (perception) {
+      for (const entry of perception.entries) await wm.write(entry, phaseUri);
+      return;
+    }
     const text = envelope.text || '';
     if (text) {
       await wm.write(
@@ -1374,6 +1471,8 @@ export class CycleManager {
     endedAt: Date,
     status: 'completed' | 'aborted',
     userKey: string,
+    marks: PhaseMarks = { cycleStart: startedAt, coreEnd: endedAt },
+    toolEvents: ToolEpisodeEvent[] = [],
   ): Promise<void> {
     const graph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
     this.registry.assertWritable(graph);
@@ -1390,19 +1489,47 @@ export class CycleManager {
       `<${cycleUri}> <${COGT}forUser> "${escapeLiteral(userKey)}" .`,
     ];
 
-    // Phase timings: 1-2 precede the core, 3-5 span it, 6 follows. With no
-    // sub-phase instrumentation in Phase B the cycle boundaries are the only
-    // honest timestamps, so phases share them accordingly.
-    const span = (ordinal: number): [string, string] => {
-      if (ordinal <= 2) return [tStart, tStart];
-      if (ordinal <= 5) return [tStart, tEnd];
-      return [tEnd, tEnd];
-    };
+    // Phase boundaries come from instants measured in memory while the cycle
+    // ran. Phase k spans [b[k-1], b[k]]:
+    //   b0 cycle start          b1 perception record computed
+    //   b2 goal hook started    b3 goal hook returned
+    //   b4 last tool completed  b5 core returned      b6 now (records written)
+    // Phase 1 therefore covers the context build and the perception compute;
+    // Phase 2 is reserved (no work yet) and spans the gap to the goal hook;
+    // Phase 4 ends with the last tool call (zero length on a turn without
+    // tools), Phase 5 is the rest of the core, Phase 6 is the reflection write.
+    // Boundaries are forced non-decreasing and the times are millisecond
+    // resolution, so a phase that finishes within one millisecond has zero length.
+    const lastToolDone = toolEvents
+      .filter((e) => e.phase === 'completed')
+      .reduce<Date | undefined>((m, e) => (!m || e.occurredAt > m ? e.occurredAt : m), undefined);
+    const raw: Array<Date | undefined> = [
+      marks.cycleStart,
+      marks.perceivedAt,
+      marks.goalStart,
+      marks.goalEnd,
+      lastToolDone,
+      marks.coreEnd ?? endedAt,
+      new Date(),
+    ];
+    const bounds: number[] = [];
+    raw.forEach((d, i) => {
+      const prev = i === 0 ? startedAt.getTime() : bounds[i - 1];
+      bounds.push(Math.max(prev, d ? d.getTime() : prev));
+    });
+    // The tool completion must not run past the end of the core.
+    bounds[4] = Math.min(bounds[4], bounds[5]);
+    bounds[3] = Math.min(bounds[3], bounds[4]);
+    const span = (ordinal: number): [string, string] => [
+      new Date(bounds[ordinal - 1]).toISOString(),
+      new Date(bounds[ordinal]).toISOString(),
+    ];
 
     PHASE_KINDS.forEach((kind, i) => {
       const ordinal = i + 1;
       const phaseUri = `${cycleUri}_${ordinal}`;
       const [s, e] = span(ordinal);
+      lines.push(`<${cycleUri}> <${COGT}hasPhase> <${phaseUri}> .`);
       lines.push(`<${phaseUri}> <${RDF_TYPE}> <${COGT}Phase> .`);
       lines.push(`<${phaseUri}> <${COGT}partOfCycle> <${cycleUri}> .`);
       lines.push(`<${phaseUri}> <${COGT}phaseKind> "${escapeLiteral(kind)}" .`);

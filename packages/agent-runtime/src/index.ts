@@ -15,7 +15,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
 import { CogCleanup, type CleanupReport } from './cognitive/CogCleanup.js';
-import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder } from './cognitive/CycleManager.js';
+import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder, type PerceptionRecorder } from './cognitive/CycleManager.js';
+import type { PerceptionSource } from './cognitive/Perception.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
 import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag } from './cognitive/CognitiveConfig.js';
@@ -631,7 +632,7 @@ If a greeting or onboarding template is written in another language, translate a
     return { note, extractedText: extracts.join('\n\n') };
   }
 
-  private async buildContext(envelope: MessageEnvelope): Promise<{ session: SessionRecord, origin: SessionOrigin, textContent: string, messages: ChatMessage[], resolvedWorkspace: string, currentModel: string, providerName: string, parseResult?: SemanticParseResult, bindingSection?: string }> {
+  private async buildContext(envelope: MessageEnvelope): Promise<{ session: SessionRecord, origin: SessionOrigin, textContent: string, messages: ChatMessage[], resolvedWorkspace: string, currentModel: string, providerName: string, parseResult?: SemanticParseResult, bindingSection?: string, perceptionSource: PerceptionSource }> {
       const origin = {
         channel: envelope.channel,
         chatType: envelope.chatType,
@@ -735,10 +736,16 @@ If a greeting or onboarding template is written in another language, translate a
         }
       }
 
+      // What perception reads later: the entities found, the facts stored from
+      // this message with their claim ids, and the transcript position.
+      const perceivedEntities: PerceptionSource['entities'] = [];
+      const storedClaims: PerceptionSource['storedClaims'] = [];
+
       // NER on user text → load entity-specific facts
       if (this.entityMatcher && this.knowledgeEngine) {
         try {
           const entities = await this.entityMatcher.extractEntities(textContent, this.agentId, origin.senderId);
+          perceivedEntities.push(...entities);
           this.emitDebug('ner', `Entities detected: ${entities.length}`, entities);
           if (entities.length > 0) {
             const entityNames = entities.map((e: { name: string }) => e.name);
@@ -795,6 +802,17 @@ If a greeting or onboarding template is written in another language, translate a
                   `Ingestion: ${ingestionReport.storedFacts.length} stored, ${ingestionReport.skippedFacts.length} skipped, ${ingestionReport.proposals.length} proposals`,
                   { stored: ingestionReport.storedFacts.length, skipped: ingestionReport.skippedFacts.length, proposals: ingestionReport.proposals.length, timeMs: ingestionReport.totalTimeMs }
                 );
+
+                for (const sf of ingestionReport.storedFacts) {
+                  if (sf.result.claimUri) {
+                    storedClaims.push({
+                      subject: sf.fact.subject,
+                      predicate: sf.fact.predicate,
+                      object: sf.fact.object,
+                      claimUri: sf.result.claimUri,
+                    });
+                  }
+                }
 
                 // Inject stored facts into system prompt
                 if (ingestionReport.storedFacts.length > 0) {
@@ -963,7 +981,17 @@ Users can use these commands:
         messages.push({ role: 'user', content: finalContent });
       }
       
-      return { session, origin, textContent: finalContent, messages, resolvedWorkspace, currentModel, providerName, parseResult, bindingSection };
+      return {
+        session, origin, textContent: finalContent, messages, resolvedWorkspace, currentModel, providerName, parseResult, bindingSection,
+        perceptionSource: {
+          entities: perceivedEntities,
+          parseResult,
+          storedClaims,
+          // The session store adds one transcript line per message, so its count
+          // at the start of the turn is the line index the user entry will get.
+          transcriptLine: session.messageCount,
+        },
+      };
   }
 
   /**
@@ -1160,7 +1188,7 @@ Users can use these commands:
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         return await this.cycleManager.runCycle(
           envelope,
-          (recordTool, prepareGoals, recordInbound) => this.runCore(envelope, recordTool, prepareGoals, recordInbound),
+          (recordTool, prepareGoals, recordInbound, perceive) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive),
           (r) => r.sessionId,
           (r) => r.text,
           {
@@ -1753,9 +1781,13 @@ Users can use these commands:
     prepareGoals?: GoalContextProvider,
     recordInbound?: InboundEpisodeRecorder,
     maxRounds: number = MAX_TOOL_ROUNDS,
+    perceive?: PerceptionRecorder,
   ): Promise<AgentResponse> {
       const ctx = await this.buildContext(envelope);
       const { session, origin, messages, resolvedWorkspace, currentModel } = ctx;
+
+      // Phase 1 — perceive before answering: in memory only, no store access.
+      perceive?.(ctx.perceptionSource);
 
       // Phase 4 (Phase D) — splice the `[Active goal]` section into the system
       // prompt once the session is known. Gated: on the legacy path prepareGoals
@@ -2020,7 +2052,7 @@ Users can use these commands:
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         yield* this.cycleManager.runCycleStream<StreamChunk>(
           envelope,
-          (recordTool, prepareGoals, recordInbound) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound),
+          (recordTool, prepareGoals, recordInbound, perceive) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound, perceive),
           (chunk) =>
             chunk.type === 'stream_start'
               ? { sessionId: chunk.sessionId }
@@ -2050,10 +2082,14 @@ Users can use these commands:
     recordTool?: ToolEpisodeRecorder,
     prepareGoals?: GoalContextProvider,
     recordInbound?: InboundEpisodeRecorder,
+    perceive?: PerceptionRecorder,
   ): AsyncGenerator<StreamChunk> {
     {
       const ctx = await this.buildContext(envelope);
       const { session, origin, messages, resolvedWorkspace, currentModel, providerName } = ctx;
+
+      // Phase 1 — same as runCore.
+      perceive?.(ctx.perceptionSource);
 
       // Same goal / skill / self prompt splice as runCore.
       if (prepareGoals) {
