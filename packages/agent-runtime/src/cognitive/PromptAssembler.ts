@@ -13,7 +13,7 @@
  *   [Active goal]        goalBuffer       the top goal verbatim, parents in one line
  *   [Recalled]           retrievalBuffer  episodes and facts from comprehension
  *   [Skills that worked …] retrievalBuffer learned skills and tool sequences
- *   [Note]               metaBuffer       carry-over notes (usually absent)
+ *   [Note]               metaBuffer       carry-over notes and the metacognition nudge (usually absent)
  *
  * The perception buffer is part of the in-memory view (and of the projection)
  * but is not rendered: the current message already is the conversation's last
@@ -26,7 +26,7 @@
  *   goalBuffer       salience ≥ θ; top goal verbatim, rest one line     3
  *   recalled         salience ≥ θ; best score first, rendered quoted   8
  *   skills           salience ≥ θ; best score first                    7 (5 + 2)
- *   metaBuffer       salience ≥ θ; "previously noted: …"                3
+ *   metaBuffer       salience ≥ θ; "previously noted: …", or a nudge    3
  *
  * Choices the doc leaves open: when the six self items must be cut, constraints
  * (salience 0.9) outlive capabilities (0.7); the recalled block shows no source
@@ -61,6 +61,7 @@
 
 import { projectGlobalWorkspace, DEFAULT_THETA, type BufferName } from './WorkingMemory.js';
 import { neutraliseQuoted } from './untrustedText.js';
+import { CHURN_ENTRY_KIND, CHURN_NOTE_TEXT, UNKNOWN_NUDGE_ENTRY_KIND, UNKNOWN_NUDGE_TEXT } from './Metacognition.js';
 
 /** Largest salience-≥θ items per block (see the table above). */
 export const MAX_ITEMS = { self: 6, goal: 3, recalled: 8, skills: 7, note: 3 } as const;
@@ -191,8 +192,25 @@ function renderSkills(items: WorkspaceEntry[]): string {
   return [SKILLS_HEADER, ...items.map((e) => `• ${e.text}`)].join('\n');
 }
 
+/**
+ * The metacognition nudges are our own fixed sentences: they are rendered from
+ * the constant for their kind, never from the entry text. Every other note is
+ * carried text and stays quoted as "previously noted".
+ */
+const NUDGE_LINES: Readonly<Record<string, string>> = {
+  [UNKNOWN_NUDGE_ENTRY_KIND]: UNKNOWN_NUDGE_TEXT,
+  [CHURN_ENTRY_KIND]: CHURN_NOTE_TEXT,
+};
+
 function renderNote(items: WorkspaceEntry[]): string {
-  return ['[Note]', ...items.map((e) => `- Previously noted: ${neutraliseQuoted(e.text, MAX_QUOTED_LINE)}`)].join('\n');
+  return [
+    '[Note]',
+    ...items.map((e) =>
+      NUDGE_LINES[e.entryKind] !== undefined
+        ? `- ${NUDGE_LINES[e.entryKind]}`
+        : `- Previously noted: ${neutraliseQuoted(e.text, MAX_QUOTED_LINE)}`,
+    ),
+  ].join('\n');
 }
 
 /** Name of a rendered block from its first line, e.g. `[Self]`, or undefined. */

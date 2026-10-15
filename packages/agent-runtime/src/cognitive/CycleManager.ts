@@ -56,6 +56,7 @@ import {
 } from './PromptAssembler.js';
 import type { AttentionSettings, PromptMode, PromptSettings } from './CognitiveConfig.js';
 import {
+  GOAL_TYPES,
   GoalStack,
   RESPOND_TO_USER,
   goalBelongsTo,
@@ -70,6 +71,7 @@ import {
   comprehend,
   type ComprehensionResult,
   type ComprehensionDeps,
+  type RecallEntry,
 } from './Comprehension.js';
 import {
   buildPerception,
@@ -80,6 +82,17 @@ import {
 } from './Perception.js';
 import {
   Metacognition,
+  CHURN_ENTRY_KIND,
+  CHURN_NOTE_TEXT,
+  CHURN_SALIENCE,
+  CHURN_TOOL_CALLS,
+  UNKNOWN_NUDGE_ENTRY_KIND,
+  UNKNOWN_NUDGE_SALIENCE,
+  UNKNOWN_NUDGE_TEXT,
+  conflictsOfTurn,
+  goalProgressOf,
+  isUnknownQuestion,
+  uncertaintyOf,
   type ImpasseInput,
   type ImpasseKind,
   type ReflectiveMarkerInput,
@@ -167,6 +180,14 @@ export type PerceptionRecorder = (source: PerceptionSource) => Perception;
  */
 export type ComprehensionRecorder = (sessionId: string) => Promise<ComprehensionResult | undefined>;
 
+/**
+ * Churn hook (metacognition). The core calls it for every tool call of a turn
+ * with the running count (1, 2, ...). At the {@link CHURN_TOOL_CALLS}th call,
+ * with metacognition on, the cycle keeps one `metaBuffer` warning for its queued
+ * persist; with metacognition off it does nothing.
+ */
+export type ToolCallHook = (callCount: number) => void;
+
 /** The delegated core; receives the tool sink and the phase hooks. */
 export type CoreFn<T> = (
   recordTool: ToolEpisodeRecorder,
@@ -174,6 +195,7 @@ export type CoreFn<T> = (
   recordInbound: InboundEpisodeRecorder,
   perceive: PerceptionRecorder,
   comprehendHook: ComprehensionRecorder,
+  onToolCall: ToolCallHook,
 ) => Promise<T>;
 
 /** The delegated streaming core: yields the consumer's chunks as they happen. */
@@ -254,6 +276,13 @@ export interface RunCycleOptions {
   /** θ and the token caps for the assembler; defaults apply when absent. */
   promptSettings?: PromptSettings;
   /**
+   * Canary of the "I don't know" nudge (metacognition on, live prompt): by
+   * default the nudge reaches the prompt of the owner only; `true` (setup key
+   * `cog.unknownNudgeAllUsers`) lets it reach every user. Shadow mode records it
+   * for every user either way.
+   */
+  unknownNudgeAllUsers?: boolean;
+  /**
    * Attention and carry-over (docs/cognitive-architecture/04 §6-§7, 07 §6). When
    * present, the queued persist carries the previous cycle's entries of the
    * same session and user into this cycle, applies the goal-steered salience
@@ -286,10 +315,33 @@ interface GoalExtras {
   choice?: { winner: string; losers: string[] };
   /** The implicit RespondToUser goal serving this cycle, resolved at its end. */
   implicitUri?: string;
+  /** What decided the turn's goal (see {@link GoalCause}); set by the conversational tree. */
+  cause?: GoalCause;
+}
+
+/**
+ * Why the turn's goal is the goal: `cue` (the message closed the top goal),
+ * `overlap` (its entities matched), `intent` (a new goal from the intent, or a
+ * follow-up of the same kind) are caused by the user; `carry` (no link to the
+ * message: the most recent open goal was kept), `armed` (a mandate or wake) and
+ * `implicit` are not.
+ */
+type GoalCause = 'cue' | 'overlap' | 'intent' | 'carry' | 'armed' | 'implicit';
+
+/** Per-turn observations the metacognition marker is derived from. */
+interface TurnSignals {
+  /** The top goal changed without a user trigger; undefined when not measured. */
+  goalDrift?: boolean;
+  /** Facts stored from this message, from the ingestion report. */
+  storedFacts: number;
 }
 
 /** Sessions (per user) whose newest working graph the carry-over remembers. */
 const LAST_CYCLE_MAX = 1000;
+/** Most conflicts of one turn that become a `ResolveConflict` goal. */
+const MAX_CONFLICT_GOALS = 3;
+/** Priority of a `ResolveConflict` goal: below the 0.7 of a goal the user asked for. */
+const CONFLICT_GOAL_PRIORITY = 0.5;
 /** How many levels of parent goals reach the goalBuffer. */
 const MAX_GOAL_PARENT_DEPTH = 5;
 
@@ -391,6 +443,12 @@ export class CycleManager {
    */
   private readonly lastCycle = new Map<string, string>();
   /**
+   * The top (non-implicit) goal of the newest turn, per session and user, to tell
+   * a goal drift from a goal the user chose. In memory and bounded: after a
+   * restart the first turn has nothing to compare with and reports no drift.
+   */
+  private readonly lastTopGoal = new Map<string, string>();
+  /**
    * (session, user) pairs whose stale implicit goals were already cleaned up by
    * this process (the first touch of a session; see {@link CycleManager.manageGoals}).
    */
@@ -485,7 +543,7 @@ export class CycleManager {
     let coreError: unknown;
     let status: 'completed' | 'aborted' = 'completed';
     try {
-      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive, cycle.comprehend);
+      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive, cycle.comprehend, cycle.onToolCall);
     } catch (e) {
       status = 'aborted';
       coreError = e;
@@ -598,11 +656,30 @@ export class CycleManager {
     // Goal lifecycle records of this turn, written by the queued persist.
     const goalExtras: GoalExtras = { events: [] };
     const mode = options.mode ?? 'conversational';
+    // Metacognition signals of a conversational turn (docs/cognitive-architecture
+    // 08 §3, §7). With the flag off none of this state is ever filled or written.
+    const mcOn = options.metacognitionEnabled === true && mode === 'conversational';
+    const signals: TurnSignals = { storedFacts: 0 };
+    // Meta entries collected during the turn; the queued persist writes them.
+    const metaWm: WMEntryInput[] = [];
+    let churnWritten = false;
+    const onToolCall: ToolCallHook = (callCount) => {
+      if (!mcOn || churnWritten || callCount < CHURN_TOOL_CALLS) return;
+      churnWritten = true; // once per turn
+      metaWm.push({
+        buffer: 'metaBuffer',
+        entryKind: CHURN_ENTRY_KIND,
+        payload: CHURN_NOTE_TEXT,
+        salience: CHURN_SALIENCE,
+        carryForward: false,
+      });
+    };
     // Phase 1 (perception) in memory, plus the phase boundaries measured as the
     // hooks run. `perceivedAt` closes Phase 1; the goal hook brackets Phase 3.
     let perception: Perception | undefined;
     const marks: PhaseMarks = { cycleStart: startedAt };
     const perceive: PerceptionRecorder = (source) => {
+      signals.storedFacts = source.storedFactCount ?? source.storedClaims.length;
       perception = buildPerception(
         {
           text: envelope.text || '',
@@ -703,6 +780,7 @@ export class CycleManager {
             : await this.manageInitiativeGoals(gs, options.initiativeGoalUri);
         const goal = managed.goal;
         goalConflict = managed.conflict;
+        if (mcOn) signals.goalDrift = this.noteTopGoal(sessionId, userKey, goal, goalExtras.cause);
         activeGoalUri = goal.uri;
         activeGoalType = goal.goalType;
         emitPhase('goal_management', 'Deliberation', { goalType: goal.goalType });
@@ -770,11 +848,18 @@ export class CycleManager {
       try {
         const legacy = await prepareGoalsInner(sessionId);
         if (promptMode === 'off') return legacy;
+        // The "I don't know" nudge: recorded in shadow for every user; in live
+        // mode it reaches the prompt of the owner, or of everyone when the
+        // setup key says so (canary).
+        const unknown = mcOn && isUnknownQuestion(perception?.intent, comprehension);
+        const unknownNudge =
+          unknown && (promptMode === 'shadow' || userKey === OWNER_USER_KEY || options.unknownNudgeAllUsers === true);
         return this.composeCognitivePrompt(promptMode, legacy, {
           perception,
           comprehension,
           phaseView,
           userKey,
+          unknownNudge,
           options,
           setShadow: (r) => {
             shadow = r;
@@ -825,6 +910,21 @@ export class CycleManager {
         this.logger.info({ agent: this.agentId, cycleId, phase: 'reflection', durationMs }, `cycle ${cycleId} completed in ${durationMs}ms`);
         emitPhase('reflection', 'Reflection');
       }
+      // The "I don't know" entry (question intent and an empty retrieval) and the
+      // churn warning, written by the queued persist; none with metacognition off.
+      const metaEntries: WMEntryInput[] = [];
+      if (mcOn) {
+        if (isUnknownQuestion(perception?.intent, comprehension)) {
+          metaEntries.push({
+            buffer: 'metaBuffer',
+            entryKind: UNKNOWN_NUDGE_ENTRY_KIND,
+            payload: UNKNOWN_NUDGE_TEXT,
+            salience: UNKNOWN_NUDGE_SALIENCE,
+            carryForward: false,
+          });
+        }
+        metaEntries.push(...metaWm);
+      }
       const queued = this.enqueuePersist(sessionId, () =>
         this.persist(
           envelope,
@@ -853,6 +953,8 @@ export class CycleManager {
           comprehension,
           {
             wm: queuedWm,
+            meta: metaEntries,
+            ...(mcOn ? { signals, conflictGoals: options.goalsEnabled === true } : {}),
             shadow,
             goal: goalExtras,
             ...(mode === 'conversational' && options.attention
@@ -864,7 +966,7 @@ export class CycleManager {
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
     };
 
-    return { recordTool, prepareGoals, recordInbound, perceive, comprehend: comprehendHook, finish };
+    return { recordTool, prepareGoals, recordInbound, perceive, comprehend: comprehendHook, onToolCall, finish };
   }
 
   /**
@@ -943,14 +1045,21 @@ export class CycleManager {
     const signal = detectGoalSignal(text, intent);
     if (signal && candidates.length === 0) {
       // A closer with nothing to close creates no goal ("passt" is not a topic).
-      return armed[0] ? { goal: armed[0], conflict: false } : this.implicitGoal(gs, userKey, extras);
+      if (armed[0]) {
+        extras.cause = 'armed';
+        return { goal: armed[0], conflict: false };
+      }
+      return this.implicitGoal(gs, userKey, extras);
     }
     if (signal) {
       const [top, ...rest] = candidates;
       await gs.setStatus(top.uri, signal === 'satisfied' ? 'resolved' : 'abandoned');
       candidates = rest;
       const next = candidates[0] ?? armed[0];
-      if (next) return { goal: next, conflict: false };
+      if (next) {
+        extras.cause = 'cue';
+        return { goal: next, conflict: false };
+      }
       return this.implicitGoal(gs, userKey, extras);
     }
 
@@ -960,6 +1069,7 @@ export class CycleManager {
       .sort((a, b) => entityOverlap(b.about, about) - entityOverlap(a.about, about) || byRecentIntent(a, b));
     if (overlapping.length > 0) {
       const winner = overlapping[0];
+      extras.cause = 'overlap';
       return this.decided(winner, overlapping.slice(1), extras);
     }
 
@@ -982,13 +1092,46 @@ export class CycleManager {
         about,
       });
       const created = await gs.get(uri);
-      if (created) return this.decided(created, candidates, extras);
+      if (created) {
+        extras.cause = 'intent';
+        return this.decided(created, candidates, extras);
+      }
     }
 
-    // No new goal: keep the earlier behaviour.
-    if (candidates.length > 0) return this.decided(candidates[0], candidates.slice(1), extras);
-    if (armed.length > 0) return { goal: armed[0], conflict: armed.length > 1 };
+    // No new goal: keep the earlier behaviour. A follow-up of the same kind is
+    // the user's doing; keeping the latest goal with no link to the message is not.
+    if (candidates.length > 0) {
+      extras.cause = wanted && followUp ? 'intent' : 'carry';
+      return this.decided(candidates[0], candidates.slice(1), extras);
+    }
+    if (armed.length > 0) {
+      extras.cause = 'armed';
+      return { goal: armed[0], conflict: armed.length > 1 };
+    }
     return this.implicitGoal(gs, userKey, extras);
+  }
+
+  /**
+   * Goal drift: the turn's top goal differs from the newest turn's top goal of
+   * this session and user, and the user did not cause the change (see
+   * {@link GoalCause}). The implicit RespondToUser goal is no top goal, so a turn
+   * that ends on it neither drifts nor leaves anything to compare with.
+   */
+  private noteTopGoal(sessionId: string, userKey: string, goal: Goal, cause: GoalCause | undefined): boolean {
+    const key = `${sessionId}\u0000${userKey}`;
+    const previous = this.lastTopGoal.get(key);
+    const top = goal.goalType === RESPOND_TO_USER ? undefined : goal.uri;
+    const drift =
+      previous !== undefined && top !== undefined && top !== previous && (cause === 'carry' || cause === 'armed');
+    this.lastTopGoal.delete(key);
+    if (top !== undefined) {
+      this.lastTopGoal.set(key, top);
+      if (this.lastTopGoal.size > LAST_CYCLE_MAX) {
+        const oldest = this.lastTopGoal.keys().next().value;
+        if (oldest !== undefined) this.lastTopGoal.delete(oldest);
+      }
+    }
+    return drift;
   }
 
   /** The goal of the turn when `losers` competed with it: record the choice. */
@@ -1005,6 +1148,7 @@ export class CycleManager {
     extras: GoalExtras,
   ): Promise<{ goal: Goal; conflict: boolean }> {
     const goal = await gs.ensureImplicit(new Date(), userKey);
+    extras.cause = 'implicit';
     if (goal.goalType === RESPOND_TO_USER) extras.implicitUri = goal.uri;
     return { goal, conflict: false };
   }
@@ -1135,6 +1279,7 @@ export class CycleManager {
       comprehension?: ComprehensionResult;
       phaseView: WorkspaceEntry[];
       userKey: string;
+      unknownNudge?: boolean;
       options: RunCycleOptions;
       setShadow: (r: ShadowRecord) => void;
       cycleId: string;
@@ -1162,6 +1307,15 @@ export class CycleManager {
         });
       }
       view.push(...ctx.phaseView);
+      if (ctx.unknownNudge) {
+        view.push({
+          buffer: 'metaBuffer',
+          entryKind: UNKNOWN_NUDGE_ENTRY_KIND,
+          text: UNKNOWN_NUDGE_TEXT,
+          salience: UNKNOWN_NUDGE_SALIENCE,
+          forUser: ctx.userKey,
+        });
+      }
       const settings = ctx.options.promptSettings;
       const assembled = assemblePrompt({
         entries: view,
@@ -1320,6 +1474,12 @@ export class CycleManager {
     comprehension?: ComprehensionResult,
     extras: {
       wm: WMEntryInput[];
+      /** Metacognition entries for the `metaBuffer` (the nudge, the churn warning). */
+      meta?: WMEntryInput[];
+      /** Per-turn observations; present only with metacognition on. */
+      signals?: TurnSignals;
+      /** Push a `ResolveConflict` goal for a conflict of the turn (metacognition and goals on). */
+      conflictGoals?: boolean;
       shadow?: ShadowRecord;
       goal?: GoalExtras;
       attention?: AttentionSettings;
@@ -1387,6 +1547,20 @@ export class CycleManager {
       } catch (e) {
         this.onError?.(e);
       }
+    }
+    // Meta entries (metacognition on only): the "I don't know" nudge, the churn warning.
+    if (extras.meta && extras.meta.length > 0) {
+      try {
+        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_6`, extras.meta, wmOpts);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
+    // Conflicts this turn surfaced in the sender's own data: a ResolveConflict goal each.
+    const conflicts =
+      extras.signals && comprehension ? conflictsOfTurn(comprehension.entries, startedAt.toISOString()) : [];
+    if (conflicts.length > 0 && extras.conflictGoals && extras.goal) {
+      await this.pushConflictGoals(envelope, sessionId, conflicts, extras.goal);
     }
     // Carry-over from the previous cycle and the goal-steered salience rules.
     if (extras.attention) {
@@ -1470,6 +1644,16 @@ export class CycleManager {
         selfModelEnabled,
         wmOverflow: overflow.dropped > 0 && extras.attention ? { dropped: overflow.dropped, capacity: extras.attention.capacity } : undefined,
         userKey: mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
+        ...(extras.signals
+          ? {
+              signals: extras.signals,
+              intent: record?.intent,
+              goalsResolved: (extras.goal?.events ?? []).filter(
+                (t) => t.kind === 'resolved' && t.goalType !== RESPOND_TO_USER,
+              ).length,
+              conflictCount: conflicts.length,
+            }
+          : {}),
       });
     } else {
       await this.writeReflectiveMarker(cycleUri, status);
@@ -1493,6 +1677,11 @@ export class CycleManager {
     selfModelEnabled: boolean;
     wmOverflow?: { dropped: number; capacity: number };
     userKey?: string;
+    /** Conversational turn with the new signals; absent for an initiative cycle. */
+    signals?: TurnSignals;
+    intent?: string;
+    goalsResolved?: number;
+    conflictCount?: number;
   }): Promise<void> {
     const meta = new Metacognition(this.triplestore, this.agentId);
 
@@ -1505,7 +1694,11 @@ export class CycleManager {
     const resolved: ResolvedImpasse[] = [];
     for (const input of impasses) {
       try {
-        const flagged = await meta.flagImpasse(input); // S1 meta-perception + S2 density
+        // Every impasse carries the user of the cycle, unless the detector set one.
+        const flagged = await meta.flagImpasse({
+          ...input,
+          ...(input.forUser === undefined && ctx.userKey ? { forUser: ctx.userKey } : {}),
+        }); // S1 meta-perception + S2 density
         this.logger.warn(
           { agent: this.agentId, kind: flagged.kind, chronic: flagged.chronic, phase: input.flaggedInPhase },
           `impasse flagged: ${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}`,
@@ -1548,18 +1741,91 @@ export class CycleManager {
           ? 'Cycle completed; no impasse.'
           : 'Cycle aborted; core delegation threw.';
 
+    // The metacognition signals of a conversational turn.
+    const emptyRetrieval = ctx.retrievalHits === 0;
+    const sig = ctx.signals;
+    const stepUpdates = ctx.toolEvents.filter(
+      (e) => e.toolName === 'update_goal_step' && e.phase === 'completed' && e.outcome === 'success',
+    ).length;
+    const goalProgress = sig
+      ? goalProgressOf({ stepUpdates, goalsResolved: ctx.goalsResolved ?? 0 })
+      : undefined;
+
     await meta.writeMarker({
       cycleUri: ctx.cycleUri,
       cycleStatus,
       toolsUsed,
       toolErrors,
-      emptyRetrieval: ctx.retrievalHits === 0,
+      emptyRetrieval,
       toolChurn: this.isToolChurn(ctx.toolEvents),
       constraintPressure,
       flaggedImpasse,
       resolvedImpasse,
       noted,
+      ...(ctx.userKey ? { forUser: ctx.userKey } : {}),
+      ...(sig
+        ? {
+            newKnowledge: String(sig.storedFacts),
+            uncertainty: uncertaintyOf({ emptyRetrieval, intent: ctx.intent, toolErrors }),
+            conflictSurfaced: ctx.conflictCount ?? 0,
+            ...(goalProgress ? { goalProgress } : {}),
+            ...(sig.goalDrift !== undefined ? { goalDrift: sig.goalDrift } : {}),
+          }
+        : {}),
     });
+  }
+
+  /**
+   * A `ResolveConflict` goal for each conflict the turn surfaced in the sender's
+   * own data (at most {@link MAX_CONFLICT_GOALS}); the goal belongs to the sender
+   * and is about the entity of the changed fact. A conflict the sender already
+   * has an open goal for is not pushed twice. The transition reaches the goal
+   * episodes through the turn's own list. Best-effort.
+   */
+  private async pushConflictGoals(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    conflicts: RecallEntry[],
+    extras: GoalExtras,
+  ): Promise<void> {
+    try {
+      const userKey = cogUserKey(envelope.sender);
+      const gs = new GoalStack(
+        this.triplestore,
+        this.registry,
+        this.agentId,
+        sessionId,
+        undefined,
+        this.viewerOf(envelope),
+        (t) => {
+          extras.events.push(t);
+        },
+      );
+      const open = (await gs.active()).filter(
+        (g) => g.goalType === GOAL_TYPES.ResolveConflict && goalBelongsTo(g, userKey),
+      );
+      for (const c of conflicts.slice(0, MAX_CONFLICT_GOALS)) {
+        const brief = c.payload.length > 80 ? `${c.payload.slice(0, 77)}...` : c.payload;
+        const label = `Resolve conflict: ${brief}`;
+        if (open.some((g) => g.goalLabel === label)) continue;
+        let about: string[] = [];
+        try {
+          sparqlIri(c.refersTo);
+          about = [c.refersTo];
+        } catch {
+          /* an unsafe IRI is left out */
+        }
+        await gs.push({
+          goalType: GOAL_TYPES.ResolveConflict,
+          goalLabel: label,
+          priority: CONFLICT_GOAL_PRIORITY,
+          forUser: userKey,
+          about,
+        });
+      }
+    } catch (e) {
+      this.onError?.(e);
+    }
   }
 
   /**

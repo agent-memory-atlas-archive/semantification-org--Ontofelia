@@ -259,6 +259,15 @@ background pass over `urn:<agent>:cog:meta` looks for:
 These produce **long-term goals** in `urn:<agent>:cog:goals:longterm` that
 appear in the user's next session.
 
+As implemented, the scan runs **per user**: every read is restricted to one
+`cogt:forUser` (the owner's scope also holds records written before the key
+existed), is bounded (newest 5000 rows) and compares instants, not strings. Every
+record the scan writes carries the user. Nothing is aggregated across users; the
+report returned to the owner covers the owner's scope only. The former
+`ReflectionRunner` body (worldview triple count, conflict detection, reflection
+event) lives in `reflectOnWorldview`; `ReflectionRunner.reflect` delegates to it,
+and `crossCycleScan` runs it for the owner scope when given a conflict detector.
+
 ---
 
 ## 7. The "I don't know" rule
@@ -280,6 +289,42 @@ cog:wm_meta_001 a cogt:WorkingMemoryEntry ;
 
 The high salience (1.0) means it always enters the prompt, where it
 nudges the LLM toward honest uncertainty rather than confabulation.
+
+### 7.1 As implemented
+
+- **Trigger.** The intent is `question` and Phase 2 finished cleanly (`status ok`)
+  with no entry. A degraded read (`partial`, `timeout`) never triggers: a failed
+  lookup is not an unknown.
+- **Entry.** `metaBuffer`, kind `unknown-nudge`, salience 1.0, `carryForward
+  false`, written for the sender by the queued persist. The prompt assembler
+  renders it in `[Note]` as one fixed, neutral sentence (answer that you do not
+  know rather than guess, or ask what is missing).
+- **Owner-only canary.** In live prompt mode the nudge reaches the prompt of the
+  owner only. The setup key `cog.unknownNudgeAllUsers` (boolean on the cognitive
+  config subject, default false) lets it reach every user. The entry is written
+  for every user either way. In shadow mode it is only recorded, for every user.
+- **Flags.** Everything needs `flagMetacognition`; the prompt effect needs
+  `flagWorkingMemoryPrompt` as well. With metacognition off nothing is written
+  and the prompt is byte-identical.
+
+### 7.2 Signals in the reflective marker (as implemented)
+
+| Signal | Value |
+|---|---|
+| `forUser` | the user key of the cycle (also on impasses raised by the cycle) |
+| `newKnowledge` | the number of facts the ingestion report stored for the message, as a string |
+| `goalDrift` | the top goal differs from the previous turn's top goal (same session and user) and the turn did not cause it: neither the message's intent, nor its entities, nor a closing cue. Only with the goal stack on. The previous top goal is held in memory, so the first turn after a restart reports no drift |
+| `goalProgress` | `N step update(s), M goal(s) resolved` for the cycle; absent when there are none |
+| `uncertainty` | `gap` = empty retrieval AND question intent; `errors` = tool calls that ended in an error. `high` if (gap and errors >= 1) or errors >= 3; `medium` if gap or errors >= 1; else `low` |
+| `conflictSurfaced` | the number of facts of the sender's own graph that were replaced during this turn |
+
+A conflict of the turn pushes a `ResolveConflict` goal (priority 0.5, for the
+sender, at most three per turn, never twice for the same fact) when the goal
+stack is on. Worldview facts and changes made before the turn do not count.
+
+The **churn warning** is a `metaBuffer` entry (kind `churn-warning`, salience
+0.8, `carryForward false`) recorded when the 5th tool call of a turn starts,
+once per turn, and written by the queued persist.
 
 ---
 

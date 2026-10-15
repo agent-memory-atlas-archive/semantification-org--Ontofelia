@@ -77,6 +77,11 @@ export interface PerceptionSource {
     objectUri?: string;
   }>;
   /**
+   * Number of facts the ingestion report says were stored for this message
+   * (the metacognition marker's `newKnowledge`). Absent when no ingestion ran.
+   */
+  storedFactCount?: number;
+  /**
    * Zero-based line index of the user entry in the session's JSONL transcript:
    * the session store's message count when the turn began (every append adds
    * exactly one line), so no file is read. Absent when unknown.

@@ -257,6 +257,20 @@ export class CognitiveConfig {
     return 'off';
   }
 
+  /**
+   * Setup key `cog.unknownNudgeAllUsers` (a boolean triple on the config
+   * subject, not a feature flag): when true, the "I don't know" nudge may reach
+   * the live prompt of every user. Default `false`: the owner only (canary).
+   * A missing, unparseable or unreadable value counts as false.
+   */
+  async unknownNudgeAllUsers(): Promise<boolean> {
+    try {
+      return await this.isFlagEnabled('unknownNudgeAllUsers');
+    } catch {
+      return false;
+    }
+  }
+
   /** θ and the token caps of the prompt assembler (see {@link PromptSettings}). */
   async promptSettings(): Promise<PromptSettings> {
     const [theta, recalled, total] = await Promise.all([

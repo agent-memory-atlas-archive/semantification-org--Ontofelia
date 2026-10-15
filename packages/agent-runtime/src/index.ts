@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
 import { CogCleanup, type CleanupReport } from './cognitive/CogCleanup.js';
-import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder, type PerceptionRecorder, type ComprehensionRecorder } from './cognitive/CycleManager.js';
+import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder, type PerceptionRecorder, type ComprehensionRecorder, type ToolCallHook } from './cognitive/CycleManager.js';
 import type { PerceptionSource } from './cognitive/Perception.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
@@ -734,6 +734,8 @@ If a greeting or onboarding template is written in another language, translate a
       // this message with their claim ids, and the transcript position.
       const perceivedEntities: PerceptionSource['entities'] = [];
       const storedClaims: PerceptionSource['storedClaims'] = [];
+      // Facts the ingestion report says were stored for this message.
+      let storedFactCount = 0;
 
       // NER on user text → load entity-specific facts
       if (this.entityMatcher && this.knowledgeEngine) {
@@ -797,6 +799,7 @@ If a greeting or onboarding template is written in another language, translate a
                   { stored: ingestionReport.storedFacts.length, skipped: ingestionReport.skippedFacts.length, proposals: ingestionReport.proposals.length, timeMs: ingestionReport.totalTimeMs }
                 );
 
+                storedFactCount = ingestionReport.storedFacts.length;
                 for (const sf of ingestionReport.storedFacts) {
                   if (sf.result.claimUri) {
                     storedClaims.push({
@@ -986,6 +989,7 @@ Users can use these commands:
           entities: perceivedEntities,
           parseResult,
           storedClaims,
+          storedFactCount,
           // The session store adds one transcript line per message, so its count
           // at the start of the turn is the line index the user entry will get.
           transcriptLine: session.messageCount,
@@ -1220,7 +1224,7 @@ Users can use these commands:
         const episodicRecallEnabled = await this.cognitiveConfig.isEpisodicRecallEnabled();
         return await this.cycleManager.runCycle(
           envelope,
-          (recordTool, prepareGoals, recordInbound, perceive, comprehend) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive, comprehend),
+          (recordTool, prepareGoals, recordInbound, perceive, comprehend, onToolCall) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive, comprehend, onToolCall),
           (r) => r.sessionId,
           (r) => r.text,
           {
@@ -1346,7 +1350,15 @@ Users can use these commands:
     if (!this.knowledgeEngine || !this.cognitiveConfig) return empty;
     if (!(await this.cognitiveConfig.isMetacognitionEnabled())) return empty;
     const meta = new Metacognition(this.knowledgeEngine['triplestore'], this.agentId);
-    return meta.crossCycleScan({ since, until });
+    const window = { since, until };
+    // Every other user is scanned on their own: their records stay theirs (the
+    // chronic impasse, capability gap and long-term goal carry their key) and
+    // nothing of it is added to the owner's report returned here.
+    for (const user of await meta.usersInWindow(window)) {
+      if (user === OWNER_USER_KEY) continue;
+      await meta.crossCycleScan(window, { forUser: user });
+    }
+    return meta.crossCycleScan(window, { forUser: OWNER_USER_KEY });
   }
 
   /**
@@ -1827,11 +1839,16 @@ Users can use these commands:
    * setup graph. With both flags off (the default) only the two flag reads
    * happen and the legacy prompt is built.
    */
-  private async promptOptions(): Promise<{ promptMode: PromptMode; promptSettings?: PromptSettings }> {
+  private async promptOptions(): Promise<{ promptMode: PromptMode; promptSettings?: PromptSettings; unknownNudgeAllUsers?: boolean }> {
     if (!this.cognitiveConfig) return { promptMode: 'off' };
     const promptMode = await this.cognitiveConfig.promptMode();
     if (promptMode === 'off') return { promptMode };
-    return { promptMode, promptSettings: await this.cognitiveConfig.promptSettings() };
+    return {
+      promptMode,
+      promptSettings: await this.cognitiveConfig.promptSettings(),
+      // Canary of the "I don't know" nudge: owner only unless the setup key says all users.
+      unknownNudgeAllUsers: await this.cognitiveConfig.unknownNudgeAllUsers(),
+    };
   }
 
   /**
@@ -1847,6 +1864,7 @@ Users can use these commands:
     maxRounds: number = MAX_TOOL_ROUNDS,
     perceive?: PerceptionRecorder,
     comprehend?: ComprehensionRecorder,
+    onToolCall?: ToolCallHook,
   ): Promise<AgentResponse> {
       const ctx = await this.buildContext(envelope);
       const { session, origin, messages, resolvedWorkspace, currentModel } = ctx;
@@ -1911,12 +1929,17 @@ Users can use these commands:
       const toolContext = this.buildToolContext(session, envelope, resolvedWorkspace);
       if (inboundEpisodeUri) toolContext.inboundEpisodeUri = inboundEpisodeUri;
 
+      let toolCallsInTurn = 0;
       while (response.finishReason === 'tool_calls' && rounds < maxRounds) {
         rounds++;
 
         const toolResults: ChatMessage[] = [];
         for (const toolCall of response.toolCalls) {
           this.emitDebug('tool_call', `Tool: ${toolCall.name}`, { name: toolCall.name, args: toolCall.arguments });
+          // Churn hook (metacognition): told the running count of tool calls of
+          // this turn. A no-op unless the cycle has metacognition on.
+          toolCallsInTurn++;
+          try { onToolCall?.(toolCallsInTurn); } catch { /* observation only */ }
           
           let toolArgs = {};
           try {
