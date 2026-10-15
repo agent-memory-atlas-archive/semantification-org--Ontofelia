@@ -40,7 +40,15 @@ import {
   type TraceInput,
   type SelfView,
 } from '@ontofelia/semantic-memory';
-import { WorkingMemory } from './WorkingMemory.js';
+import { WorkingMemory, type WMEntryInput } from './WorkingMemory.js';
+import {
+  assemblePrompt,
+  diffCognitiveBlocks,
+  type Assembled,
+  type BlockDiff,
+  type WorkspaceEntry,
+} from './PromptAssembler.js';
+import type { PromptMode, PromptSettings } from './CognitiveConfig.js';
 import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
 import { looksLikeSecret } from './privacyClass.js';
 import {
@@ -214,6 +222,17 @@ export interface RunCycleOptions {
    */
   episodicRecallEnabled?: boolean;
   /**
+   * How the cognitive prompt blocks are built (docs/cognitive-architecture/09
+   * §2). `off` (the default, and always for an unattended cycle): the legacy
+   * strings, byte for byte. `shadow`: the prompt assembler also runs and its
+   * output and a diff against the blocks actually sent are recorded; the prompt
+   * is unchanged. `live`: the blocks come from the assembler; the `[Recalled]`
+   * block additionally needs `episodicRecallEnabled`.
+   */
+  promptMode?: PromptMode;
+  /** θ and the token caps for the assembler; defaults apply when absent. */
+  promptSettings?: PromptSettings;
+  /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
    * unattended cycle: Phase 3 does NOT seed the implicit RESPOND_TO_USER goal
@@ -273,6 +292,21 @@ function newId(): string {
   return typeof globalThis.crypto?.randomUUID === 'function'
     ? globalThis.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/** Salience of the self-model entries written for the prompt assembler. */
+const SELF_SALIENCE = { capability: 0.7, constraint: 0.9 } as const;
+
+/**
+ * What the prompt assembler produced next to the prompt actually sent (shadow
+ * mode). Stored in the cycles graph by the queued persist.
+ */
+interface ShadowRecord {
+  assembledText: string;
+  tokens: number;
+  droppedForeign: number;
+  diff: BlockDiff;
+  cut: Assembled['cut'];
 }
 
 /** New skill traces after which a consolidation is requested (doc 06 §5). */
@@ -575,6 +609,16 @@ export class CycleManager {
         return undefined;
       }
     };
+    // Prompt assembler (docs/cognitive-architecture/09 §2). Only conversational
+    // turns use it; an unattended cycle always keeps the legacy strings.
+    const promptMode: PromptMode = mode === 'conversational' ? (options.promptMode ?? 'off') : 'off';
+    const userKey = cogUserKey(envelope.sender);
+    // Goal and self entries produced for the assembler; the queued persist writes
+    // them to working memory (nothing is awaited before the LLM call for them).
+    const queuedWm: WMEntryInput[] = [];
+    // Goal / skill / self entries of the in-memory working-memory view.
+    const phaseView: WorkspaceEntry[] = [];
+    let shadow: ShadowRecord | undefined;
     const prepareGoalsInner: GoalContextProvider = async (sessionId) => {
       if (!options.goalsEnabled) return undefined;
       try {
@@ -593,6 +637,11 @@ export class CycleManager {
         activeGoalType = goal.goalType;
         emitPhase('goal_management', 'Deliberation', { goalType: goal.goalType });
         const sections = [this.renderActiveGoal(goal)];
+        if (promptMode !== 'off') {
+          const body = sections[0].slice('[Active goal]\n'.length);
+          phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-active', text: body, salience: 1, forUser: userKey });
+          queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-active', payload: body, salience: 1, forGoal: goal.uri });
+        }
         // E4 — bias action selection with learned skills for this goal type.
         if (options.proceduralEnabled) {
           const skillsText = await this.surfaceSkillSuggestions(
@@ -602,12 +651,38 @@ export class CycleManager {
             goal.goalType,
             cogUserKey(envelope.sender),
           );
-          if (skillsText) sections.push(skillsText);
+          if (skillsText) {
+            sections.push(skillsText.text);
+            if (promptMode !== 'off') {
+              // Written to working memory by surfaceSkillSuggestions as before.
+              for (const it of skillsText.items) {
+                phaseView.push({
+                  buffer: 'retrievalBuffer',
+                  entryKind: it.kind,
+                  text: it.text,
+                  salience: it.score,
+                  retrievalScore: it.score,
+                  agentLevel: true,
+                  forUser: userKey,
+                });
+              }
+            }
+          }
         }
         // G2 — seed the `[Self]` block from the queryable self-model.
         if (options.selfModelEnabled) {
           const selfText = await this.renderSelfBlock(goal.goalType);
-          if (selfText) sections.push(selfText);
+          if (selfText) {
+            sections.push(selfText.text);
+            if (promptMode !== 'off') {
+              const add = (entryKind: 'capability' | 'constraint', text: string, salience: number) => {
+                phaseView.push({ buffer: 'selfBuffer', entryKind, text, salience, agentLevel: true, forUser: userKey });
+                queuedWm.push({ buffer: 'selfBuffer', entryKind, payload: text, salience });
+              };
+              for (const c of selfText.caps) add('capability', c, SELF_SALIENCE.capability);
+              for (const c of selfText.cons) add('constraint', c, SELF_SALIENCE.constraint);
+            }
+          }
         }
         return sections.join('\n\n');
       } catch (e) {
@@ -618,7 +693,19 @@ export class CycleManager {
     const prepareGoals: GoalContextProvider = async (sessionId) => {
       marks.goalStart = new Date();
       try {
-        return await prepareGoalsInner(sessionId);
+        const legacy = await prepareGoalsInner(sessionId);
+        if (promptMode === 'off') return legacy;
+        return this.composeCognitivePrompt(promptMode, legacy, {
+          perception,
+          comprehension,
+          phaseView,
+          userKey,
+          options,
+          setShadow: (r) => {
+            shadow = r;
+          },
+          cycleId,
+        });
       } finally {
         marks.goalEnd = new Date();
       }
@@ -689,6 +776,7 @@ export class CycleManager {
           pendingResolved ? undefined : options.resolveEntities,
           inboundAbout,
           comprehension,
+          { wm: queuedWm, shadow },
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
@@ -785,6 +873,78 @@ export class CycleManager {
   }
 
   /**
+   * Build the cognitive prompt blocks with the prompt assembler from this
+   * cycle's in-memory working-memory view (perception + comprehension + the
+   * goal, skill and self entries). Shadow: record the output and its diff
+   * against `legacy` (the text actually sent) and return `legacy`. Live: return
+   * the assembled text. Never throws: on a failure the legacy text goes out.
+   */
+  private composeCognitivePrompt(
+    mode: 'shadow' | 'live',
+    legacy: string | undefined,
+    ctx: {
+      perception?: Perception;
+      comprehension?: ComprehensionResult;
+      phaseView: WorkspaceEntry[];
+      userKey: string;
+      options: RunCycleOptions;
+      setShadow: (r: ShadowRecord) => void;
+      cycleId: string;
+    },
+  ): string | undefined {
+    try {
+      const view: WorkspaceEntry[] = [];
+      for (const e of ctx.perception?.entries ?? []) {
+        view.push({
+          buffer: e.buffer,
+          entryKind: e.entryKind,
+          text: e.payload,
+          salience: e.salience,
+          forUser: ctx.userKey,
+        });
+      }
+      for (const e of ctx.comprehension?.entries ?? []) {
+        view.push({
+          buffer: 'retrievalBuffer',
+          entryKind: e.kind,
+          text: e.payload,
+          salience: e.score,
+          retrievalScore: e.score,
+          forUser: e.forUser,
+        });
+      }
+      view.push(...ctx.phaseView);
+      const settings = ctx.options.promptSettings;
+      const assembled = assemblePrompt({
+        entries: view,
+        theta: settings?.theta,
+        userKey: ctx.userKey,
+        recallEnabled: ctx.options.episodicRecallEnabled === true,
+        recalledTokenCap: settings?.recalledTokenCap,
+        totalTokenCap: settings?.totalTokenCap,
+      });
+      if (mode === 'live') return assembled.text === '' ? undefined : assembled.text;
+      const diff = diffCognitiveBlocks(legacy, assembled.text);
+      ctx.setShadow({
+        assembledText: assembled.text,
+        tokens: assembled.tokens,
+        droppedForeign: assembled.droppedForeign,
+        diff,
+        cut: assembled.cut,
+      });
+      // Debug log: sizes and block names only, never the recalled text.
+      this.logger.debug(
+        { agent: this.agentId, cycleId: ctx.cycleId, tokens: assembled.tokens, droppedForeign: assembled.droppedForeign, diff },
+        `prompt shadow for cycle ${ctx.cycleId}`,
+      );
+      return legacy;
+    } catch (e) {
+      this.onError?.(e);
+      return legacy;
+    }
+  }
+
+  /**
    * E4 — surface the top learned skills/sequences for `goalType` into the
    * retrieval buffer (entryKind `skill-suggestion` / `sequence-suggestion`,
    * carrying a score) and render the `[Skills that worked]` prompt block
@@ -797,7 +957,7 @@ export class CycleManager {
     cycleUri: string,
     goalType: string,
     userKey: string,
-  ): Promise<string | undefined> {
+  ): Promise<{ text: string; items: Array<{ kind: string; text: string; score: number }> } | undefined> {
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
     const [skills, sequences] = await Promise.all([
       pm.suggestSkills(goalType, SKILL_SUGGESTION_K),
@@ -811,6 +971,7 @@ export class CycleManager {
     const pct = (n: number) => `${Math.round(n * 100)}%`;
 
     const lines: string[] = ['[Skills that worked before for this kind of goal]'];
+    const items: Array<{ kind: string; text: string; score: number }> = [];
     for (const s of skills) {
       await wm.write(
         {
@@ -828,6 +989,7 @@ export class CycleManager {
       if (s.satisfactionRate > 0) parts.push(`satisfied ${pct(s.satisfactionRate)}`);
       if (s.meanDurationMs > 0) parts.push(`~${Math.round(s.meanDurationMs)} ms avg`);
       lines.push(`• ${s.toolName} — ${parts.join(', ')}`);
+      items.push({ kind: 'skill-suggestion', text: lines[lines.length - 1].slice(2), score: s.score });
     }
     for (const seq of sequences) {
       await wm.write(
@@ -844,8 +1006,9 @@ export class CycleManager {
       );
       const chain = seq.steps.map((st) => st.toolName).join(' → ');
       lines.push(`• [sequence] ${chain} (${seq.successCount}×, ${pct(seq.successRate)} success)`);
+      items.push({ kind: 'sequence-suggestion', text: lines[lines.length - 1].slice(2), score: seq.successRate });
     }
-    return lines.join('\n');
+    return { text: lines.join('\n'), items };
   }
 
   /**
@@ -854,16 +1017,21 @@ export class CycleManager {
    * agent's constraints. Returns `undefined` when the self graph holds no
    * capabilities/constraints yet, so an unmigrated agent adds nothing.
    */
-  private async renderSelfBlock(goalType: string): Promise<string | undefined> {
+  private async renderSelfBlock(
+    goalType: string,
+  ): Promise<{ text: string; caps: string[]; cons: string[] } | undefined> {
     const sm = new SelfModel(this.triplestore, this.agentId);
     const view: SelfView = await sm.queryFor(goalType);
     if (view.capabilities.length === 0 && view.constraints.length === 0) return undefined;
     const lines: string[] = ['[Self]'];
+    const caps: string[] = [];
+    const cons: string[] = [];
     if (view.capabilities.length > 0) {
       lines.push('Capabilities relevant to this goal:');
       for (const c of view.capabilities) {
         const reqs = c.requires.length > 0 ? ` (uses ${c.requires.join(', ')})` : '';
         lines.push(`• ${c.label}${reqs}`);
+        caps.push(`${c.label}${reqs}`);
       }
     }
     if (view.constraints.length > 0) {
@@ -871,9 +1039,10 @@ export class CycleManager {
       for (const c of view.constraints) {
         const by = c.enforcedBy ? ` [${c.enforcedBy}]` : '';
         lines.push(`• ${c.label}${by}`);
+        cons.push(`${c.label}${by}`);
       }
     }
-    return lines.join('\n');
+    return { text: lines.join('\n'), caps, cons };
   }
 
   private async persist(
@@ -901,6 +1070,7 @@ export class CycleManager {
     resolveEntities?: RunCycleOptions['resolveEntities'],
     inboundAbout: string[] = [],
     comprehension?: ComprehensionResult,
+    extras: { wm: WMEntryInput[]; shadow?: ShadowRecord } = { wm: [] },
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     // Conversational turns write the perception record (computed before the LLM
@@ -943,6 +1113,14 @@ export class CycleManager {
     const retrievalHits = comprehension?.entries.length ?? 0;
     if (comprehension && retrievalHits > 0) {
       await this.writeRecall(envelope, sessionId, cycleId, `${cycleUri}_2`, comprehension);
+    }
+    // Goal and self entries produced for the prompt assembler (Phase 3).
+    if (extras.wm.length > 0) {
+      try {
+        await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_3`, extras.wm);
+      } catch (e) {
+        this.onError?.(e);
+      }
     }
     if (episodicEnabled) {
       await this.writeEpisodes(
@@ -999,6 +1177,13 @@ export class CycleManager {
       marks,
       toolEvents,
     );
+    if (extras.shadow) {
+      try {
+        await this.writePromptShadow(sessionId, cycleUri, cogUserKey(envelope.sender), extras.shadow);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
     // Phase 6 reflection. With metacognition ON, detect impasses, run the
     // S1–S4 subcycle for each, and write the *full* marker; OFF restores the
     // minimal Phase B marker exactly (the flag-off equivalence guarantee).
@@ -1404,6 +1589,56 @@ export class CycleManager {
         phaseUri,
       );
     }
+  }
+
+  /** Write the goal and self entries produced for the prompt assembler (queued persist). */
+  private async writeQueuedWm(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    phaseUri: string,
+    entries: WMEntryInput[],
+  ): Promise<void> {
+    const wm = new WorkingMemory(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      sessionId,
+      cycleId,
+      cogUserKey(envelope.sender),
+    );
+    for (const e of entries) await wm.write(e, phaseUri);
+  }
+
+  /**
+   * Shadow mode: store what the prompt assembler produced and how it differs
+   * from the blocks actually sent, as a `cogt:PromptShadow` of the cycle. It
+   * carries the cycle's `forUser`, like every record of the cycle.
+   */
+  private async writePromptShadow(
+    sessionId: string,
+    cycleUri: string,
+    userKey: string,
+    record: ShadowRecord,
+  ): Promise<void> {
+    const graph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
+    this.registry.assertWritable(graph);
+    const uri = `${cycleUri}_prompt`;
+    const summary = JSON.stringify({
+      diff: record.diff,
+      cut: record.cut,
+      droppedForeign: record.droppedForeign,
+    });
+    const lines = [
+      `<${uri}> <${RDF_TYPE}> <${COGT}PromptShadow> .`,
+      `<${uri}> <${COGT}partOfCycle> <${cycleUri}> .`,
+      `<${uri}> <${COGT}forUser> "${escapeLiteral(userKey)}" .`,
+      `<${uri}> <${COGT}createdAt> "${new Date().toISOString()}"^^<${XSD}dateTime> .`,
+      `<${uri}> <${COGT}assembledText> "${escapeLiteral(record.assembledText)}" .`,
+      `<${uri}> <${COGT}assembledTokens> "${Math.trunc(record.tokens)}"^^<${XSD}integer> .`,
+      `<${uri}> <${COGT}diffSummary> "${escapeLiteral(summary)}" .`,
+    ];
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
   }
 
   /**

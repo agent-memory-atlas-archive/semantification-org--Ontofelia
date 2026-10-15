@@ -13,12 +13,34 @@
 
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
+import { DEFAULT_THETA } from './WorkingMemory.js';
+import { DEFAULT_RECALLED_TOKEN_CAP, DEFAULT_TOTAL_TOKEN_CAP } from './PromptAssembler.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 
 /** IRI of the per-agent cognitive-config resource in the setup graph. */
 function configSubject(agentId: string): string {
   return `urn:${agentId}:setup:cognitive`;
+}
+
+/** How the cognitive prompt blocks are built for a message. */
+export type PromptMode = 'off' | 'shadow' | 'live';
+
+/**
+ * Prompt-assembler parameters from the setup graph, as numeric triples on the
+ * config subject `urn:<agent>:setup:cognitive`:
+ *
+ *   cog.salienceThreshold  θ in [0,1]; default 0.5
+ *   cog.recalledTokenCap   hard cap of the `[Recalled]` block, estimated
+ *                          tokens (chars / 4); default 600
+ *   cog.promptTokenCap     cap of all cognitive blocks together; default 1200
+ *
+ * A missing, unparseable or out-of-range value falls back to the default.
+ */
+export interface PromptSettings {
+  theta: number;
+  recalledTokenCap: number;
+  totalTokenCap: number;
 }
 
 /** One cognitive feature flag: its setup-graph name, short key and a one-line description. */
@@ -34,13 +56,15 @@ export interface CognitiveFlagInfo {
 export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
   { name: 'flagCycleManager', key: 'cycleManager', description: 'Route messages through the six-phase cognitive cycle.' },
   { name: 'flagEpisodicMemory', key: 'episodicMemory', description: 'Let the cycle write episodes (messages, tools, replies); arm_goal needs this.' },
-  { name: 'flagEpisodicRecall', key: 'episodicRecall', description: 'Allow the recalled episodes and facts to be injected into the prompt (recall itself follows the cycle flag; nothing is injected yet).' },
+  { name: 'flagEpisodicRecall', key: 'episodicRecall', description: 'Allow the recalled episodes and facts into the prompt; only the working-memory prompt mode renders them (recall itself follows the cycle flag).' },
   { name: 'flagGoalStack', key: 'goalStack', description: 'Manage an explicit goal stack in the cycle.' },
   { name: 'flagProceduralMemory', key: 'proceduralMemory', description: 'Record skill traces per tool call and suggest skills.' },
   { name: 'flagMetacognition', key: 'metacognition', description: 'Raise impasses and write the full reflective marker.' },
   { name: 'flagSelfModelQuery', key: 'selfModelQuery', description: 'Add a self-model block to the prompt.' },
   { name: 'flagRetention', key: 'retention', description: 'Let the retention sweep tier old episodes.' },
   { name: 'flagDebugPanel', key: 'debugPanel', description: 'Expose the read-only cognitive inspection routes.' },
+  { name: 'flagPromptShadow', key: 'promptShadow', description: 'Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged.' },
+  { name: 'flagWorkingMemoryPrompt', key: 'workingMemoryPrompt', description: 'Build the cognitive prompt blocks (self, goal, recalled, skills, note) from working memory instead of the legacy strings.' },
   { name: 'flagInitiative', key: 'initiative', description: 'Allow self-started goal wakes (kill switch for unattended work).' },
 ];
 
@@ -204,6 +228,37 @@ export class CognitiveConfig {
     return this.setFlag('flagEpisodicRecall', enabled);
   }
 
+  /**
+   * The prompt mode for a message: `live` when `flagWorkingMemoryPrompt` is on,
+   * else `shadow` when `flagPromptShadow` is on, else `off` (the default). Live
+   * wins when both are on; a read failure counts as off.
+   */
+  async promptMode(): Promise<PromptMode> {
+    try {
+      if (await this.isFlagEnabled('flagWorkingMemoryPrompt')) return 'live';
+      if (await this.isFlagEnabled('flagPromptShadow')) return 'shadow';
+    } catch {
+      /* fail closed to the legacy prompt */
+    }
+    return 'off';
+  }
+
+  /** θ and the token caps of the prompt assembler (see {@link PromptSettings}). */
+  async promptSettings(): Promise<PromptSettings> {
+    const [theta, recalled, total] = await Promise.all([
+      this.readNumber('salienceThreshold').catch(() => undefined),
+      this.readNumber('recalledTokenCap').catch(() => undefined),
+      this.readNumber('promptTokenCap').catch(() => undefined),
+    ]);
+    const cap = (v: number | undefined, dflt: number) =>
+      v !== undefined && Number.isInteger(v) && v >= 1 && v <= 1_000_000 ? v : dflt;
+    return {
+      theta: theta !== undefined && theta >= 0 && theta <= 1 ? theta : DEFAULT_THETA,
+      recalledTokenCap: cap(recalled, DEFAULT_RECALLED_TOKEN_CAP),
+      totalTokenCap: cap(total, DEFAULT_TOTAL_TOKEN_CAP),
+    };
+  }
+
   /** Read any flag on the {@link COGNITIVE_FLAGS} allowlist by its exact name. */
   async isEnabled(info: CognitiveFlagInfo): Promise<boolean> {
     return this.isFlagEnabled(info.name);
@@ -231,6 +286,20 @@ export class CognitiveConfig {
       } LIMIT 1`);
     const v = res.bindings?.[0]?.v?.value;
     return v === 'true' || v === '1';
+  }
+
+  /** Read one numeric `cog.<name>` triple; undefined when absent or not a number. */
+  private async readNumber(name: string): Promise<number | undefined> {
+    const graph = GraphUriResolver.getSetupGraph(this.agentId);
+    const subject = configSubject(this.agentId);
+    const res = await this.triplestore.query(`
+      SELECT ?v WHERE {
+        GRAPH <${graph}> { <${subject}> <${COGT}${name}> ?v }
+      } LIMIT 1`);
+    const raw = res.bindings?.[0]?.v?.value;
+    if (raw === undefined || raw.trim() === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
   }
 
   /** Replace one boolean `cog.<flag>` triple in the setup graph. */

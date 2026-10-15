@@ -326,5 +326,33 @@ for the Web UI.
       reasons — keeping the global workspace focused — not for cost. The render
       emits the full salience-≥θ slice; if a model's hard context limit is ever
       hit, the model-side limit truncates safely, and that is acceptable.
+      *Amended for the recall blocks:* once recalled text can reach the prompt
+      (`flagWorkingMemoryPrompt` with `flagEpisodicRecall`), the entry-count
+      caps alone let the cost grow with the user's history. The prompt
+      assembler (`cognitive/PromptAssembler.ts`) therefore adds a conservative
+      token ceiling for the cognitive blocks only; the rest of the prompt is
+      untouched. Tokens are estimated as characters / 4. The `[Recalled]` block
+      has a hard cap (default 600), all cognitive blocks together another
+      (default 1200); entries are cut whole, lowest score first (recalled) or
+      least important block first (total). Both are read per message from the
+      setup graph.
+
+### 10.1 Prompt assembler parameters (setup graph)
+
+Numeric triples on `urn:<agent>:setup:cognitive` in `urn:<agent>:setup`
+(predicates in the `cogt:` namespace `urn:shared:ontology#cog/`); a missing,
+unparseable or out-of-range value falls back to the default.
+
+| Predicate | Meaning | Default |
+|---|---|---|
+| `salienceThreshold` | θ, the global-workspace cutoff, 0 to 1 | 0.5 |
+| `recalledTokenCap` | hard cap of the `[Recalled]` block, estimated tokens | 600 |
+| `promptTokenCap` | cap of all cognitive blocks together | 1200 |
+
+Two flags choose the mode per message (both default off): `flagPromptShadow`
+runs the assembler beside the normal prompt and records its output and a block
+diff in the cycle graph (`cogt:PromptShadow`); `flagWorkingMemoryPrompt` builds
+the cognitive blocks from the assembler instead of the legacy strings. Live wins
+when both are on. The always-on graph context of the prompt is not replaced.
 
 Continue with [`05-episodic-memory.md`](05-episodic-memory.md).

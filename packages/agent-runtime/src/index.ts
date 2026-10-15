@@ -19,7 +19,8 @@ import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type 
 import type { PerceptionSource } from './cognitive/Perception.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
-import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag } from './cognitive/CognitiveConfig.js';
+import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag, type PromptMode, type PromptSettings } from './cognitive/CognitiveConfig.js';
+import { neutraliseLine } from './cognitive/untrustedText.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
 import { CogHealth, type CogHealthReport } from './cognitive/CogHealth.js';
 import {
@@ -174,16 +175,7 @@ const DIGEST_RENDER_MAX = 10;
  * clearly-delimited quoted section that tells the model it is untrusted.
  */
 export function sanitizeDigestMessage(message: string): string {
-  const oneLine = String(message ?? '')
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ') // control chars incl. newlines/tabs
-    .replace(/\s+/g, ' ')
-    .trim()
-    // Strip markdown structural lead-ins so no heading/quote/list/table/rule
-    // survives even after whitespace is collapsed.
-    .replace(/^[#>\-*`|=~+]+\s*/, '')
-    .trim();
-  if (oneLine.length <= DIGEST_LINE_MAX) return oneLine;
-  return `${oneLine.slice(0, DIGEST_LINE_MAX - 1).trimEnd()}…`;
+  return neutraliseLine(message, DIGEST_LINE_MAX);
 }
 
 /**
@@ -1233,6 +1225,7 @@ Users can use these commands:
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
             episodicRecallEnabled,
+            ...(await this.promptOptions()),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             // Surface the cognitive phases on the live debug stream so the
@@ -1813,6 +1806,19 @@ Users can use these commands:
   }
 
   /**
+   * Prompt-assembler options for one message (docs/cognitive-architecture/09
+   * §2): the mode from the two prompt flags, and θ and the token caps from the
+   * setup graph. With both flags off (the default) only the two flag reads
+   * happen and the legacy prompt is built.
+   */
+  private async promptOptions(): Promise<{ promptMode: PromptMode; promptSettings?: PromptSettings }> {
+    if (!this.cognitiveConfig) return { promptMode: 'off' };
+    const promptMode = await this.cognitiveConfig.promptMode();
+    if (promptMode === 'off') return { promptMode };
+    return { promptMode, promptSettings: await this.cognitiveConfig.promptSettings() };
+  }
+
+  /**
    * The legacy non-command message core: build context, call the provider with
    * tools, run the tool loop, apply fallbacks, and return the response. Shared
    * by both the legacy path and the CycleManager path (Phase B, B3).
@@ -2111,6 +2117,7 @@ Users can use these commands:
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
             episodicRecallEnabled,
+            ...(await this.promptOptions()),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),

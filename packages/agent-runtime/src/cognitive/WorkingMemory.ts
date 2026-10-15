@@ -115,7 +115,31 @@ const MAX_ENTRIES = 200;
 /** Salience multiplier applied to entries carried into the next cycle (§6). */
 const CARRY_DECAY = 0.7;
 /** Default global-workspace cutoff (doc 04 §4). */
-const DEFAULT_THETA = 0.5;
+export const DEFAULT_THETA = 0.5;
+
+/**
+ * The global-workspace projection on any list of entries: keep those with
+ * `salience ≥ θ`, ordered by the fixed buffer sequence and then by descending
+ * salience (stable, so equal entries keep their input order). This is the one
+ * piece of projection code: {@link WorkingMemory.globalWorkspace} applies it to
+ * the stored entries, the prompt assembler to the cycle's in-memory view.
+ */
+export function projectGlobalWorkspace<T extends { buffer: BufferName; salience: number }>(
+  entries: readonly T[],
+  theta = DEFAULT_THETA,
+): T[] {
+  const min = clamp01(theta);
+  return entries
+    .filter((e) => e.salience >= min)
+    .sort((a, b) => {
+      const ai = BUFFER_ORDER.indexOf(a.buffer);
+      const bi = BUFFER_ORDER.indexOf(b.buffer);
+      const ar = ai === -1 ? BUFFER_ORDER.length : ai;
+      const br = bi === -1 ? BUFFER_ORDER.length : bi;
+      if (ar !== br) return ar - br;
+      return b.salience - a.salience;
+    });
+}
 
 function clamp01(n: number): number {
   if (Number.isNaN(n)) return 0;
@@ -260,14 +284,7 @@ export class WorkingMemory {
    */
   async globalWorkspace(theta = DEFAULT_THETA): Promise<WMEntry[]> {
     const entries = await this.read({ minSalience: theta });
-    return entries.sort((a, b) => {
-      const ai = BUFFER_ORDER.indexOf(a.buffer);
-      const bi = BUFFER_ORDER.indexOf(b.buffer);
-      const ar = ai === -1 ? BUFFER_ORDER.length : ai;
-      const br = bi === -1 ? BUFFER_ORDER.length : bi;
-      if (ar !== br) return ar - br;
-      return b.salience - a.salience;
-    });
+    return projectGlobalWorkspace(entries, theta);
   }
 
   /** Additively adjust an entry's salience, clamped to [0,1]. */
