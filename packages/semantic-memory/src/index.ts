@@ -6,6 +6,7 @@ export * from './reasoning/ReasonableEngine.js';
 export * from './ontology/OntologyManager.js';
 export * from './reasoning/ConflictDetector.js';
 export * from './reflection/ReflectionRunner.js';
+export { reflectOnWorldview } from './reflection/worldviewReflection.js';
 export * from './KnowledgeEngine.js';
 export * from './ner/EntityMatcher.js';
 export * from './FusekiWatchdog.js';

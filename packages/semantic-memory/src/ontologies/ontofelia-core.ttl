@@ -367,7 +367,7 @@ cogt:OwnerRequestedWork rdfs:subClassOf cogt:GoalType ;
 
 cogt:ResolveConflict rdfs:subClassOf cogt:GoalType ;
     rdfs:label "Resolve Conflict" ;
-    rdfs:comment "Reserved: a goal raised by metacognition for a conflict. Not created yet." .
+    rdfs:comment "A goal raised by metacognition when a turn surfaced a conflict in the sender's own data (a fact the sender changed)." .
 
 cogt:CompletePlan rdfs:subClassOf cogt:GoalType ;
     rdfs:label "Complete Plan" ;
@@ -671,6 +671,9 @@ cogt:emptyRetrieval rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "empty retrieval" .
 cogt:goalDrift rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "goal drift" .
+cogt:conflictSurfaced rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:integer ; rdfs:label "conflict surfaced" ;
+    rdfs:comment "Number of conflicts in the sender's own data that this turn surfaced." .
 cogt:toolChurn rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "tool churn" .
 cogt:constraintPressure rdf:type owl:DatatypeProperty ;
