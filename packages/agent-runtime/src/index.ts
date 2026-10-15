@@ -25,7 +25,8 @@ import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/ar
 import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag, type PromptMode, type PromptSettings } from './cognitive/CognitiveConfig.js';
 import { neutraliseLine } from './cognitive/untrustedText.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
-import { CogHealth, type CogHealthReport } from './cognitive/CogHealth.js';
+import { CogHealth, type CogHealthReport, type SoakMetrics } from './cognitive/CogHealth.js';
+import { defaultsReport, applyDefaults, defaultOnFlags, DEFAULT_OFF_FLAGS, COGNITIVE_DEFAULTS_VERSION } from './cognitive/CognitiveDefaults.js';
 import {
   CogInspector,
   renderExplanation,
@@ -68,6 +69,7 @@ export type { GoalSummary } from './cognitive/goalSummary.js';
 // both read it). Re-exported so tests and the executor import ONE list.
 export { INITIATIVE_ALLOWED_TOOLS } from './initiativeTools.js';
 export { CognitiveConfig } from './cognitive/CognitiveConfig.js';
+export { seedDefaultsForFreshInstall, defaultOnFlags, COGNITIVE_DEFAULTS_VERSION } from './cognitive/CognitiveDefaults.js';
 // Owner-notification service (docs/initiative-architecture.md §7). Re-exported
 // so the gateway composition root can construct it, drop it into
 // InitiativeService as the real sink, and back the notify_owner tool with it.
@@ -1917,6 +1919,17 @@ Users can use these commands:
   }
 
   /**
+   * Soak metrics for the staged rollout (persist latency, graph sizes, impasse
+   * rate, dumps per turn). Numbers only, bounded reads. Owner surface only: the
+   * unauthenticated health route does not carry it.
+   */
+  async cogSoak(cycles?: number): Promise<SoakMetrics | undefined> {
+    if (!this.knowledgeEngine) return undefined;
+    const ch = new CogHealth(this.knowledgeEngine['triplestore'], this.agentId);
+    return ch.soak({ cycles, persist: this.cycleManager?.recentPersists() ?? [] });
+  }
+
+  /**
    * I — read-only inspection projection for the cognitive debug panel (doc 09
    * §10). Returns `undefined` when the knowledge engine is absent or the
    * debug-panel flag is off, so the panel is dev-gated and never exposed by
@@ -2630,15 +2643,18 @@ Users can use these commands:
       // debug on|off and migrate change state on the owner's behalf: they need
       // a live human owner turn, not a scheduler/cron/webhook/initiative envelope.
       const requiresHumanTurn =
-        sub === 'migrate' || sub === 'debug on' || sub === 'debug off' || sub === 'flags' || sub === 'flag' || sub.startsWith('flag ');
+        sub === 'migrate' || sub === 'debug on' || sub === 'debug off' || sub === 'flags' || sub === 'flag' || sub.startsWith('flag ') ||
+        sub === 'defaults apply';
       if (requiresHumanTurn && !isHumanOwnerTurn(envelope)) {
         return { text: 'This command needs a live owner turn.', sessionId: session.sessionId };
       }
       if (sub === 'health' || sub === '') {
         const health = await this.cogHealth();
+        // The soak metrics ride along on this owner-only command (numbers only).
+        const soak = health ? await this.cogSoak().catch(() => undefined) : undefined;
         return {
           text: health
-            ? '```json\n' + JSON.stringify(health, null, 2) + '\n```'
+            ? '```json\n' + JSON.stringify(soak ? { ...health, soak } : health, null, 2) + '\n```'
             : 'Cognitive architecture is not active (no knowledge engine).',
           sessionId: session.sessionId,
         };
@@ -2692,6 +2708,39 @@ Users can use these commands:
           lines.push(`• ${f.name} (${f.key.toLowerCase()}): ${on ? 'on' : 'off'} — ${f.description}`);
         }
         return { text: `⚙️ Cognitive flags:\n${lines.join('\n')}\nSet one with /cog flag <name> on|off.`, sessionId: session.sessionId };
+      }
+      // Default-on set for the cognitive layer: show the difference, or adopt it.
+      if (sub === 'defaults' || sub === 'defaults apply') {
+        if (!this.cognitiveConfig || !this.knowledgeEngine) {
+          return { text: 'Cognitive architecture is not active.', sessionId: session.sessionId };
+        }
+        const store = this.knowledgeEngine['triplestore'];
+        if (sub === 'defaults apply') {
+          const r = await applyDefaults(this.cognitiveConfig, store, this.agentId);
+          if (r.changed.includes('flagSelfModelQuery')) {
+            await this.seedDerivedSelfModelIfEnabled().catch((e) => this.emitDebug('error', `self-model derivation failed: ${(e as Error).message}`));
+          }
+          const left = Object.keys(DEFAULT_OFF_FLAGS).join(', ');
+          return {
+            text:
+              (r.changed.length > 0
+                ? `⚙️ Cognitive defaults applied. Turned on (${r.changed.length}): ${r.changed.join(', ')}.`
+                : '⚙️ Cognitive defaults applied. Nothing changed: every default flag was already on.') +
+              `\nStill off by design: ${left}. Setup keys were not touched. Undo any flag with /cog flag <name> off, or the whole layer with /cog cycle off.`,
+            sessionId: session.sessionId,
+          };
+        }
+        const rep = await defaultsReport(this.cognitiveConfig, store, this.agentId);
+        const lines = rep.rows.map((x) => `• ${x.name}: ${x.current ? 'on (no change)' : 'off -> on'}`);
+        const off = Object.entries(DEFAULT_OFF_FLAGS).map(([n, why]) => `• ${n}: stays off (${why})`);
+        const marker = rep.marker ? `Defaults last written ${rep.marker.at} (revision ${rep.marker.version}).` : 'The defaults were never written on this install.';
+        return {
+          text:
+            `⚙️ Cognitive defaults (revision ${COGNITIVE_DEFAULTS_VERSION}, on by default for new installs): ${rep.toChange.length} of ${defaultOnFlags().length} flags would change.\n` +
+            `${lines.join('\n')}\n${off.join('\n')}\n${marker}\n` +
+            'Adopt them with /cog defaults apply. That turns on only the flags above that are off or missing (also ones you switched off yourself), never changes setup keys, and writes the marker.',
+          sessionId: session.sessionId,
+        };
       }
       if (sub === 'flag' || sub.startsWith('flag ')) {
         if (!this.cognitiveConfig) {
@@ -2756,7 +2805,7 @@ Users can use these commands:
         const exp = await ins.explainResponse(session.sessionId, cycleId, OWNER_USER_KEY);
         return { text: renderExplanation(exp), sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|consolidate-episodes|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain [cycleId]]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|defaults [apply]|flags|flag <name> on|off|retain|consolidate|consolidate-episodes|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain [cycleId]]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.
@@ -2944,7 +2993,7 @@ Users can use these commands:
     }
 
     if (cmd === '/help') {
-      const ownerCommands = isOwner ? ', /goals, /initiative, /cog cycle on|off, /cog flags, /cog flag <name> on|off, /reseed-persona' : '';
+      const ownerCommands = isOwner ? ', /goals, /initiative, /cog cycle on|off, /cog flags, /cog flag <name> on|off, /cog defaults [apply], /reseed-persona' : '';
       return { text: `Available commands: /new, /reset, /status, /tools, /model, /skills, /plugins, /help, /stop${ownerCommands}`, sessionId: session.sessionId };
     }
     if (cmd === '/stop') {

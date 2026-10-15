@@ -7,6 +7,7 @@ import type { TriplestoreAdapter, MessageEnvelope, ChannelType } from '@ontofeli
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { seedExistingInstall } from './existingInstall.js';
 
 // The HTTP reseed (which the CLI command calls) re-derives the self-model like
 // /reseed-persona does: with the self-model flag on, after the persona, and a
@@ -30,6 +31,7 @@ describe('POST /api/ontology/reseed-self and the derived self-model', () => {
   beforeAll(async () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'reseed-self-'));
     process.env.HOME = tmpHome;
+    seedExistingInstall(tmpHome); // an existing install: nothing of the new-install defaults applies
     delete (globalThis as Record<symbol, unknown>)[Symbol.for('ontofelia-gateway-started')];
     const original = AgentRuntime.prototype.setStateDir;
     vi.spyOn(AgentRuntime.prototype, 'setStateDir').mockImplementation(function (this: AgentRuntime, dir: string) {

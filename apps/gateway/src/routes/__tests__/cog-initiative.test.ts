@@ -7,6 +7,7 @@ import { EpisodicMemory } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { seedExistingInstall } from './existingInstall.js';
 
 const auth = { authorization: 'Bearer test-secret' };
 const URL = '/api/cog/inspect/initiative';
@@ -22,6 +23,7 @@ describe('GET /api/cog/inspect/initiative', () => {
     // data under $HOME/.ontofelia, so point HOME at a throwaway directory.
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cog-initiative-'));
     process.env.HOME = tmpHome;
+    seedExistingInstall(tmpHome); // an existing install: nothing of the new-install defaults applies
     delete (globalThis as Record<symbol, unknown>)[Symbol.for('ontofelia-gateway-started')];
     // Capture the gateway's runtime on the first inspector gate check, so the
     // test can seed the very store the route reads from.

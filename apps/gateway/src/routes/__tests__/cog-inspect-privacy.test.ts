@@ -8,6 +8,7 @@ import { EpisodicMemory, GraphRegistry } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { seedExistingInstall } from './existingInstall.js';
 
 // The inspect routes read every user's cycles, goals and episodes. They need
 // the debug-panel flag AND the gateway's bearer token, and their output is
@@ -25,6 +26,7 @@ describe('/api/cog/inspect/* — owner credential and scope', () => {
   beforeAll(async () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cog-inspect-priv-'));
     process.env.HOME = tmpHome;
+    seedExistingInstall(tmpHome); // an existing install: nothing of the new-install defaults applies
     delete (globalThis as Record<symbol, unknown>)[Symbol.for('ontofelia-gateway-started')];
     const original = AgentRuntime.prototype.cogInspector;
     vi.spyOn(AgentRuntime.prototype, 'cogInspector').mockImplementation(function (this: AgentRuntime) {
