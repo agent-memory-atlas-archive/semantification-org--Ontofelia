@@ -91,6 +91,8 @@ export interface EpisodeInput {
   privacyClass?: 'secret';
   /** Entity IRIs this episode is about. */
   about?: string[];
+  /** IRIs of the claims stored from this episode's message (`cogt:hasClaim`). */
+  hasClaim?: string[];
   /** Explicit predecessor; when omitted, append() chains to the session's last. */
   precededBy?: string;
   partOfGoal?: string;
@@ -298,6 +300,7 @@ export class EpisodicMemory {
     if (ep.privacyClass === 'secret')
       lines.push(`<${uri}> <${CORE}privacyClass> "secret" .`);
     for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> ${sparqlIri(a)} .`);
+    for (const c of ep.hasClaim ?? []) lines.push(`<${uri}> <${COGT}hasClaim> ${sparqlIri(c)} .`);
     if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> ${sparqlIri(precededBy)} .`);
     if (ep.partOfGoal) lines.push(`<${uri}> <${COGT}partOfGoal> ${sparqlIri(ep.partOfGoal)} .`);
     if (ep.payload) lines.push(`<${uri}> <${COGT}payload> "${escapeLiteral(ep.payload)}" .`);

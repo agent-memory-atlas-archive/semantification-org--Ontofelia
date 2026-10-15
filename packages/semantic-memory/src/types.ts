@@ -48,4 +48,6 @@ export interface StoreResult {
   newEntities: string[];
   newProperties: string[];
   tripleCount: number;
+  /** IRI of the claim minted for this fact; absent for a duplicate (nothing stored). */
+  claimUri?: string;
 }

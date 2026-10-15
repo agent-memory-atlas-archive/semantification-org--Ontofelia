@@ -56,6 +56,18 @@ describe('EpisodicMemory', () => {
     expect(hit.precededBy).toBeUndefined(); // first in session
   });
 
+  it('stores hasClaim links for the claims of the episode', async () => {
+    const uri = await em.append({
+      episodeType: 'message-received',
+      sessionId: SESS,
+      hasClaim: ['urn:claim:a', 'urn:claim:b'],
+    });
+    const res = await store.query(
+      `SELECT ?c WHERE { GRAPH <${em.graphUri()}> { <${uri}> <urn:shared:ontology#cog/hasClaim> ?c } }`,
+    );
+    expect((res.bindings ?? []).map((b) => b.c.value).sort()).toEqual(['urn:claim:a', 'urn:claim:b']);
+  });
+
   it('chains precededBy to the previous episode of the session', async () => {
     const e1 = await em.append({ episodeType: 'message-received', sessionId: SESS, payload: 'one' });
     const e2 = await em.append({ episodeType: 'response-sent', sessionId: SESS, payload: 'two' });

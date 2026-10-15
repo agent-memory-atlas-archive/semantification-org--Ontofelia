@@ -164,6 +164,18 @@ export class KnowledgeEngine {
     return graphUri;
   }
 
+  /**
+   * The entity IRI a name maps to (the slug mapping `getFactsAbout` reads by).
+   * Pure string work, no store access; `undefined` for a name that is not a safe IRI.
+   */
+  entityUriFor(name: string): string | undefined {
+    try {
+      return this.toEntityUri(name);
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Convert a human-readable name to an entity URI */
   private toEntityUri(name: string): string {
     if (name.startsWith('urn:') || name.startsWith('http://') || name.startsWith('https://')) {
@@ -1694,7 +1706,8 @@ export class KnowledgeEngine {
       objectUri,
       newEntities,
       newProperties,
-      tripleCount: 1
+      tripleCount: 1,
+      claimUri: newClaimUri,
     };
   }
 

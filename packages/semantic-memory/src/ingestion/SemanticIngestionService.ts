@@ -29,6 +29,8 @@ export interface IngestionReport {
   proposals: ParsedOntologyProposal[];
   /** Total storage time in milliseconds */
   totalTimeMs: number;
+  /** IRIs of the claims minted for the stored facts, in storage order. */
+  claimUris: string[];
 }
 
 export interface StoredFactReport {
@@ -69,7 +71,7 @@ export class SemanticIngestionService {
 
     // If parse was skipped (trivial message), return empty report
     if (parseResult.meta.skipped) {
-      return { storedFacts, skippedFacts, proposals, totalTimeMs: Date.now() - start };
+      return { storedFacts, skippedFacts, proposals, totalTimeMs: Date.now() - start, claimUris: [] };
     }
 
     for (const fact of parseResult.facts) {
@@ -128,6 +130,7 @@ export class SemanticIngestionService {
       skippedFacts,
       proposals,
       totalTimeMs: Date.now() - start,
+      claimUris: storedFacts.flatMap((s) => (s.result.claimUri ? [s.result.claimUri] : [])),
     };
   }
 }
