@@ -9,7 +9,7 @@
  * so cross-session scans use a `GRAPH ?g` pattern rather than a fixed graph.
  */
 
-import type { TriplestoreAdapter } from '@ontofelia/core';
+import { compareIso, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
 import { CognitiveConfig } from './CognitiveConfig.js';
 
@@ -104,7 +104,7 @@ export class CogHealth {
       }`);
     const lastWrite = (stamps.bindings ?? [])
       .map((b) => b.o.value)
-      .sort()
+      .sort(compareIso)
       .pop();
     return { tripleCount: count.bindings?.length ?? 0, lastWrite };
   }

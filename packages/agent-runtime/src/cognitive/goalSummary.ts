@@ -3,6 +3,7 @@
  * `list_goals` tool, so the two can never disagree. Everything is derived from
  * the goal's stored fields — no LLM involved.
  */
+import { compareIsoDesc } from '@ontofelia/core';
 import type { GoalSummary } from '@ontofelia/tools';
 import type { Goal } from './GoalStack.js';
 
@@ -27,7 +28,7 @@ export function orderGoals<T extends Pick<Goal, 'status' | 'priority' | 'created
     (a, b) =>
       STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
       b.priority - a.priority ||
-      (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0),
+      compareIsoDesc(a.createdAt, b.createdAt),
   );
 }
 

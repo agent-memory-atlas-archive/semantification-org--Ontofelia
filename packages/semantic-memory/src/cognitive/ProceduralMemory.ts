@@ -19,7 +19,7 @@
  * aggregates.
  */
 
-import type { TriplestoreAdapter } from '@ontofelia/core';
+import { compareIso, compareIsoDesc, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
 import type { GraphRegistry } from '../utils/GraphRegistry.js';
 import { escapeSparqlStringContent } from '../utils/SparqlSyntax.js';
@@ -438,9 +438,9 @@ export class ProceduralMemory {
     const satisfiedCount = prevSatisfied + newSatisfied;
     const satisfactionRate = successCount === 0 ? 0 : clampRate(satisfiedCount / successCount);
 
-    const lastTrace = rows.reduce((a, b) => (a.executedAt > b.executedAt ? a : b));
+    const lastTrace = rows.reduce((a, b) => (compareIso(a.executedAt, b.executedAt) > 0 ? a : b));
     const lastUsedAt =
-      !prev?.lastUsedAt || lastTrace.executedAt > prev.lastUsedAt
+      !prev?.lastUsedAt || compareIso(lastTrace.executedAt, prev.lastUsedAt) > 0
         ? lastTrace.executedAt
         : prev.lastUsedAt;
 
@@ -457,7 +457,7 @@ export class ProceduralMemory {
     // Ring buffer of the last 10 trace links.
     const keepTraces = rows
       .slice()
-      .sort((a, b) => (a.executedAt < b.executedAt ? 1 : -1))
+      .sort((a, b) => compareIsoDesc(a.executedAt, b.executedAt))
       .slice(0, 10);
 
     // Replace the whole skill row, then re-insert.

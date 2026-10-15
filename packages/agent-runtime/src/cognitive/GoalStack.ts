@@ -18,7 +18,7 @@
  *    active set, so sorting in-process is both safe and cheap.
  */
 
-import { OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
+import { OWNER_USER_KEY, compareIsoDesc, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphRegistry, GraphUriResolver, sparqlIri } from '@ontofelia/semantic-memory';
 
 const COGT = 'urn:shared:ontology#cog/';
@@ -718,14 +718,14 @@ export class GoalStack {
     return goals.sort(
       (a, b) =>
         b.priority - a.priority ||
-        (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0),
+        compareIsoDesc(a.createdAt, b.createdAt),
     );
   }
 
   /** Every goal in both graphs, any status (read-only; for inspection/UI). */
   async list(): Promise<Goal[]> {
     const goals = await this.readWhere('');
-    return goals.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    return goals.sort((a, b) => compareIsoDesc(a.createdAt, b.createdAt));
   }
 
   /** Fetch a single goal by IRI (searches both graphs). */

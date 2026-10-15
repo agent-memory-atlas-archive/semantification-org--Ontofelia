@@ -25,6 +25,7 @@
 import {
   OWNER_USER_KEY,
   cogUserKey,
+  compareIsoDesc,
   createLogger,
   isHumanOwnerTurn,
   type MessageEnvelope,
@@ -294,7 +295,7 @@ const MAX_GOAL_PARENT_DEPTH = 5;
 
 /** Most recent intent first (creation time), then higher priority. */
 function byRecentIntent(a: Goal, b: Goal): number {
-  return a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : b.priority - a.priority;
+  return compareIsoDesc(a.createdAt, b.createdAt) || b.priority - a.priority;
 }
 
 /**
