@@ -87,12 +87,14 @@ describe('attention and carry-over in the cycle', () => {
     const res = await store.query(`SELECT DISTINCT ?g WHERE { GRAPH ?g { ?e a <${COGT}WorkingMemoryEntry> ;
       <${COGT}writtenAt> ?t } FILTER(STRSTARTS(STR(?g), "${prefix}")) }`);
     const gs = (res.bindings ?? []).map((b) => b.g.value);
-    const times = new Map<string, string>();
+    const times = new Map<string, number>();
     for (const g of gs) {
       const r = await store.query(`SELECT ?t WHERE { GRAPH <${g}> { ?e <${COGT}writtenAt> ?t } } ORDER BY ASC(?t) LIMIT 1`);
-      times.set(g, r.bindings?.[0]?.t?.value ?? '');
+      // The store drops trailing zeros of the fraction ("41.4Z" for .400), so
+      // the strings do not sort as time: compare the parsed instants.
+      times.set(g, Date.parse(r.bindings?.[0]?.t?.value ?? ''));
     }
-    return gs.sort((a, b) => (times.get(a)! < times.get(b)! ? -1 : 1));
+    return gs.sort((a, b) => times.get(a)! - times.get(b)!);
   }
   const cycleOf = (g: string) => g.slice(`urn:${AGENT}:cog:working:${sess}:`.length);
   const wmFor = (cycle: string, user = 'alice', s = sess) =>
