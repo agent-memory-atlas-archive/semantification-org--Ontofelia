@@ -434,9 +434,11 @@ cogt:hasConstraint rdf:type owl:ObjectProperty ;
 cogt:relevantToGoalType rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Capability ; rdfs:label "relevant to goal type" .
 cogt:requiresApproval rdf:type owl:ObjectProperty ;
-    rdfs:label "requires approval" .
+    rdfs:label "requires approval" ;
+    rdfs:comment "A tool (urn:tool:<name>) that is denied-by-default or gated by the guardian until the owner approves. Derived; asserted on the derived profile." .
 cogt:authorityOver rdf:type owl:ObjectProperty ;
-    rdfs:label "authority over" .
+    rdfs:label "authority over" ;
+    rdfs:comment "A tool (urn:tool:<name>) the agent may use without asking. Derived; asserted on the derived profile." .
 cogt:owner rdf:type owl:ObjectProperty ;
     rdfs:label "owner" .
 cogt:operatesIn rdf:type owl:ObjectProperty ;
@@ -449,6 +451,50 @@ cogt:enforcedBy rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Constraint ; rdfs:range xsd:string ; rdfs:label "enforced by" .
 cogt:ownerRelation rdf:type owl:DatatypeProperty ;
     rdfs:range xsd:string ; rdfs:label "owner relation" .
+
+# Derived self-model: capabilities and constraints computed from the tool
+# registry, the tool policy, the guardian policy and the behavior directives
+# (SelfModel.reseedDerived). Everything below lives on nodes under
+# urn:<agent>:self#derived/ or on the self-model subject; none of it is written
+# on the bootstrap persona subject.
+cogt:DerivedSelfProfile rdf:type owl:Class ;
+    rdfs:label "Derived self profile" ;
+    rdfs:comment "One node per agent holding the derived autonomy level, owner relation and the approval / authority tool sets. Replaced wholesale on every re-derivation." .
+
+cogt:Principal rdf:type owl:Class ;
+    rdfs:label "Principal" ;
+    rdfs:comment "A party the agent answers to, e.g. the owner who approves gated tools. Carries no personal data." .
+
+cogt:hasDerivedProfile rdf:type owl:ObjectProperty ;
+    rdfs:range cogt:DerivedSelfProfile ; rdfs:label "has derived profile" .
+
+cogt:autonomyLevel rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:DerivedSelfProfile ; rdfs:range xsd:string ; rdfs:label "autonomy level" ;
+    rdfs:comment "restricted (no tool usable without approval) | semi-autonomous (some tool needs approval) | autonomous (no tool needs approval). Computed from the tool verdicts, not configured." .
+
+cogt:policyStatus rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Capability ; rdfs:range xsd:string ; rdfs:label "policy status" ;
+    rdfs:comment "allowed | needs-approval | denied. The verdict of the tool policy combined with the guardian for a tool, as seen by the owner. It says what the policy lets the agent attempt, not that the agent is good at it." .
+
+cogt:derivedFrom rdf:type owl:DatatypeProperty ;
+    rdfs:range xsd:string ; rdfs:label "derived from" ;
+    rdfs:comment "tool-registry | tool-policy | guardian-policy | behavior-directive. Present only on derived nodes; learned nodes never carry it." .
+
+cogt:constraintScope rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Constraint ; rdfs:range xsd:string ; rdfs:label "constraint scope" ;
+    rdfs:comment "For a constraint derived from a behavior directive: the directive's scope." .
+
+cogt:derivedLabel rdf:type owl:DatatypeProperty ;
+    rdfs:range xsd:string ; rdfs:label "derived label" ;
+    rdfs:comment "Human-readable name of a derived node. Deliberately not rdfs:label, so derived nodes never take part in entity resolution by label." .
+
+cogt:derivedNote rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Capability ; rdfs:range xsd:string ; rdfs:label "derived note" ;
+    rdfs:comment "One neutralised line taken from the tool description at derivation time. Stored for queries; never rendered into a prompt." .
+
+cogt:basedOn rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Constraint ; rdfs:label "based on" ;
+    rdfs:comment "The behavior directive a derived constraint was derived from. Only ever the object of a triple: the directive itself stays owned by the bootstrap persona." .
 
 # === Structural object properties ===
 cogt:partOfCycle rdf:type owl:ObjectProperty ;

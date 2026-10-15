@@ -106,8 +106,19 @@ export interface ToolCall {
   arguments: string; // JSON string
 }
 
+/**
+ * Why a tool call did not run, as decided by the dispatch chokepoint:
+ * `policy-denied` (tool policy, self-protection, initiative gate or sandbox
+ * requirement refused it), `guardian-approval-required` (the call needed an
+ * owner approval that was not granted) or `error` (any other failure, e.g. the
+ * tool threw, timed out or does not exist).
+ */
+export type ToolDenialClass = 'policy-denied' | 'guardian-approval-required' | 'error';
+
 export interface ToolResult {
   success: boolean;
+  /** Set on a failed result; absent on success. */
+  denialClass?: ToolDenialClass;
   output: unknown;
   error?: string;
   artifacts?: ToolArtifact[];

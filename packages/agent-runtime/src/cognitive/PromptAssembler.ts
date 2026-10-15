@@ -60,7 +60,7 @@
  */
 
 import { projectGlobalWorkspace, DEFAULT_THETA, type BufferName } from './WorkingMemory.js';
-import { neutraliseQuoted } from './untrustedText.js';
+import { neutraliseLine, neutraliseQuoted } from './untrustedText.js';
 import { CHURN_ENTRY_KIND, CHURN_NOTE_TEXT, UNKNOWN_NUDGE_ENTRY_KIND, UNKNOWN_NUDGE_TEXT } from './Metacognition.js';
 
 /** Largest salience-≥θ items per block (see the table above). */
@@ -71,6 +71,8 @@ export const DEFAULT_RECALLED_TOKEN_CAP = 600;
 export const DEFAULT_TOTAL_TOKEN_CAP = 1200;
 /** Longest recalled / note line, in characters (matches the retrieval payload bound). */
 export const MAX_QUOTED_LINE = 400;
+/** Longest `[Self]` line, in characters. */
+const MAX_SELF_LINE = 240;
 
 /** The block names, in render order. */
 export const BLOCK_ORDER = ['Self', 'Active goal', 'Recalled', 'Skills that worked', 'Note'] as const;
@@ -158,11 +160,11 @@ function renderSelf(items: WorkspaceEntry[]): string {
   const lines = ['[Self]'];
   if (caps.length > 0) {
     lines.push('Capabilities relevant to this goal:');
-    for (const c of caps) lines.push(`• ${c.text}`);
+    for (const c of caps) lines.push(`• ${neutraliseLine(c.text, MAX_SELF_LINE)}`);
   }
   if (cons.length > 0) {
     lines.push('Constraints I must respect:');
-    for (const c of cons) lines.push(`• ${c.text}`);
+    for (const c of cons) lines.push(`• ${neutraliseLine(c.text, MAX_SELF_LINE)}`);
   }
   return lines.join('\n');
 }

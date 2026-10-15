@@ -9,6 +9,7 @@ import { PluginRegistry } from '@ontofelia/plugins';
 import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, GraphUriResolver } from '@ontofelia/semantic-memory';
 import type { SemanticParseResult, ConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
 import { GoalStack } from './cognitive/GoalStack.js';
+import { seedDerivedSelfModel } from './cognitive/SelfModelSources.js';
 import { directGoalEpisodeSink } from './cognitive/GoalEpisodes.js';
 import { INITIATIVE_ALLOWED_TOOLS } from './initiativeTools.js';
 import * as fs from 'fs/promises';
@@ -375,7 +376,25 @@ export class AgentRuntime {
       }
     }
 
+    // Derived self-model (capabilities and constraints from the real tool
+    // registry and policies). Only with the self-model flag on: with it off the
+    // self graph is not touched and nothing reaches the prompt. A failure here
+    // must never keep the agent from starting.
+    await this.seedDerivedSelfModelIfEnabled().catch((e) => this.emitDebug('error', `self-model derivation failed: ${(e as Error).message}`));
+
     this.lifecycle = 'running';
+  }
+
+  /**
+   * (Re)derive the self-model from the tool registry, tool policy, guardian
+   * policy and behavior directives, when `cog.flagSelfModelQuery` is on.
+   * Idempotent. Returns the report, or undefined when nothing was done (flag
+   * off, no knowledge engine).
+   */
+  async seedDerivedSelfModelIfEnabled(): Promise<{ capabilities: number; constraints: number } | undefined> {
+    if (!this.knowledgeEngine || !this.cognitiveConfig) return undefined;
+    if (!(await this.cognitiveConfig.isSelfModelQueryEnabled())) return undefined;
+    return seedDerivedSelfModel(this.knowledgeEngine['triplestore'], this.agentId, this.toolRegistry, this.toolPolicy);
   }
 
   pause(): void {
@@ -1970,6 +1989,7 @@ Users can use these commands:
               outcome: 'error',
               durationMs: Date.now() - toolStart,
               errorClass: 'guardian-denied',
+              denialClass: 'guardian-approval-required',
             });
             toolResults.push(this.guardianDeniedMessage(toolCall));
             continue;
@@ -1986,6 +2006,7 @@ Users can use these commands:
             outcome: result.success ? 'success' : 'error',
             durationMs: Date.now() - toolStart,
             errorClass: result.success ? undefined : (result.error ? 'tool-error' : undefined),
+            denialClass: result.success ? undefined : (result.denialClass ?? 'error'),
           });
 
           toolResults.push({
@@ -2315,6 +2336,7 @@ Users can use these commands:
                 outcome: 'error',
                 durationMs: Date.now() - toolStart,
                 errorClass: 'guardian-denied',
+                denialClass: 'guardian-approval-required',
               });
               const errOut = this.guardianDeniedPayload();
               yield { type: 'tool_result', name: toolCall.name, success: false, output: errOut };
@@ -2333,6 +2355,7 @@ Users can use these commands:
               outcome: result.success ? 'success' : 'error',
               durationMs: Date.now() - toolStart,
               errorClass: result.success ? undefined : (result.error ? 'tool-error' : undefined),
+            denialClass: result.success ? undefined : (result.denialClass ?? 'error'),
             });
             yield { type: 'tool_result', name: toolCall.name, success: result.success, output: result.output };
             
@@ -2542,6 +2565,11 @@ Users can use these commands:
         }
         const on = value === 'on';
         await this.cognitiveConfig.setEnabled(info, on);
+        // Switching the self-model on at runtime derives it right away, so the
+        // first turn after the switch already has something to show.
+        if (on && info.name === 'flagSelfModelQuery') {
+          await this.seedDerivedSelfModelIfEnabled().catch((e) => this.emitDebug('error', `self-model derivation failed: ${(e as Error).message}`));
+        }
         return { text: `⚙️ ${info.name} = ${on}.`, sessionId: session.sessionId };
       }
       // Cycle-manager switch (setup flag cog.flagCycleManager). Owner-only AND a
@@ -2591,11 +2619,21 @@ Users can use these commands:
       }
       try {
         const r = await this.knowledgeEngine.reseedSelf(this.bootstrapDir, this.agentId);
+        // After the persona, never before: the derived self-model reads the
+        // behavior directives the reseed just wrote. Only with the flag on.
+        let derivedLine = '';
+        try {
+          const d = await this.seedDerivedSelfModelIfEnabled();
+          if (d) derivedLine = `\n• Self-model re-derived: ${d.capabilities} tools, ${d.constraints} constraints`;
+        } catch (e) {
+          derivedLine = `\n• Self-model re-derivation failed: ${(e as Error).message}`;
+        }
         return {
           text: `🪞 Persona re-seeded from bootstrap.\n`
             + `• Bootstrap triples: ${r.bootstrapBefore} → ${r.bootstrapAfter}\n`
             + `• Learned/other preserved: ${r.preserved}\n`
-            + `• Self graph total: ${r.totalBefore} → ${r.totalAfter}`,
+            + `• Self graph total: ${r.totalBefore} → ${r.totalAfter}`
+            + derivedLine,
           sessionId: session.sessionId,
         };
       } catch (e) {

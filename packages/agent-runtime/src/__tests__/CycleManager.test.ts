@@ -615,18 +615,20 @@ describe('CycleManager', () => {
     expect(section).not.toContain('[Self]');
   });
 
-  it('attributes constraint pressure from a governed tool error (G3)', async () => {
+  it('counts a typed policy denial as constraint pressure, but not an ordinary error of a governed tool (G3)', async () => {
     const SESS = 'sessG3';
     const sm = new SelfModel(store, AGENT);
-    // A constraint governs memory_store; an error there is constraint pressure
-    // even though the error class is not a policy/permission string.
+    // A constraint governs memory_store. An ordinary failure there is not
+    // pressure; only a refusal by policy or a missing approval is.
     await sm.seed({ constraints: [{ id: 'no_secret', label: 'Never persist secrets', applies: ['memory_store'], enforcedBy: 'MemorySkill' }] });
 
     await cm.runCycle(
       makeEnvelope('remember this'),
       async (recordTool) => {
         recordTool({ phase: 'called', toolName: 'memory_store', callId: 'c1', occurredAt: new Date(), argsBrief: 'key' });
-        recordTool({ phase: 'completed', toolName: 'memory_store', callId: 'c1', occurredAt: new Date(), outcome: 'error', errorClass: 'ValidationError' });
+        recordTool({ phase: 'completed', toolName: 'memory_store', callId: 'c1', occurredAt: new Date(), outcome: 'error', errorClass: 'ValidationError', denialClass: 'error' });
+        recordTool({ phase: 'called', toolName: 'exec', callId: 'c2', occurredAt: new Date(), argsBrief: 'command' });
+        recordTool({ phase: 'completed', toolName: 'exec', callId: 'c2', occurredAt: new Date(), outcome: 'error', errorClass: 'tool-error', denialClass: 'policy-denied' });
         return { text: 'tried', sessionId: SESS };
       },
       (r) => r.sessionId,

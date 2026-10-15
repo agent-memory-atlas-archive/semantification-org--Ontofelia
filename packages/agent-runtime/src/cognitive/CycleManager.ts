@@ -29,6 +29,7 @@ import {
   createLogger,
   isHumanOwnerTurn,
   type MessageEnvelope,
+  type ToolDenialClass,
   type TriplestoreAdapter,
 } from '@ontofelia/core';
 import {
@@ -38,6 +39,7 @@ import {
   sparqlIri,
   ProceduralMemory,
   SelfModel,
+  DERIVED_LABELS,
   type TraceInput,
   type SelfView,
 } from '@ontofelia/semantic-memory';
@@ -67,6 +69,7 @@ import {
 import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from './GoalLifecycle.js';
 import { writeGoalEpisode } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
+import { neutraliseQuoted } from './untrustedText.js';
 import {
   comprehend,
   type ComprehensionResult,
@@ -140,6 +143,11 @@ export interface ToolEpisodeEvent {
   outcome?: 'success' | 'error';
   durationMs?: number;
   errorClass?: string;
+  /**
+   * Typed reason a failed call failed, from the dispatch chokepoint. Constraint
+   * pressure and the policy-denied impasse read this, never `errorClass` text.
+   */
+  denialClass?: ToolDenialClass;
 }
 
 /** Sink the runtime tool loop calls; a no-op (undefined) on the legacy path. */
@@ -221,9 +229,9 @@ export interface RunCycleOptions {
   metacognitionEnabled?: boolean;
   /**
    * When true (cog.flagSelfModelQuery), Phase 4 seeds a `[Self]` prompt block
-   * from `SelfModel.queryFor(goalType)` and constraint pressure is attributed
-   * from the self-model's constraints. OFF adds no block and leaves the Phase F
-   * constraint-pressure heuristic untouched.
+   * from `SelfModel.queryFor(goalType)`, rendered through fixed templates. OFF
+   * adds no block. Constraint pressure does not depend on this flag: it counts
+   * the typed tool denials (policy-denied, guardian-approval-required).
    */
   selfModelEnabled?: boolean;
   /**
@@ -397,7 +405,23 @@ function newId(): string {
 }
 
 /** Salience of the self-model entries written for the prompt assembler. */
-const SELF_SALIENCE = { capability: 0.7, constraint: 0.9 } as const;
+/** Whether a completed tool call was refused by policy or by a missing approval (not an ordinary failure). */
+function isConstraintDenial(e: Pick<ToolEpisodeEvent, 'denialClass'>): boolean {
+  return e.denialClass === 'policy-denied' || e.denialClass === 'guardian-approval-required';
+}
+
+const SELF_SALIENCE = { capability: 0.7, restrictedTool: 0.8, constraint: 0.9 } as const;
+/** Longest label / tool name rendered into the `[Self]` block, in characters. */
+const SELF_LABEL_MAX = 120;
+const SELF_NAME_MAX = 60;
+/** At most this many derived tool capabilities are rendered per turn. */
+const SELF_TOOL_CAP = 8;
+/** The only words a tool's policy status renders as. */
+const SELF_POLICY_WORDS: Readonly<Record<'allowed' | 'needs-approval' | 'denied', string>> = {
+  allowed: 'allowed',
+  'needs-approval': 'needs approval',
+  denied: 'denied by default',
+};
 
 /**
  * What the prompt assembler produced next to the prompt actually sent (shadow
@@ -832,7 +856,7 @@ export class CycleManager {
                 phaseView.push({ buffer: 'selfBuffer', entryKind, text, salience, agentLevel: true, forUser: userKey });
                 queuedWm.push({ buffer: 'selfBuffer', entryKind, payload: text, salience });
               };
-              for (const c of selfText.caps) add('capability', c, SELF_SALIENCE.capability);
+              for (const c of selfText.caps) add('capability', c.text, c.salience);
               for (const c of selfText.cons) add('constraint', c, SELF_SALIENCE.constraint);
             }
           }
@@ -1421,28 +1445,66 @@ export class CycleManager {
    */
   private async renderSelfBlock(
     goalType: string,
-  ): Promise<{ text: string; caps: string[]; cons: string[] } | undefined> {
+  ): Promise<
+    { text: string; caps: Array<{ text: string; salience: number }>; cons: string[] } | undefined
+  > {
     const sm = new SelfModel(this.triplestore, this.agentId);
     const view: SelfView = await sm.queryFor(goalType);
     if (view.capabilities.length === 0 && view.constraints.length === 0) return undefined;
-    const lines: string[] = ['[Self]'];
-    const caps: string[] = [];
+
+    // Every line is a fixed template; store text only fills a slot, one inert
+    // line at a time. A row that does not fit its template is left out.
+    const caps: Array<{ text: string; salience: number }> = [];
+    const learned = view.capabilities.filter((c) => c.derivedFrom === undefined);
+    for (const c of learned) {
+      const label = neutraliseQuoted(c.label, SELF_LABEL_MAX);
+      if (label === '') continue;
+      const reqs = c.requires.length > 0 ? ` (uses ${c.requires.map((r) => neutraliseQuoted(r, SELF_NAME_MAX)).join(', ')})` : '';
+      caps.push({ text: `${label}${reqs}`, salience: SELF_SALIENCE.capability });
+    }
+    // Tool capabilities: tools that are not freely usable first (they are what
+    // the model most needs to know), then by name; at most SELF_TOOL_CAP lines.
+    const tools: Array<{ text: string; salience: number; free: boolean; name: string }> = [];
+    for (const c of view.capabilities) {
+      if (c.derivedFrom !== 'tool-registry' || c.policyStatus === undefined) continue;
+      const name = neutraliseQuoted(c.requires[0] ?? '', SELF_NAME_MAX);
+      if (name === '') continue;
+      const free = c.policyStatus === 'allowed';
+      tools.push({
+        text: `has tool ${name} (policy: ${SELF_POLICY_WORDS[c.policyStatus]})`,
+        salience: free ? SELF_SALIENCE.capability : SELF_SALIENCE.restrictedTool,
+        free,
+        name,
+      });
+    }
+    tools.sort((x, y) => Number(x.free) - Number(y.free) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+    for (const t of tools.slice(0, SELF_TOOL_CAP)) caps.push({ text: t.text, salience: t.salience });
+
     const cons: string[] = [];
-    if (view.capabilities.length > 0) {
-      lines.push('Capabilities relevant to this goal:');
-      for (const c of view.capabilities) {
-        const reqs = c.requires.length > 0 ? ` (uses ${c.requires.join(', ')})` : '';
-        lines.push(`• ${c.label}${reqs}`);
-        caps.push(`${c.label}${reqs}`);
+    for (const c of view.constraints) {
+      if (c.derivedFrom === 'tool-policy') cons.push(DERIVED_LABELS.toolPolicy);
+      else if (c.derivedFrom === 'guardian-policy') cons.push(DERIVED_LABELS.guardian);
+      else if (c.derivedFrom === 'behavior-directive') {
+        const label = neutraliseQuoted(c.label, SELF_LABEL_MAX);
+        const scope = neutraliseQuoted(c.scope ?? '', SELF_NAME_MAX);
+        if (label !== '') cons.push(`Binding rule${scope ? ` (${scope})` : ''}: ${label}`);
+      } else if (c.derivedFrom === undefined) {
+        const label = neutraliseQuoted(c.label, SELF_LABEL_MAX);
+        if (label === '') continue;
+        const by = c.enforcedBy ? ` [${neutraliseQuoted(c.enforcedBy, SELF_NAME_MAX)}]` : '';
+        cons.push(`${label}${by}`);
       }
     }
-    if (view.constraints.length > 0) {
+    if (caps.length === 0 && cons.length === 0) return undefined;
+
+    const lines: string[] = ['[Self]'];
+    if (caps.length > 0) {
+      lines.push('Capabilities relevant to this goal:');
+      for (const c of caps) lines.push(`• ${c.text}`);
+    }
+    if (cons.length > 0) {
       lines.push('Constraints I must respect:');
-      for (const c of view.constraints) {
-        const by = c.enforcedBy ? ` [${c.enforcedBy}]` : '';
-        lines.push(`• ${c.label}${by}`);
-        cons.push(`${c.label}${by}`);
-      }
+      for (const c of cons) lines.push(`• ${c}`);
     }
     return { text: lines.join('\n'), caps, cons };
   }
@@ -1725,9 +1787,7 @@ export class CycleManager {
     ).length;
     const flaggedImpasse = resolved.map((r) => r.flaggedUri);
     const resolvedImpasse = resolved.filter((r) => r.resolved).map((r) => r.flaggedUri);
-    const constraintPressure = ctx.selfModelEnabled
-      ? await this.selfModelConstraintPressure(ctx.toolEvents)
-      : this.constraintPressure(ctx.toolEvents);
+    const constraintPressure = this.constraintPressure(ctx.toolEvents);
     const cycleStatus: ReflectiveMarkerInput['cycleStatus'] =
       ctx.status === 'aborted'
         ? 'aborted'
@@ -1866,7 +1926,7 @@ export class CycleManager {
     }
     for (const e of ctx.toolEvents) {
       if (e.phase !== 'completed' || e.outcome !== 'error') continue;
-      const denied = /policy|permission|denied|forbidden|unauthor/i.test(e.errorClass ?? '');
+      const denied = isConstraintDenial(e);
       const kind: ImpasseKind = denied ? 'tool-policy-denied-all' : 'tool-error';
       out.push({
         kind,
@@ -1886,33 +1946,14 @@ export class CycleManager {
     return out;
   }
 
-  /** Constraint pressure = count of policy/permission-denied tool errors. */
-  private constraintPressure(toolEvents: ToolEpisodeEvent[]): number {
-    return toolEvents.filter(
-      (e) =>
-        e.phase === 'completed' &&
-        e.outcome === 'error' &&
-        /policy|permission|denied|forbidden|unauthor/i.test(e.errorClass ?? ''),
-    ).length;
-  }
-
   /**
-   * G3 — constraint pressure attributed from the self-model: an errored tool
-   * call counts as pressure when a `cogt:Constraint` governs that tool (its
-   * `cogt:applies` names the tool), the regex heuristic catches it, or both.
-   * This makes the self-model's declared constraints, not just error strings,
-   * the source of the metacognitive constraint-pressure signal.
+   * Constraint pressure = count of tool calls the system refused: denied by the
+   * tool policy or held back for an owner approval that was not granted. Read
+   * from the typed denial class of the dispatch chokepoint, so the self-model
+   * flag changes what is shown in the prompt, not what is counted here.
    */
-  private async selfModelConstraintPressure(toolEvents: ToolEpisodeEvent[]): Promise<number> {
-    const sm = new SelfModel(this.triplestore, this.agentId);
-    let pressure = 0;
-    for (const e of toolEvents) {
-      if (e.phase !== 'completed' || e.outcome !== 'error') continue;
-      const heuristic = /policy|permission|denied|forbidden|unauthor/i.test(e.errorClass ?? '');
-      const governed = (await sm.constraintsForTool(e.toolName)).length > 0;
-      if (heuristic || governed) pressure++;
-    }
-    return pressure;
+  private constraintPressure(toolEvents: ToolEpisodeEvent[]): number {
+    return toolEvents.filter((e) => e.phase === 'completed' && e.outcome === 'error' && isConstraintDenial(e)).length;
   }
 
   /** Tool churn = the same tool invoked three or more times in one cycle. */

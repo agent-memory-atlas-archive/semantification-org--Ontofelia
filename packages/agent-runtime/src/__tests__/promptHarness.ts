@@ -7,7 +7,7 @@ import type {
 } from '@ontofelia/core';
 import { SessionStore } from '@ontofelia/session-store';
 import { ToolRegistry, AuditLog } from '@ontofelia/tools';
-import type { ToolAuditEntry } from '@ontofelia/core';
+import type { ToolAuditEntry, ToolCategory } from '@ontofelia/core';
 import { ToolPolicyEngine } from '@ontofelia/security';
 import { SkillRegistry, SkillExecutor } from '@ontofelia/skills';
 import { PluginRegistry } from '@ontofelia/plugins';
@@ -96,7 +96,9 @@ export async function makeEnv(opts: {
   /** Replaces the default answer-only provider (e.g. one that makes tool calls). */
   provider?: (probe: Probe) => ProviderAdapter;
   /** Tools to register and allow; a failing tool returns an error result. */
-  tools?: Array<{ name: string; fails?: boolean }>;
+  tools?: Array<{ name: string; fails?: boolean; category?: ToolCategory; description?: string }>;
+  /** Tool names on the policy's deny list (they stay registered). */
+  deny?: string[];
 } = {}): Promise<Env> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'prompt-store-'));
   const sessDir = await fs.mkdtemp(path.join(os.tmpdir(), 'prompt-sess-'));
@@ -122,7 +124,7 @@ export async function makeEnv(opts: {
   const toolRegistry = new ToolRegistry();
   for (const t of opts.tools ?? []) {
     toolRegistry.register({
-      name: t.name, description: 'test', category: 'utility', inputSchema: {}, permissions: [],
+      name: t.name, description: t.description ?? 'test', category: t.category ?? 'utility', inputSchema: {}, permissions: [],
       execute: async () => ({
         success: !t.fails, output: t.fails ? 'failed' : 'ok', ...(t.fails ? { error: 'boom' } : {}),
         auditEntry: {} as unknown as ToolAuditEntry,
@@ -132,7 +134,7 @@ export async function makeEnv(opts: {
   const toolNames = (opts.tools ?? []).map((t) => t.name);
   const runtime = new AgentRuntime(
     AGENT, { ...config, enabledTools: toolNames }, opts.provider ? opts.provider(probe) : new MockProvider(probe), new SessionStore(sessDir),
-    toolRegistry, new ToolPolicyEngine({ allow: toolNames, deny: [] }),
+    toolRegistry, new ToolPolicyEngine({ allow: toolNames, deny: opts.deny ?? [] }),
     new AuditLog(`/tmp/prompt-ws-${Math.random().toString(36).slice(2)}`), new SkillRegistry(),
     new SkillExecutor(new SkillRegistry()), new PluginRegistry(), undefined, ke, undefined,
   );

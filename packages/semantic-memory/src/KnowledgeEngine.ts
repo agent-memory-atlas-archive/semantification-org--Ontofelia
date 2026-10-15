@@ -2104,10 +2104,17 @@ export class KnowledgeEngine {
           ...this.directiveLikeSubjects(selfTriples),
           ...this.driveLikeSubjects(selfTriples),
         ]);
+        // The derived self-model (capabilities and constraints computed from
+        // the tool registry and policies) is rendered only by the cognitive
+        // `[Self]` block, behind its flag: its nodes and the triples that link
+        // to them never become identity bullets.
+        const derivedPrefix = GraphUriResolver.getSelfDerivedPrefix(agentId);
         const selfFacts = selfTriples.filter(t =>
           !tierSubjects.has(t.subject) &&
           t.predicate !== `${CORE_NS}hasDirective` &&
-          t.predicate !== `${CORE_NS}hasDrive`
+          t.predicate !== `${CORE_NS}hasDrive` &&
+          !t.subject.startsWith(derivedPrefix) &&
+          !t.value.startsWith(derivedPrefix)
         );
 
         const greetingFact = selfFacts.find(f => f.predicate.includes('greetingTemplate') || f.predicate.includes('greeting'));
