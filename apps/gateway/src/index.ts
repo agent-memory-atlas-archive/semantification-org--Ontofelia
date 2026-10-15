@@ -378,6 +378,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     { name: 'cog.retention', cron: '0 3 * * *', prompt: '/cog retain' },
     { name: 'cog.consolidation', cron: '0 */6 * * *', prompt: '/cog consolidate' },
     { name: 'cog.cleanup', cron: '30 3 * * *', prompt: '/cog cleanup' },
+    { name: 'cog.consolidate-episodes', cron: '45 3 * * *', prompt: '/cog consolidate-episodes' },
     { name: 'cog.metacog-scan', cron: '0 4 * * 0', prompt: '/cog scan' },
   ];
   const existingCogNames = new Set(scheduler.listCronJobs().map((j) => j.name));

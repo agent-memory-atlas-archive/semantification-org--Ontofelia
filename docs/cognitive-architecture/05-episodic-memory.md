@@ -287,6 +287,50 @@ groups). All configurable in `urn:<agent>:setup`.
 - Episodes whose `cogt:rawText` was retracted via privacy delete (the
   episode itself is hard-deleted, see §7).
 
+### 6.4 As built: pattern 1 (repeated entity assertion)
+
+Behind `cog.flagEpisodicConsolidation` (off by default; `/cog flag
+episodicconsolidation on`). A daily job (`cog.consolidate-episodes`) and the
+owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
+§6.2 on purpose, as a privacy decision:
+
+- **Target.** A fact is promoted only into the graph `urn:<agent>:user:<key>` of
+  the user whose episodes assert it. There is no worldview promotion path and no
+  parameter that selects another graph. The owner's key is `owner`, so the
+  owner's episodes promote into `urn:<agent>:user:owner`.
+- **Evidence never mixes users.** Episodes are read per user and counted only
+  towards promotions into that user's graph.
+- **Count.** From the claims an episode stored (`cogt:hasClaim`): a triple
+  `(s, p, o)` qualifies with at least K distinct episodes in at least Q distinct
+  evidence groups. A group is one session (transcriptRef, else sessionId) on one
+  UTC day. Setup keys on `urn:<agent>:setup:cognitive`:
+  `cog:consolidationMinEpisodes` (K, default 3) and `cog:consolidationMinGroups`
+  (Q, default 2); integers 1..100.
+- **Exclusions.** A claim that is not `accepted` (retracted claims no longer
+  exist; superseded and rejected ones are not accepted), a claim asserted in a
+  graph other than the worldview or the user's own graph, a claim that is itself
+  a consolidation, secret-classed episodes or claims, and episodes of a session
+  flagged `cogt:sessionUntrusted`.
+- **Minting.** The existing Claim/Evidence write with `sourceKind
+  "consolidation-episodic"`; the evidence lists the source episodes
+  (`core:sourceEpisode`) and their claims (`core:supportClaim`). A
+  `consolidation-promoted` episode with `forUser` records the claim hash as the
+  tag `claim-hash:<sha256>`.
+- **Idempotence.** The hash over (user, s, p, o) in that ledger means a rerun
+  promotes nothing, and a fact the user retracted after promotion does not come
+  back. A triple or accepted claim already in the user's graph is left alone
+  (no duplicate, no corroboration evidence).
+- **Functional properties.** A promoted claim is superseded by a later value like
+  any other. A promotion never overrides a different accepted value the user's
+  graph holds now (counted as a conflict).
+- **Bounds.** 200 users, the newest 500 claim-bearing episodes per user, 20
+  promotions per user and 100 per run. No model call. No watermark: the counts
+  need the older episodes, and the ledger already makes a rerun a no-op.
+
+Pattern 3 (user preference, "accepted X over Y") is not implemented: no episode
+records which alternative was offered and which was chosen, so it cannot be
+detected deterministically.
+
 ---
 
 ## 7. Retention

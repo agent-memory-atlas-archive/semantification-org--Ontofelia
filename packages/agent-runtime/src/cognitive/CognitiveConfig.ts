@@ -13,6 +13,7 @@
 
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
+import { DEFAULT_EPISODIC_CONSOLIDATION_SETTINGS, type EpisodicConsolidationSettings } from '@ontofelia/semantic-memory';
 import { DEFAULT_CAPACITY, DEFAULT_THETA } from './WorkingMemory.js';
 import { DEFAULT_RECALLED_TOKEN_CAP, DEFAULT_TOTAL_TOKEN_CAP } from './PromptAssembler.js';
 import { defaultArgRedactionRules, parseArgRedactionRules, type ArgRedactionRules } from './ArgRedaction.js';
@@ -81,6 +82,7 @@ export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
   { name: 'flagPromptShadow', key: 'promptShadow', description: 'Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged.' },
   { name: 'flagWorkingMemoryPrompt', key: 'workingMemoryPrompt', description: 'Build the cognitive prompt blocks (self, goal, recalled, skills, note) from working memory instead of the legacy strings.' },
   { name: 'flagInitiative', key: 'initiative', description: 'Allow self-started goal wakes (kill switch for unattended work).' },
+  { name: 'flagEpisodicConsolidation', key: 'episodicConsolidation', description: 'Daily, promote facts a user asserted in several independent episodes into that user\'s own graph (never the worldview).' },
 ];
 
 /**
@@ -322,6 +324,28 @@ export class CognitiveConfig {
     };
   }
 
+  /**
+   * Thresholds of the episodic consolidation, numeric triples on the config
+   * subject `urn:<agent>:setup:cognitive`:
+   *
+   *   cog.consolidationMinEpisodes  K, integer 1..100; default 3
+   *   cog.consolidationMinGroups    Q, integer 1..100; default 2
+   *
+   * A missing, unparseable or out-of-range value falls back to the default.
+   */
+  async consolidationSettings(): Promise<EpisodicConsolidationSettings> {
+    const [k, q] = await Promise.all([
+      this.readNumber('consolidationMinEpisodes').catch(() => undefined),
+      this.readNumber('consolidationMinGroups').catch(() => undefined),
+    ]);
+    const pick = (v: number | undefined, dflt: number) =>
+      v !== undefined && Number.isInteger(v) && v >= 1 && v <= 100 ? v : dflt;
+    return {
+      minEpisodes: pick(k, DEFAULT_EPISODIC_CONSOLIDATION_SETTINGS.minEpisodes),
+      minGroups: pick(q, DEFAULT_EPISODIC_CONSOLIDATION_SETTINGS.minGroups),
+    };
+  }
+
   /** Read any flag on the {@link COGNITIVE_FLAGS} allowlist by its exact name. */
   async isEnabled(info: CognitiveFlagInfo): Promise<boolean> {
     return this.isFlagEnabled(info.name);
@@ -337,6 +361,11 @@ export class CognitiveConfig {
     const out: Record<string, boolean> = {};
     for (const f of COGNITIVE_FLAGS) out[f.key] = await this.isFlagEnabled(f.name).catch(() => false);
     return out;
+  }
+
+  /** Read one flag by its exact setup name, e.g. `flagEpisodicConsolidation`. */
+  async isFlagEnabledByName(flag: string): Promise<boolean> {
+    return this.isFlagEnabled(flag);
   }
 
   /** Read one boolean `cog.<flag>` triple; `false` when absent or unparseable. */

@@ -89,8 +89,8 @@ describe('/cog flags and /cog flag <name> on|off', () => {
     await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('knows exactly twelve flags and all of them default to off', async () => {
-    expect(COGNITIVE_FLAGS).toHaveLength(12);
+  it('knows exactly thirteen flags and all of them default to off', async () => {
+    expect(COGNITIVE_FLAGS).toHaveLength(13);
     expect(Object.values(await allValues()).every((v) => v === false)).toBe(true);
   });
 
@@ -163,7 +163,7 @@ describe('/cog flags and /cog flag <name> on|off', () => {
       return JSON.parse(text.replace(/^```json\n/, '').replace(/\n```$/, '')) as { flags: Record<string, boolean> };
     };
     const first = await read();
-    expect(Object.keys(first.flags)).toHaveLength(12);
+    expect(Object.keys(first.flags)).toHaveLength(13);
     expect(Object.keys(first.flags).sort()).toEqual(COGNITIVE_FLAGS.map((f) => f.key).sort());
     expect(Object.values(first.flags).every((v) => v === false)).toBe(true);
     await runtime.handleMessage(env('/cog flag episodicmemory on'));

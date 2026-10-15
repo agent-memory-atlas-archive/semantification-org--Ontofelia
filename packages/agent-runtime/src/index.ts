@@ -6,8 +6,8 @@ import { ToolPolicyEngine } from '@ontofelia/security';
 import { ToolExecutor } from './executor/ToolExecutor.js';
 import { SkillRegistry, SkillExecutor } from '@ontofelia/skills';
 import { PluginRegistry } from '@ontofelia/plugins';
-import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, GraphUriResolver } from '@ontofelia/semantic-memory';
-import type { SemanticParseResult, ConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
+import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, EpisodicConsolidation, GraphUriResolver } from '@ontofelia/semantic-memory';
+import type { SemanticParseResult, ConsolidationReport, EpisodicConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
 import { GoalStack } from './cognitive/GoalStack.js';
 import { seedDerivedSelfModel } from './cognitive/SelfModelSources.js';
 import { directGoalEpisodeSink } from './cognitive/GoalEpisodes.js';
@@ -1316,6 +1316,39 @@ Users can use these commands:
   private consolidationInFlight?: Promise<ConsolidationReport>;
 
   /**
+   * Episodic to semantic consolidation (doc 05 §6, pattern 1): facts a user
+   * asserted in several independent episodes are promoted into that user's own
+   * graph. Off unless `cog.flagEpisodicConsolidation` is on: with the flag off
+   * nothing is read or written and `enabled` is false. One run at a time.
+   */
+  async runEpisodicConsolidation(now: Date = new Date()): Promise<{ enabled: boolean; report?: EpisodicConsolidationReport }> {
+    if (!this.knowledgeEngine || !this.cognitiveConfig) return { enabled: false };
+    if (!(await this.cognitiveConfig.isFlagEnabledByName('flagEpisodicConsolidation'))) return { enabled: false };
+    if (this.episodicConsolidationInFlight) return { enabled: true, report: await this.episodicConsolidationInFlight };
+    const run = (async () => {
+      const settings = await this.cognitiveConfig!.consolidationSettings();
+      const report = await new EpisodicConsolidation(
+        this.knowledgeEngine!['triplestore'],
+        this.agentId,
+        this.knowledgeEngine!,
+      ).run(settings, now);
+      this.logger.info(
+        { job: 'cog.consolidate-episodes', ...report },
+        `cog consolidate-episodes: promoted ${report.promoted} of ${report.qualified} qualified`,
+      );
+      return report;
+    })();
+    this.episodicConsolidationInFlight = run;
+    try {
+      return { enabled: true, report: await run };
+    } finally {
+      this.episodicConsolidationInFlight = undefined;
+    }
+  }
+
+  private episodicConsolidationInFlight?: Promise<EpisodicConsolidationReport>;
+
+  /**
    * Daily hygiene of the per-cycle cognitive graphs: drops working-memory graphs
    * 7 days after their last write and cycle graphs 30 days after theirs. Only
    * graphs the registry classifies as cog working/cycles of this agent are
@@ -2532,6 +2565,14 @@ Users can use these commands:
         const r = await this.consolidateProceduralMemory();
         return { text: `🧩 Consolidation: ${r.tracesScanned} traces, ${r.skillsUpserted} skills, ${r.sequenceSkillsCreated} new sequences.`, sessionId: session.sessionId };
       }
+      if (sub === 'consolidate-episodes') {
+        const r = await this.runEpisodicConsolidation();
+        if (!r.enabled || !r.report) {
+          return { text: 'Episodic consolidation is off (flagEpisodicConsolidation). Nothing was read or changed. Enable with /cog flag episodicconsolidation on.', sessionId: session.sessionId };
+        }
+        const x = r.report;
+        return { text: `🧩 Episodic consolidation: ${x.episodesScanned} episodes of ${x.users} user(s), ${x.qualified} qualified, ${x.promoted} promoted, ${x.alreadyPresent + x.alreadyPromoted} already known, ${x.conflicts} in conflict.`, sessionId: session.sessionId };
+      }
       if (sub === 'cleanup') {
         const r = await this.runCogCleanup();
         const traces = r.procedural ? ` ${r.procedural.tracesDropped} procedural trace(s) older than 90 days dropped.` : '';
@@ -2622,7 +2663,7 @@ Users can use these commands:
         if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|consolidate-episodes|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.

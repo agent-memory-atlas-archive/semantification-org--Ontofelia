@@ -1,5 +1,5 @@
 /** Kind of source an Evidence object records. */
-export type EvidenceType = 'message-span' | 'tool-result' | 'document' | 'web-source' | 'manual-review';
+export type EvidenceType = 'message-span' | 'tool-result' | 'document' | 'web-source' | 'manual-review' | 'consolidation';
 
 export interface FactInput {
   subject: string;
@@ -11,7 +11,7 @@ export interface FactInput {
   // Provenance & Claim fields
   confidenceNumeric?: number; // e.g. 0.95
   confidenceLabel?: 'high' | 'medium' | 'low';
-  sourceKind?: 'user' | 'agent' | 'tool' | 'consolidation';
+  sourceKind?: 'user' | 'agent' | 'tool' | 'consolidation' | 'consolidation-episodic';
   sourceMessageId?: string;
   sourceSpan?: string;
   sourceUri?: string;

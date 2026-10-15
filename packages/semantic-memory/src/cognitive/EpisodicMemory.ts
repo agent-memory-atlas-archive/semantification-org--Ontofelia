@@ -93,6 +93,12 @@ export interface EpisodeInput {
   about?: string[];
   /** IRIs of the claims stored from this episode's message (`cogt:hasClaim`). */
   hasClaim?: string[];
+  /**
+   * The episode's session is untrusted (test or dry-run). Persisted as
+   * `cogt:sessionUntrusted` only when true; the episodic consolidation never
+   * counts an episode of such a session.
+   */
+  sessionUntrusted?: boolean;
   /** Explicit predecessor; when omitted, append() chains to the session's last. */
   precededBy?: string;
   partOfGoal?: string;
@@ -129,6 +135,23 @@ export interface EpisodeHit {
   /** Populated by retrieve(); 0 for plain reads. */
   relevanceScore: number;
 }
+
+/** Slim record of an episode that stored claims, for the episodic consolidation. */
+export interface ClaimEpisode {
+  uri: EpisodeId;
+  occurredAt: string;
+  sessionId?: string;
+  transcriptRef?: string;
+  /** Claim IRIs the episode stored (`cogt:hasClaim`). */
+  claims: string[];
+  /** The episode itself carries `core:privacyClass "secret"`. */
+  secret: boolean;
+  /** The episode itself is flagged `cogt:sessionUntrusted`. */
+  untrusted: boolean;
+}
+
+/** Tag prefix of a `consolidation-promoted` episode: the promotion's claim hash. */
+export const CLAIM_HASH_TAG = 'claim-hash:';
 
 /** Fail closed on a missing scope (JS callers, casts): never read unscoped. */
 function assertScope(userScope: UserScope): void {
@@ -301,6 +324,8 @@ export class EpisodicMemory {
       lines.push(`<${uri}> <${CORE}privacyClass> "secret" .`);
     for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> ${sparqlIri(a)} .`);
     for (const c of ep.hasClaim ?? []) lines.push(`<${uri}> <${COGT}hasClaim> ${sparqlIri(c)} .`);
+    if (ep.sessionUntrusted === true)
+      lines.push(`<${uri}> <${COGT}sessionUntrusted> "true"^^<${XSD}boolean> .`);
     if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> ${sparqlIri(precededBy)} .`);
     if (ep.partOfGoal) lines.push(`<${uri}> <${COGT}partOfGoal> ${sparqlIri(ep.partOfGoal)} .`);
     if (ep.payload) lines.push(`<${uri}> <${COGT}payload> "${escapeLiteral(ep.payload)}" .`);
@@ -767,6 +792,124 @@ export class EpisodicMemory {
     const values = chosen.map((c) => sparqlIri(c.uri)).join(' ');
     const hits = await this.runSelect(`VALUES ?ep { ${values} }`, userScope);
     return hits.sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
+  }
+
+  /**
+   * The user keys that have episodes with stored claims, at most `limit`. An
+   * episode without a `forUser` (written before the key existed) counts for the
+   * owner. Only the keys are returned; no episode content leaves this method.
+   */
+  async usersWithClaimEpisodes(limit = 200): Promise<string[]> {
+    const res = await this.triplestore.query(`
+      SELECT DISTINCT ?u WHERE {
+        GRAPH <${this.graphUri()}> {
+          ?ep a <${COGT}Episode> ;
+              <${COGT}hasClaim> ?c .
+          OPTIONAL { ?ep <${COGT}forUser> ?u . }
+        }
+      }`);
+    const keys = new Set<string>();
+    for (const r of res.bindings ?? []) keys.add(r.u?.value ?? OWNER_USER_KEY);
+    return [...keys].sort().slice(0, Math.max(0, Math.trunc(limit)));
+  }
+
+  /**
+   * The newest `limit` episodes of one user that stored claims, with the fields
+   * the consolidation needs and nothing else (no payload). `userScope` must be a
+   * concrete user key: the all-users scope is refused, so a read here can never
+   * mix users. Episodes of the `consolidation-promoted` type are left out (they
+   * link the claim they minted and must not count as evidence for it).
+   * Also returns the sessions flagged untrusted by any episode.
+   */
+  async claimEpisodes(
+    userScope: UserScope,
+    limit: number,
+  ): Promise<{ episodes: ClaimEpisode[]; untrustedSessions: Set<string> }> {
+    assertScope(userScope);
+    if (userScope === ALL_USERS_SCOPE) {
+      throw new Error('EpisodicMemory.claimEpisodes: a concrete user key is required');
+    }
+    const n = Math.max(0, Math.trunc(limit));
+    const graph = this.graphUri();
+    const key = sparqlStringLiteral(userScope);
+    const pick = async (scopePattern: string): Promise<string[]> => {
+      const res = await this.triplestore.query(`
+        SELECT DISTINCT ?ep ?when WHERE {
+          GRAPH <${graph}> {
+            ?ep a <${COGT}Episode> ;
+                <${COGT}episodeType> ?type ;
+                <${COGT}occurredAt> ?when ;
+                <${COGT}hasClaim> ?c .
+            ${scopePattern}
+            FILTER (?type != "consolidation-promoted")
+          }
+        } ORDER BY DESC(?when) ?ep LIMIT ${n}`);
+      return (res.bindings ?? []).map((r) => r.ep.value);
+    };
+    const uris = new Set<string>(await pick(`?ep <${COGT}forUser> ${key} .`));
+    if (userScope === OWNER_USER_KEY) {
+      for (const u of await pick(`FILTER NOT EXISTS { ?ep <${COGT}forUser> ?anyUser . }`)) uris.add(u);
+    }
+    const episodes: ClaimEpisode[] = [];
+    const list = [...uris];
+    for (let i = 0; i < list.length; i += MULTI_VALUE_CHUNK) {
+      const chunk = list.slice(i, i + MULTI_VALUE_CHUNK).map((u) => sparqlIri(u));
+      const res = await this.triplestore.query(`
+        SELECT ?ep ?when ?forUser ?sessionId ?transcriptRef ?privacy ?untrusted WHERE {
+          GRAPH <${graph}> {
+            VALUES ?ep { ${chunk.join(' ')} }
+            ?ep <${COGT}occurredAt> ?when .
+            OPTIONAL { ?ep <${COGT}forUser> ?forUser . }
+            OPTIONAL { ?ep <${COGT}sessionId> ?sessionId . }
+            OPTIONAL { ?ep <${COGT}transcriptRef> ?transcriptRef . }
+            OPTIONAL { ?ep <${CORE}privacyClass> ?privacy . }
+            OPTIONAL { ?ep <${COGT}sessionUntrusted> ?untrusted . }
+          }
+        }`);
+      const claims = await this.multiValued(`<${COGT}hasClaim>`, list.slice(i, i + MULTI_VALUE_CHUNK));
+      const seen = new Set<string>();
+      for (const r of res.bindings ?? []) {
+        const uri = r.ep.value;
+        // Re-check the scope on the values read back, as runSelect does.
+        if (!inScope({ forUser: r.forUser?.value }, userScope)) continue;
+        if (seen.has(uri)) continue;
+        seen.add(uri);
+        const rec: ClaimEpisode = {
+          uri,
+          occurredAt: r.when.value,
+          claims: claims.get(uri) ?? [],
+          secret: r.privacy?.value === 'secret',
+          untrusted: r.untrusted?.value === 'true',
+        };
+        if (r.sessionId) rec.sessionId = r.sessionId.value;
+        if (r.transcriptRef) rec.transcriptRef = r.transcriptRef.value;
+        episodes.push(rec);
+      }
+    }
+    const marks = await this.triplestore.query(`
+      SELECT DISTINCT ?sessionId WHERE {
+        GRAPH <${graph}> {
+          ?ep <${COGT}sessionUntrusted> "true"^^<${XSD}boolean> ;
+              <${COGT}sessionId> ?sessionId .
+        }
+      }`);
+    const untrustedSessions = new Set((marks.bindings ?? []).map((r) => r.sessionId.value));
+    return { episodes, untrustedSessions };
+  }
+
+  /**
+   * The claim hashes of the `consolidation-promoted` episodes written for one
+   * user (the ledger of what the consolidation already promoted). Scoped to the
+   * user's own episodes.
+   */
+  async promotedHashes(userScope: UserScope): Promise<Set<string>> {
+    assertScope(userScope);
+    const hits = await this.runSelect(`?ep <${COGT}episodeType> "consolidation-promoted" .`, userScope);
+    const out = new Set<string>();
+    for (const h of hits) {
+      for (const t of h.tags) if (t.startsWith(CLAIM_HASH_TAG)) out.add(t.slice(CLAIM_HASH_TAG.length));
+    }
+    return out;
   }
 
   private async runSelect(constraint: string, userScope: UserScope): Promise<EpisodeHit[]> {

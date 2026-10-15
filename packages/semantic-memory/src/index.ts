@@ -22,6 +22,7 @@ export * from './utils/GraphCatalog.js';
 export * from './cognitive/EpisodicMemory.js';
 export * from './cognitive/ProceduralMemory.js';
 export * from './cognitive/SelfModel.js';
+export * from './cognitive/EpisodicConsolidation.js';
 
 // Ontology Learning pipeline (Milestone 1)
 export * from './ingestion/types.js';

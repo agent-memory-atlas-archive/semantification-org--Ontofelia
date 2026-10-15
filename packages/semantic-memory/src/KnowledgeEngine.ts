@@ -1760,6 +1760,140 @@ export class KnowledgeEngine {
     objectTriple = sparqlIri(obj.uri);
   }
 
+  const committed = await this.commitFact({
+    fact, context, targetGraph,
+    subjectUri: subject.uri, predicateUri: predicate.uri, objectUri, objectTriple, userCanonical,
+  });
+  const newClaimUri = committed.claimUri;
+
+    return {
+      success: true,
+      subjectUri: subject.uri,
+      predicateUri: predicate.uri,
+      objectUri,
+      newEntities,
+      newProperties,
+      tripleCount: 1,
+      claimUri: newClaimUri,
+    };
+  }
+
+  /**
+   * Promote a fact that a user asserted in several episodes into THAT USER's own
+   * graph `urn:<agent>:user:<userKey>` and nowhere else. This is the write half
+   * of the episodic consolidation: it reuses the Claim/Evidence minting of
+   * {@link storeFact} (`commitFact`) with `sourceKind "consolidation-episodic"`.
+   *
+   * The target graph is fixed by `userKey`; there is no parameter that selects
+   * another graph, and the worldview is never a target. The three terms must
+   * already be resolved (they come from existing claims), so nothing is
+   * minted as an entity.
+   *
+   * Outcomes: `already-present` when the user graph already holds the triple or
+   * an accepted claim for it (nothing is written, no second claim); `conflict`
+   * when the predicate is functional and the user graph already holds a
+   * different accepted value (a count of earlier assertions never overrides what
+   * the user's graph says now); otherwise `promoted`.
+   */
+  async promoteToUserGraph(p: {
+    agentId: string;
+    userKey: string;
+    sessionId?: string;
+    subjectUri: string;
+    predicateUri: string;
+    object: { kind: 'iri' | 'literal'; value: string };
+    /** Episode IRIs the promotion stands on (linked from the evidence). */
+    sourceEpisodes: string[];
+    /** The claims those episodes stored (linked from the evidence). */
+    supportClaims: string[];
+    /** Deterministic hash of the promotion; stored as the claim's ingestion run. */
+    claimHash: string;
+    confidenceNumeric?: number;
+  }): Promise<{ outcome: 'promoted' | 'already-present' | 'conflict'; claimUri?: string; targetGraph: string }> {
+    if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
+      throw new Error('promoteToUserGraph: a concrete user key is required');
+    }
+    const targetGraph = this.assertGraph(GraphUriResolver.getUserGraph(p.agentId, p.userKey));
+    const subjectIri = sparqlIri(p.subjectUri);
+    const predicateIri = sparqlIri(p.predicateUri);
+    const objectTriple = p.object.kind === 'iri' ? sparqlIri(p.object.value) : sparqlStringLiteral(p.object.value);
+    const claimsGraph = GraphUriResolver.getClaimsGraph(p.agentId);
+
+    const present = await this.triplestore.ask(
+      `ASK { GRAPH ${sparqlIri(targetGraph)} { ${subjectIri} ${predicateIri} ${objectTriple} } }`,
+    );
+    const claimed = await this.triplestore.ask(`
+      ASK { GRAPH ${sparqlIri(claimsGraph)} {
+        ?c a <urn:shared:ontology#Claim> ;
+           <urn:shared:ontology#claimSubject> ${subjectIri} ;
+           <urn:shared:ontology#claimPredicate> ${predicateIri} ;
+           <urn:shared:ontology#claimObject> ${objectTriple} ;
+           <urn:shared:ontology#assertedInGraph> ${sparqlIri(targetGraph)} ;
+           <urn:shared:ontology#status> "accepted" .
+      } }`);
+    if (present || claimed) return { outcome: 'already-present', targetGraph };
+
+    if (await this.isFunctionalProperty(p.predicateUri, p.agentId)) {
+      const conflicting = await this.findConflictingClaims(
+        p.subjectUri, p.predicateUri, objectTriple, p.agentId, targetGraph,
+      );
+      if (conflicting.length > 0) return { outcome: 'conflict', targetGraph };
+    }
+
+    const fact: FactInput = {
+      subject: p.subjectUri,
+      predicate: p.predicateUri,
+      object: p.object.value,
+      objectType: p.object.kind === 'iri' ? 'Concept' : 'literal',
+      sourceKind: 'consolidation-episodic',
+      evidenceType: 'consolidation',
+      confidenceLabel: 'medium',
+      confidenceNumeric: p.confidenceNumeric,
+      sourceSpan: `Consolidated from ${p.sourceEpisodes.length} episodes of one user.`,
+    };
+    const context: FactContext = {
+      agentId: p.agentId,
+      userId: p.userKey,
+      sessionId: p.sessionId ?? 'consolidation',
+      isOwner: p.userKey === 'owner',
+      ingestionRunId: `consolidation:${p.claimHash}`,
+    };
+    const committed = await this.commitFact({
+      fact,
+      context,
+      targetGraph,
+      subjectUri: p.subjectUri,
+      predicateUri: p.predicateUri,
+      objectUri: p.object.value,
+      objectTriple,
+      evidenceLinks: { episodes: p.sourceEpisodes, claims: p.supportClaims },
+    });
+    return { outcome: 'promoted', claimUri: committed.claimUri, targetGraph };
+  }
+
+  /**
+   * The write half of {@link storeFact}, shared with the episodic consolidation
+   * ({@link promoteToUserGraph}): belief revision on functional properties,
+   * on-write materialization, the base triple, the owner name link, inferred
+   * triples, then Evidence and Claim. Everything is resolved by the caller: the
+   * target graph, the three terms and (for a user-stated name) the canonical
+   * user node.
+   */
+  private async commitFact(a: {
+    fact: FactInput;
+    context: FactContext;
+    targetGraph: string;
+    subjectUri: string;
+    predicateUri: string;
+    objectUri: string;
+    objectTriple: string;
+    userCanonical?: string;
+    /** Extra links written on the evidence: the episodes and claims it stands on. */
+    evidenceLinks?: { episodes: string[]; claims: string[] };
+  }): Promise<{ claimUri: string }> {
+  const { fact, context, targetGraph, objectUri, objectTriple, userCanonical } = a;
+  const subject = { uri: a.subjectUri };
+  const predicate = { uri: a.predicateUri };
   // Truth-maintenance model: a new fact is accepted as true on arrival.
   // Contradictions are handled later by belief revision (status "superseded"),
   // not by a proposal gate. 'rejected' remains available for explicit removal.
@@ -1909,6 +2043,18 @@ export class KnowledgeEngine {
       });
       evidenceUri = evidence.uri;
       evidenceGraph = evidence.graph;
+      if (a.evidenceLinks) {
+        const ONT = 'urn:shared:ontology#';
+        const lines = [
+          ...a.evidenceLinks.episodes.map((e) => `${sparqlIri(evidence.uri)} <${ONT}sourceEpisode> ${sparqlIri(e)} .`),
+          ...a.evidenceLinks.claims.map((c) => `${sparqlIri(evidence.uri)} <${ONT}supportClaim> ${sparqlIri(c)} .`),
+        ];
+        if (lines.length > 0) {
+          await this.triplestore.update(
+            `INSERT DATA { GRAPH ${sparqlIri(evidence.graph)} {\n${lines.join('\n')}\n} }`,
+          );
+        }
+      }
     }
 
     // All claims live in the agent claims graph — there is no proposal
@@ -1930,16 +2076,7 @@ export class KnowledgeEngine {
       newClaimUri,
     );
 
-    return {
-      success: true,
-      subjectUri: subject.uri,
-      predicateUri: predicate.uri,
-      objectUri,
-      newEntities,
-      newProperties,
-      tripleCount: 1,
-      claimUri: newClaimUri,
-    };
+  return { claimUri: newClaimUri };
   }
 
   // ── Core Named Graphs ──
