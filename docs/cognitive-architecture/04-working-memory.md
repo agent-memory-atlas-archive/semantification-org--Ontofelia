@@ -384,6 +384,18 @@ Done by the queued persist of the next cycle, never on the reply path:
 - **Overflow.** When the capacity forces out an entry above salience 0.7, one
   `wm-overflow` impasse is raised for the cycle (metacognition on), carrying
   `cogt:forUser`.
+- **Carried entries in the live prompt.** With `flagWorkingMemoryPrompt` on, the
+  prompt of a turn also contains what the carry will bring in. The assembler
+  reads the previous cycle's graph of the same session and user (read-only, at
+  most 20 rows, highest salience first), keeps entries written for exactly this
+  sender with `carryForward = true` that are not expired, takes the carry decay
+  (salience x 0.7), and keeps those still at or above θ. Self and goal entries
+  are not read: they are rebuilt every turn. The text is neutralised like any
+  quoted text, and the assembler's own caps apply (three notes, the recalled
+  cap, the total cap). Notes appear as `- Previously noted: <text>` in `[Note]`;
+  retrieval entries join `[Recalled]` when recall is on. The link to the
+  previous cycle is held in memory, so the first turn after a restart has
+  nothing to read. With the flag off nothing is read.
 - **Setup keys.** `salienceThreshold` (θ, default 0.5) and
   `workingMemoryCapacity` (integer 1 to 10000, default 200).
 

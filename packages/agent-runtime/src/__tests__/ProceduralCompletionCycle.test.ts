@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { OxigraphAdapter, GraphRegistry, ProceduralMemory } from '@ontofelia/semantic-memory';
 import type { TriplestoreAdapter, MessageEnvelope } from '@ontofelia/core';
 import { CycleManager, type ToolEpisodeEvent } from '../cognitive/CycleManager.js';
+import { fixedKeySource } from '../cognitive/ArgDigestKey.js';
 
 // Procedural memory completion at the cycle level: adherence, the suggestion
 // filter, redaction (a whole-store dump), the follow-up signal, privacy.
@@ -22,7 +23,9 @@ const HEX40 = '0123456789abcdef0123456789abcdef01234567';
 const JWT = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0In0.fakesignature0000';
 const BEARER_VALUE = 'test-token-0000000000';
 const PASSWORD = 'not-a-real-password-0000';
-const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+// An obviously fake key for the tests.
+const KEY = Buffer.alloc(32, 7);
+const sha = (s: string) => createHmac('sha256', KEY).update(s).digest('hex');
 
 type Sender = MessageEnvelope['sender'];
 const OWNER: Sender = { id: 'user:testuser', channelPrefix: 'webchat', isOwner: true };
@@ -48,7 +51,7 @@ describe('procedural memory completion (cycle level)', () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), 'proc-completion-cycle-'));
     store = new OxigraphAdapter();
     await store.initialize({ backend: 'oxigraph', type: 'embedded', dataDir: dir, port: 0, endpoint: '' });
-    cm = new CycleManager(store, GraphRegistry.create([AGENT]), AGENT, undefined, { awaitPersist: true });
+    cm = new CycleManager(store, GraphRegistry.create([AGENT]), AGENT, undefined, { awaitPersist: true, argDigestKey: fixedKeySource(KEY) });
     prompts = [];
   });
 
@@ -151,7 +154,7 @@ describe('procedural memory completion (cycle level)', () => {
     expect(await rows(`SELECT ?s WHERE { GRAPH <${PROC}> { ?s a <${COGT}AdherenceSummary> } }`)).toHaveLength(0);
   });
 
-  it('never lets a secret-shaped argument reach the store, and keeps only its sha256', async () => {
+  it('never lets a secret-shaped argument reach the store, and keeps only its keyed digest', async () => {
     const args = {
       query: 'plain question',
       api_key: SK, // masked by key
@@ -169,8 +172,8 @@ describe('procedural memory completion (cycle level)', () => {
     for (const raw of [SK, HEX40, JWT, BEARER_VALUE, PASSWORD]) expect(dump).not.toContain(raw);
     // The keys are there (that is the brief), the digests of the masked values too.
     expect(dump).toContain('query, api_key, note, commit, session, headers, line, password');
-    for (const v of [SK, HEX40, JWT, PASSWORD]) expect(dump).toContain(`sha256:${sha(v)}`);
-    expect(dump).toContain(`headers.Authorization=sha256:${sha(`Bearer ${BEARER_VALUE}`)}`);
+    for (const v of [SK, HEX40, JWT, PASSWORD]) expect(dump).toContain(`hmac-sha256:${sha(v)}`);
+    expect(dump).toContain(`headers.Authorization=hmac-sha256:${sha(`Bearer ${BEARER_VALUE}`)}`);
     // The unmasked, ordinary value is not stored either: briefs are keys only.
     expect(dump).not.toContain('plain question"');
     const masked = await rows(`SELECT ?m WHERE { GRAPH <${PROC}> { ?t <${COGT}maskedArg> ?m } }`);
@@ -182,7 +185,7 @@ describe('procedural memory completion (cycle level)', () => {
     await store.update(`INSERT DATA { GRAPH <urn:${AGENT}:setup> { <urn:${AGENT}:setup:cognitive> <${COGT}argRedactionRules> ${JSON.stringify(rules)} } }`);
     await turn('what is oxigraph?', [{ tool: 'unlock', args: { pin: 4711, token: 'abc' } }], { procedural: true });
     const masked = (await rows(`SELECT ?m WHERE { GRAPH <${PROC}> { ?t <${COGT}maskedArg> ?m } }`)).map((b) => b.m.value).sort();
-    expect(masked).toEqual([`pin=sha256:${sha('4711')}`, `token=sha256:${sha('abc')}`].sort());
+    expect(masked).toEqual([`pin=hmac-sha256:${sha('4711')}`, `token=hmac-sha256:${sha('abc')}`].sort());
   });
 
   it('with procedural memory off the prompt is the golden one and nothing new is written', async () => {

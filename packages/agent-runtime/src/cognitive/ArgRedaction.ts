@@ -3,10 +3,11 @@
  *
  * A skill trace never stores an argument value. It stores the argument *keys*
  * (`toolArgsBrief`) and, for every argument the redaction rules mask, the
- * sha256 of the masked value, so two calls can be compared for equality without
- * the value being kept. (A hash of a low-entropy value, e.g. a 4-digit PIN, can
- * be guessed by brute force; the keys-only brief is the real protection, the
- * hash is only an equality handle.)
+ * keyed digest of the masked value (HMAC-SHA256 under a per-instance key, see
+ * ArgDigestKey.ts), so two calls can be compared for equality without the value
+ * being kept. A plain hash of a weak value, e.g. a 4-digit PIN, can be guessed by
+ * brute force; the key makes that impossible without the instance's key file. The
+ * keys-only brief remains the main protection. Without a key no digest is made.
  *
  * Rules: a conservative built-in set that cannot be switched off, plus optional
  * additions from the setup graph (`cog:argRedactionRules` on the cognitive
@@ -24,7 +25,7 @@
  * group) is ignored; at most 20 patterns per list are used.
  */
 
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { looksLikeSecret } from './privacyClass.js';
 
 export interface ArgRedactionRules {
@@ -32,11 +33,15 @@ export interface ArgRedactionRules {
   valuePatterns: RegExp[];
 }
 
+/** The digest schemes of a masked argument; `sha256` is the unkeyed one of older records. */
+export type ArgDigestScheme = 'hmac-sha256' | 'sha256';
+
 export interface MaskedArg {
   /** Dotted path of the argument, sanitised (keys and `[index]` only). */
   path: string;
-  /** Lower-case hex sha256 of the raw value (a string as is, else its JSON). */
-  sha256: string;
+  /** Lower-case hex HMAC-SHA256 of the raw value (a string as is, else its JSON); absent without a key. */
+  digest?: string;
+  scheme?: ArgDigestScheme;
 }
 
 export interface RedactedArgs {
@@ -100,10 +105,10 @@ export function parseArgRedactionRules(raw: string | undefined): ArgRedactionRul
   return rules;
 }
 
-/** sha256 (hex) of a value: a string as is, anything else as JSON. */
-export function hashArgValue(value: unknown): string {
+/** HMAC-SHA256 (hex) of a value under `key`: a string as is, anything else as JSON. */
+export function hashArgValue(value: unknown, key: Buffer): string {
   const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
-  return createHash('sha256').update(text).digest('hex');
+  return createHmac('sha256', key).update(text).digest('hex');
 }
 
 function keyMatches(key: string, rules: ArgRedactionRules): boolean {
@@ -124,16 +129,18 @@ function safeKey(key: string): string {
 }
 
 /**
- * Redact one tool call's arguments: a keys-only brief and the sha256 of every
- * masked value. Pure; reads nothing; never returns a raw value.
+ * Redact one tool call's arguments: a keys-only brief and the keyed digest of
+ * every masked value (only the path when no `key` is given). Pure; reads
+ * nothing; never returns a raw value.
  */
-export function redactToolArgs(args: unknown, rules: ArgRedactionRules): RedactedArgs {
+export function redactToolArgs(args: unknown, rules: ArgRedactionRules, key?: Buffer): RedactedArgs {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     return { brief: '', masked: [] };
   }
   const masked: MaskedArg[] = [];
   const mask = (path: string, value: unknown) => {
-    if (masked.length < MAX_MASKED) masked.push({ path, sha256: hashArgValue(value) });
+    if (masked.length >= MAX_MASKED) return;
+    masked.push(key ? { path, digest: hashArgValue(value, key), scheme: 'hmac-sha256' } : { path });
   };
   const walk = (value: unknown, path: string, depth: number) => {
     if (typeof value === 'string') {

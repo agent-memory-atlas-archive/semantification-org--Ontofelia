@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import {
   defaultArgRedactionRules,
   hashArgValue,
@@ -7,7 +7,9 @@ import {
   redactToolArgs,
 } from '../cognitive/ArgRedaction.js';
 
-const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+// An obviously fake key for the tests; the real one is generated per instance.
+const KEY = Buffer.alloc(32, 7);
+const mac = (s: string, key: Buffer = KEY) => createHmac('sha256', key).update(s).digest('hex');
 
 // Obviously fake credentials; none of these is a real secret.
 const SK = 'sk-test-0000000000000000000000000000';
@@ -18,17 +20,18 @@ const BEARER = 'Authorization: Bearer test-token-0000000000';
 describe('redactToolArgs', () => {
   const rules = defaultArgRedactionRules();
 
-  it('keeps the brief keys-only and masks secret-shaped values by their sha256', () => {
+  it('keeps the brief keys-only and masks secret-shaped values by their keyed digest', () => {
     const r = redactToolArgs(
       { query: 'plain question', note: SK, blob: HEX40, tok: JWT, header: BEARER },
       rules,
+      KEY,
     );
     expect(r.brief).toBe('query, note, blob, tok, header');
-    const by = new Map(r.masked.map((m) => [m.path, m.sha256]));
-    expect(by.get('note')).toBe(sha(SK));
-    expect(by.get('blob')).toBe(sha(HEX40));
-    expect(by.get('tok')).toBe(sha(JWT));
-    expect(by.get('header')).toBe(sha(BEARER));
+    const by = new Map(r.masked.map((m) => [m.path, m.digest]));
+    expect(by.get('note')).toBe(mac(SK));
+    expect(by.get('blob')).toBe(mac(HEX40));
+    expect(by.get('tok')).toBe(mac(JWT));
+    expect(by.get('header')).toBe(mac(BEARER));
     expect(by.has('query')).toBe(false);
     expect(JSON.stringify(r)).not.toContain(SK);
     expect(JSON.stringify(r)).not.toContain(HEX40);
@@ -45,20 +48,22 @@ describe('redactToolArgs', () => {
         apiKeyValue: { nested: 'x' },
       },
       rules,
+      KEY,
     );
     const paths = r.masked.map((m) => m.path).sort();
     expect(paths).toEqual(['apiKeyValue', 'headers.Cookie', 'headers.X-Api-Key', 'list[0].authToken', 'password'].sort());
-    expect(r.masked.find((m) => m.path === 'list[0].authToken')?.sha256).toBe(sha('1234'));
-    expect(r.masked.find((m) => m.path === 'apiKeyValue')?.sha256).toBe(sha(JSON.stringify({ nested: 'x' })));
+    expect(r.masked.find((m) => m.path === 'list[0].authToken')?.digest).toBe(mac('1234'));
+    expect(r.masked.find((m) => m.path === 'apiKeyValue')?.digest).toBe(mac(JSON.stringify({ nested: 'x' })));
   });
 
   it('equal values hash equal, different values differ', () => {
-    const a = redactToolArgs({ token: 'same' }, rules).masked[0].sha256;
-    const b = redactToolArgs({ token: 'same' }, rules).masked[0].sha256;
-    const c = redactToolArgs({ token: 'other' }, rules).masked[0].sha256;
+    const a = redactToolArgs({ token: 'same' }, rules, KEY).masked[0].digest;
+    const b = redactToolArgs({ token: 'same' }, rules, KEY).masked[0].digest;
+    const c = redactToolArgs({ token: 'other' }, rules, KEY).masked[0].digest;
     expect(a).toBe(b);
     expect(a).not.toBe(c);
-    expect(hashArgValue('same')).toBe(a);
+    expect(hashArgValue('same', KEY)).toBe(a);
+    expect(redactToolArgs({ token: 'same' }, rules, KEY).masked[0].scheme).toBe('hmac-sha256');
   });
 
   it('does not mask ordinary values and never lists a secret-shaped key', () => {

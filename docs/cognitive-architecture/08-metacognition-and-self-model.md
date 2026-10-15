@@ -212,6 +212,17 @@ Derived tool capabilities are never unscoped and never scoped to
 Constraints are not goal-scoped and are always returned, so on a fresh install
 `queryFor` returns rows for every goal type as soon as the derivation has run.
 
+**When it is derived.** At start, when the self-model flag is switched on, on
+`/reseed-persona`, after the gateway's `POST /api/ontology/reseed-self` (which the
+CLI command `reseed-self` calls; the response then carries `selfModel` with the
+counts, or `selfModelError`), and before a cycle when the tools or their
+verdicts changed since the last derivation (a plugin, a tool the gateway
+registers once the runtime is up, a removed tool): the registry is compared by a
+fingerprint of name, category, verdict and description, and a change derives
+again, once, before that turn. Always only with the self-model flag on. Without a
+goal type (goal stack off) `queryFor` returns the capabilities that are
+generally relevant and every constraint.
+
 **What the prompt says.** Every `[Self]` line is a fixed template; store text
 fills one slot and goes through `neutraliseQuoted` (built on `neutraliseLine`)
 first. A row that does not fit its template is left out.
@@ -371,6 +382,12 @@ report returned to the owner covers the owner's scope only. The former
 `ReflectionRunner` body (worldview triple count, conflict detection, reflection
 event) lives in `reflectOnWorldview`; `ReflectionRunner.reflect` delegates to it,
 and `crossCycleScan` runs it for the owner scope when given a conflict detector.
+The runtime hands the weekly scan (`/cog scan`, the `cog.metacog-scan` job) the
+same detector the gateway's reflection endpoint uses (`setConflictDetector`), so
+the scheduled scan also runs the worldview reflection once, for the owner scope,
+and no other user's scan does. Without a detector the scan skips it. The gateway
+endpoint `POST /api/reasoning/reflect` is unchanged: it still calls
+`ReflectionRunner.reflect`, which delegates to the same function.
 
 ---
 
@@ -428,7 +445,14 @@ stack is on. Worldview facts and changes made before the turn do not count.
 
 The **churn warning** is a `metaBuffer` entry (kind `churn-warning`, salience
 0.8, `carryForward false`) recorded when the 5th tool call of a turn starts,
-once per turn, and written by the queued persist.
+once per turn, and written by the queued persist. The 5th call is counted in
+the per-cycle tool sink, which the blocking and the streamed core both report
+through, so a streamed turn gets the warning too, exactly once.
+
+The **daily impasse cap** (the count after which a kind of impasse becomes a
+`cogt:ChronicImpasse`) is counted per user: one user's impasses never exhaust
+another's. The owner's scope also counts records written before the user key
+existed.
 
 ---
 

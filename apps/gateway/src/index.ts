@@ -192,6 +192,9 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   const bootstrapDir = path.resolve(currentDir, '..', '..', '..', 'bootstrap');
   const defaultAgent = new AgentRuntime(PRIMARY_AGENT_ID, defaultAgentConfig, provider, sessionStore, toolRegistry, toolPolicy, auditLog, skillRegistry, skillExecutor, pluginRegistry, config.provider as import('@ontofelia/core').ProviderConfig, knowledgeEngine, bootstrapDir);
   await defaultAgent.initialize();
+  // The agent's state directory (the parent of its sessions) holds the key of the
+  // digests of masked tool arguments.
+  defaultAgent.setStateDir(path.dirname(agentsPath));
 
   const agents = new Map<string, AgentRuntime>();
   agents.set(PRIMARY_AGENT_ID, defaultAgent);
@@ -324,6 +327,17 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   toolRegistry.register(new UpdateGoalStepTool({
     update: async (req) => agents.get(req.agentId)?.updateGoalStep(req),
   }));
+
+  // The self-model was derived at initialize(), before the tools above existed:
+  // derive it again now that the registry is complete (a no-op with the
+  // self-model flag off). Later changes are picked up before the next cycle.
+  await defaultAgent
+    .seedDerivedSelfModelIfEnabled()
+    .catch((e) => logger.warn('Self-model derivation after tool registration failed: ' + (e as Error).message));
+
+  // The weekly metacognitive scan runs the worldview reflection for the owner
+  // with the same conflict detector the reflection endpoint uses.
+  defaultAgent.setConflictDetector(conflictDetector);
 
   scheduler.onJob(async (job) => {
     // Initiative wakes are routed to the InitiativeService, which enforces the

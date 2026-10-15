@@ -126,15 +126,15 @@ describe('ProceduralMemory completion', () => {
     expect(s.satisfactionRate).toBeCloseTo(0.5, 4);
   });
 
-  it('stores forUser and only sha256 digests of masked args', async () => {
+  it('stores forUser and only digests of masked args, each with its scheme', async () => {
     const digest = 'a'.repeat(64);
     const uri = await pm.recordTrace(
       trace({
         forUser: 'alice',
         maskedArgs: [
-          { path: 'headers.authorization', sha256: digest },
-          { path: 'raw.value', sha256: 'sk-test-000000000000000000000000' }, // not a digest: refused
-          { path: 'bad path/with spaces', sha256: 'b'.repeat(64) },
+          { path: 'headers.authorization', digest, scheme: 'hmac-sha256' },
+          { path: 'raw.value', digest: 'sk-test-000000000000000000000000' }, // not a digest: refused
+          { path: 'bad path/with spaces', digest: 'b'.repeat(64) }, // no scheme: the unkeyed sha256 of older callers
         ],
       }),
     );
@@ -143,7 +143,7 @@ describe('ProceduralMemory completion', () => {
     for (const b of r.bindings ?? []) byPred.set(b.p.value, [...(byPred.get(b.p.value) ?? []), b.o.value]);
     expect(byPred.get(`${COGT}forUser`)).toEqual(['alice']);
     expect((byPred.get(`${COGT}maskedArg`) ?? []).sort()).toEqual(
-      [`headers.authorization=sha256:${digest}`, `bad_path_with_spaces=sha256:${'b'.repeat(64)}`].sort(),
+      [`headers.authorization=hmac-sha256:${digest}`, `bad_path_with_spaces=sha256:${'b'.repeat(64)}`].sort(),
     );
     const dump = JSON.stringify(r.bindings);
     expect(dump).not.toContain('sk-test');

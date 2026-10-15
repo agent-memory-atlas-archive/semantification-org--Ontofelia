@@ -9,7 +9,8 @@ import { PluginRegistry } from '@ontofelia/plugins';
 import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, EpisodicConsolidation, GraphUriResolver } from '@ontofelia/semantic-memory';
 import type { SemanticParseResult, ConsolidationReport, EpisodicConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
 import { GoalStack } from './cognitive/GoalStack.js';
-import { seedDerivedSelfModel } from './cognitive/SelfModelSources.js';
+import { fileKeySource } from './cognitive/ArgDigestKey.js';
+import { seedDerivedSelfModel, collectSelfModelSources } from './cognitive/SelfModelSources.js';
 import { directGoalEpisodeSink } from './cognitive/GoalEpisodes.js';
 import { INITIATIVE_ALLOWED_TOOLS } from './initiativeTools.js';
 import * as fs from 'fs/promises';
@@ -35,7 +36,7 @@ import {
 import type { Goal, GoalViewer } from './cognitive/GoalStack.js';
 import { summarizeGoal, orderGoals, isOpenGoal } from './cognitive/goalSummary.js';
 import type { GoalSummary } from './cognitive/goalSummary.js';
-import type { EpisodeHit, EntityFact } from '@ontofelia/semantic-memory';
+import type { EpisodeHit, EntityFact, ConflictDetector } from '@ontofelia/semantic-memory';
 import { FACTS_PER_ENTITY } from './cognitive/Comprehension.js';
 
 // Initiative runtime (docs/initiative-architecture.md §5–§7). Re-exported so the
@@ -395,7 +396,62 @@ export class AgentRuntime {
   async seedDerivedSelfModelIfEnabled(): Promise<{ capabilities: number; constraints: number } | undefined> {
     if (!this.knowledgeEngine || !this.cognitiveConfig) return undefined;
     if (!(await this.cognitiveConfig.isSelfModelQueryEnabled())) return undefined;
-    return seedDerivedSelfModel(this.knowledgeEngine['triplestore'], this.agentId, this.toolRegistry, this.toolPolicy);
+    // The fingerprint is taken before the write, so a tool registered while the
+    // derivation runs is seen as new at the next turn.
+    const fingerprint = this.selfModelFingerprint();
+    const report = await seedDerivedSelfModel(this.knowledgeEngine['triplestore'], this.agentId, this.toolRegistry, this.toolPolicy);
+    this.derivedSelfFingerprint = fingerprint;
+    return report;
+  }
+
+  /** What the derived self-model reads from the registry and the policies, as one string. */
+  private selfModelFingerprint(): string {
+    const { tools } = collectSelfModelSources(this.toolRegistry, this.toolPolicy);
+    return JSON.stringify(
+      tools.map((t) => [t.name, t.category, t.policy, t.policyBeforeGuardian, t.description ?? '']).sort(),
+    );
+  }
+
+  /**
+   * Give the runtime the state directory of this agent. The key of the digests
+   * of masked tool arguments lives there (file `arg-digest.key`, mode 0600,
+   * created on first use). Without a state directory no digest is stored.
+   */
+  setStateDir(dir: string): void {
+    this.cycleManager?.setArgDigestKey(fileKeySource(dir, (err) => this.emitDebug('error', `cognitive write failed: ${(err as Error).message}`)));
+  }
+
+  /** Fingerprint of the registry at the last derivation (undefined: never derived). */
+  private derivedSelfFingerprint?: string;
+  private selfRefresh?: Promise<unknown>;
+
+  /**
+   * Before a cycle, with the self-model flag on: when tools were registered or
+   * changed after the last derivation (plugins, tools the gateway adds once the
+   * runtime is up), derive the self-model again, once per change, so the next
+   * `[Self]` block is right. A change in the registry is the only trigger; a
+   * failure is reported on the debug stream and not retried until the registry
+   * changes again. Does nothing with the flag off.
+   */
+  private async refreshSelfModelIfStale(selfModelEnabled: boolean): Promise<void> {
+    if (!selfModelEnabled || !this.knowledgeEngine) return;
+    try {
+      if (this.selfRefresh) {
+        await this.selfRefresh;
+        return;
+      }
+      const fingerprint = this.selfModelFingerprint();
+      if (fingerprint === this.derivedSelfFingerprint) return;
+      this.selfRefresh = this.seedDerivedSelfModelIfEnabled()
+        .catch((e) => this.emitDebug('error', `self-model derivation failed: ${(e as Error).message}`))
+        .finally(() => {
+          this.derivedSelfFingerprint = fingerprint;
+          this.selfRefresh = undefined;
+        });
+      await this.selfRefresh;
+    } catch (e) {
+      this.emitDebug('error', `self-model refresh failed: ${(e as Error).message}`);
+    }
   }
 
   pause(): void {
@@ -1252,6 +1308,7 @@ Users can use these commands:
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         const episodicRecallEnabled = await this.cognitiveConfig.isEpisodicRecallEnabled();
+        await this.refreshSelfModelIfStale(selfModelEnabled);
         return await this.cycleManager.runCycle(
           envelope,
           (recordTool, prepareGoals, recordInbound, perceive, comprehend, onToolCall) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive, comprehend, onToolCall),
@@ -1262,6 +1319,7 @@ Users can use these commands:
             episodicRecallEnabled,
             ...(await this.promptOptions()),
             attention: await this.cognitiveConfig.attentionSettings(),
+            ...(goalsEnabled ? { goalSupersedeAfterTurns: await this.cognitiveConfig.goalSupersedeAfterTurns() } : {}),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             // Surface the cognitive phases on the live debug stream so the
@@ -1435,7 +1493,22 @@ Users can use these commands:
       if (user === OWNER_USER_KEY) continue;
       await meta.crossCycleScan(window, { forUser: user });
     }
-    return meta.crossCycleScan(window, { forUser: OWNER_USER_KEY });
+    // The worldview reflection belongs to the owner scope only; it runs when a
+    // conflict detector was handed to the runtime and is skipped without one.
+    return meta.crossCycleScan(window, {
+      forUser: OWNER_USER_KEY,
+      ...(this.conflictDetector ? { reflection: { conflictDetector: this.conflictDetector } } : {}),
+    });
+  }
+
+  private conflictDetector?: Pick<ConflictDetector, 'detectConflicts' | 'storeConflicts'>;
+
+  /**
+   * Hand the runtime the conflict detector the weekly metacognitive scan uses
+   * for the owner's worldview reflection. Without one the scan skips it.
+   */
+  setConflictDetector(detector: Pick<ConflictDetector, 'detectConflicts' | 'storeConflicts'>): void {
+    this.conflictDetector = detector;
   }
 
   /**
@@ -2224,6 +2297,7 @@ Users can use these commands:
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         const episodicRecallEnabled = await this.cognitiveConfig.isEpisodicRecallEnabled();
+        await this.refreshSelfModelIfStale(selfModelEnabled);
         yield* this.cycleManager.runCycleStream<StreamChunk>(
           envelope,
           (recordTool, prepareGoals, recordInbound, perceive, comprehend) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound, perceive, comprehend),
@@ -2238,6 +2312,7 @@ Users can use these commands:
             episodicRecallEnabled,
             ...(await this.promptOptions()),
             attention: await this.cognitiveConfig.attentionSettings(),
+            ...(goalsEnabled ? { goalSupersedeAfterTurns: await this.cognitiveConfig.goalSupersedeAfterTurns() } : {}),
             resolveEntities: this.entityResolverFor(envelope),
             entityFacts: this.entityFactsFor(envelope),
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),

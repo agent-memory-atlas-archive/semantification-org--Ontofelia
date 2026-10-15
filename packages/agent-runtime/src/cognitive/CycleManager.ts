@@ -25,6 +25,7 @@
 import {
   OWNER_USER_KEY,
   cogUserKey,
+  compareIso,
   compareIsoDesc,
   createLogger,
   isHumanOwnerTurn,
@@ -50,6 +51,8 @@ import {
 import {
   WorkingMemory,
   OVERFLOW_SALIENCE,
+  CARRY_DECAY,
+  DEFAULT_THETA,
   type WMEntryInput,
   type WorkingMemoryOptions,
 } from './WorkingMemory.js';
@@ -59,6 +62,7 @@ import {
   type Assembled,
   type BlockDiff,
   type WorkspaceEntry,
+  MAX_QUOTED_LINE,
 } from './PromptAssembler.js';
 import type { AttentionSettings, PromptMode, PromptSettings } from './CognitiveConfig.js';
 import {
@@ -74,7 +78,8 @@ import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from '.
 import { writeGoalEpisode } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
 import { classifySatisfaction } from './Satisfaction.js';
-import { defaultArgRedactionRules, redactToolArgs } from './ArgRedaction.js';
+import { defaultArgRedactionRules, redactToolArgs, type MaskedArg } from './ArgRedaction.js';
+import type { ArgDigestKeySource } from './ArgDigestKey.js';
 import { CognitiveConfig } from './CognitiveConfig.js';
 import { neutraliseQuoted } from './untrustedText.js';
 import {
@@ -356,6 +361,13 @@ export interface RunCycleOptions {
    */
   attention?: AttentionSettings;
   /**
+   * With the goal stack on: a substantive goal that lost the competition and was
+   * neither chosen nor touched for this many turns of its session is abandoned
+   * ({@link SUPERSEDED_REASON}). Absent or 0: no goal is ever superseded. The
+   * runtime passes the setup value (`cog.goalSupersedeAfterTurns`, default 10).
+   */
+  goalSupersedeAfterTurns?: number;
+  /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
    * unattended cycle: Phase 3 does NOT seed the implicit RESPOND_TO_USER goal
@@ -381,7 +393,25 @@ interface GoalExtras {
   implicitUri?: string;
   /** What decided the turn's goal (see {@link GoalCause}); set by the conversational tree. */
   cause?: GoalCause;
+  /**
+   * The supersession of idle competition losers (goal stack on, conversational
+   * turn): the turn's winner and the number of turns after which a goal that
+   * was neither chosen nor touched is abandoned.
+   */
+  supersede?: { afterTurns: number; winner: string };
 }
+
+/** The reason stamped on a goal that a newer intent has superseded. */
+export const SUPERSEDED_REASON = 'superseded by newer intent';
+/** Goal types the decision tree creates from an intent; only these are superseded. */
+const SUPERSEDABLE_TYPES: ReadonlySet<string> = new Set([
+  GOAL_TYPES.AnswerQuestion,
+  GOAL_TYPES.ExecuteCommand,
+  GOAL_TYPES.HandleRequest,
+  GOAL_TYPES.AnswerInTopic,
+]);
+/** Most goals followed per session and user by the supersession bookkeeping. */
+const MAX_TRACKED_GOALS = 200;
 
 /**
  * Why the turn's goal is the goal: `cue` (the message closed the top goal),
@@ -493,10 +523,17 @@ interface ShadowRecord {
 
 /** New skill traces after which a consolidation is requested (doc 06 §5). */
 export const CONSOLIDATION_TRACE_THRESHOLD = 50;
+/** Most rows read from the previous cycle's graph for the live prompt. */
+const CARRIED_PROMPT_READ = 20;
 
 export interface CycleManagerOptions {
   /** Default for {@link RunCycleOptions.awaitPersist}; a per-call value wins. */
   awaitPersist?: boolean;
+  /**
+   * Key of the digests of masked tool arguments (procedural traces). Without a
+   * source no digest is stored, only the path of the masked argument.
+   */
+  argDigestKey?: ArgDigestKeySource;
 }
 
 export class CycleManager {
@@ -533,6 +570,8 @@ export class CycleManager {
    * this process (the first touch of a session; see {@link CycleManager.manageGoals}).
    */
   private readonly touchedGoalSessions = new Set<string>();
+  /** Turn counter and per-goal last-activity turn, per session and user (see {@link supersedeIdleLosers}). */
+  private readonly goalTurns = new Map<string, { turn: number; goals: Map<string, { lastActiveTurn: number; updatedAt: string }> }>();
   /** Background work (queued persists, triggered consolidations) not yet settled. */
   private readonly inFlight = new Set<Promise<unknown>>();
 
@@ -551,6 +590,13 @@ export class CycleManager {
   ): void {
     this.consolidationTrigger = trigger;
     this.consolidationThreshold = threshold;
+  }
+
+  private argDigestKey?: ArgDigestKeySource;
+
+  /** Set the key source of the digests of masked arguments (see {@link CycleManagerOptions.argDigestKey}). */
+  setArgDigestKey(source: ArgDigestKeySource | undefined): void {
+    this.argDigestKey = source;
   }
 
   /** Reset the new-trace counter (a consolidation just ran, whoever started it). */
@@ -756,16 +802,6 @@ export class CycleManager {
         this.onError?.(e);
       }
     };
-    const recordTool: ToolEpisodeRecorder = (ev) => {
-      noteAction(ev);
-      if (ev.args !== undefined && options.proceduralEnabled !== true) {
-        const { args: _dropped, ...rest } = ev;
-        toolEvents.push(rest);
-        return;
-      }
-      toolEvents.push(ev);
-    };
-
     // Phase 3/4 (Phase D). The core invokes this once the session is resolved;
     // it runs the goal decision tree and hands back the `[Active goal]` prompt
     // text. The chosen goal's URI is captured per-cycle so Phase 5 can backfill
@@ -784,8 +820,12 @@ export class CycleManager {
     const signals: TurnSignals = { storedFacts: 0 };
     // Meta entries collected during the turn; the queued persist writes them.
     const metaWm: WMEntryInput[] = [];
+    // Churn warning (metacognition): one entry per turn, at the fifth tool call.
+    // The calls are counted in the tool sink below, which the blocking and the
+    // streamed core both report through; `onToolCall` (the blocking core's own
+    // count) feeds the same guard, so a turn never gets two.
     let churnWritten = false;
-    const onToolCall: ToolCallHook = (callCount) => {
+    const noteToolCount = (callCount: number): void => {
       if (!mcOn || churnWritten || callCount < CHURN_TOOL_CALLS) return;
       churnWritten = true; // once per turn
       metaWm.push({
@@ -795,6 +835,21 @@ export class CycleManager {
         salience: CHURN_SALIENCE,
         carryForward: false,
       });
+    };
+    const onToolCall: ToolCallHook = noteToolCount;
+    const calledIds = new Set<string>();
+    const recordTool: ToolEpisodeRecorder = (ev) => {
+      noteAction(ev);
+      if (ev.phase === 'called' && !calledIds.has(ev.callId)) {
+        calledIds.add(ev.callId);
+        noteToolCount(calledIds.size);
+      }
+      if (ev.args !== undefined && options.proceduralEnabled !== true) {
+        const { args: _dropped, ...rest } = ev;
+        toolEvents.push(rest);
+        return;
+      }
+      toolEvents.push(ev);
     };
     // Phase 1 (perception) in memory, plus the phase boundaries measured as the
     // hooks run. `perceivedAt` closes Phase 1; the goal hook brackets Phase 3.
@@ -885,40 +940,54 @@ export class CycleManager {
     // final prompt really shows (decided in prepareGoals).
     let suggestionItems: Array<{ text: string; tools: string[] }> = [];
     let shownTools: string[] | undefined;
+    // The live prompt builds each cognitive block from its own flag, so the
+    // skills and self blocks no longer wait for the goal stack. With the goal
+    // stack off the goal blocks are absent and the goal type is unknown. The
+    // shadow and legacy paths keep their old dependency on the goal stack.
+    const goalsOn = options.goalsEnabled === true;
+    const decoupled = promptMode === 'live' && mode === 'conversational';
     const prepareGoalsInner: GoalContextProvider = async (sessionId) => {
-      if (!options.goalsEnabled) return undefined;
+      if (!goalsOn && !decoupled) return undefined;
       try {
-        const gs = new GoalStack(
-          this.triplestore,
-          this.registry,
-          this.agentId,
-          sessionId,
-          undefined,
-          this.viewerOf(envelope),
-          // Episodes of this turn's transitions are written by the queued persist.
-          (t) => {
-            goalExtras.events.push(t);
-          },
-        );
-        const managed =
-          mode === 'conversational'
-            ? await this.manageConversationalGoals(gs, envelope, sessionId, startedAt, perception, goalExtras)
-            : await this.manageInitiativeGoals(gs, options.initiativeGoalUri);
-        const goal = managed.goal;
-        goalConflict = managed.conflict;
-        if (mcOn) signals.goalDrift = this.noteTopGoal(sessionId, userKey, goal, goalExtras.cause);
-        activeGoalUri = goal.uri;
-        activeGoalType = goal.goalType;
-        emitPhase('goal_management', 'Deliberation', { goalType: goal.goalType });
-        const sections = [this.renderActiveGoal(goal)];
-        if (promptMode !== 'off') {
-          const body = sections[0].slice('[Active goal]\n'.length);
-          phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-active', text: body, salience: goalSalience(0), forUser: userKey });
-          queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-active', payload: body, salience: goalSalience(0), forGoal: goal.uri });
-          // Parents of the top goal, nearest first (doc 04 §4).
-          for (const p of await this.goalParents(gs, goal)) {
-            phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', text: p.text, salience: p.salience, forUser: userKey });
-            queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', payload: p.text, salience: p.salience, forGoal: p.uri });
+        const sections: string[] = [];
+        let goalType: string | undefined;
+        if (goalsOn) {
+          const gs = new GoalStack(
+            this.triplestore,
+            this.registry,
+            this.agentId,
+            sessionId,
+            undefined,
+            this.viewerOf(envelope),
+            // Episodes of this turn's transitions are written by the queued persist.
+            (t) => {
+              goalExtras.events.push(t);
+            },
+          );
+          const managed =
+            mode === 'conversational'
+              ? await this.manageConversationalGoals(gs, envelope, sessionId, startedAt, perception, goalExtras)
+              : await this.manageInitiativeGoals(gs, options.initiativeGoalUri);
+          const goal = managed.goal;
+          goalConflict = managed.conflict;
+          if (mcOn) signals.goalDrift = this.noteTopGoal(sessionId, userKey, goal, goalExtras.cause);
+          activeGoalUri = goal.uri;
+          activeGoalType = goal.goalType;
+          goalType = goal.goalType;
+          if (mode === 'conversational' && (options.goalSupersedeAfterTurns ?? 0) > 0) {
+            goalExtras.supersede = { afterTurns: options.goalSupersedeAfterTurns as number, winner: goal.uri };
+          }
+          emitPhase('goal_management', 'Deliberation', { goalType: goal.goalType });
+          sections.push(this.renderActiveGoal(goal));
+          if (promptMode !== 'off') {
+            const body = sections[0].slice('[Active goal]\n'.length);
+            phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-active', text: body, salience: goalSalience(0), forUser: userKey });
+            queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-active', payload: body, salience: goalSalience(0), forGoal: goal.uri });
+            // Parents of the top goal, nearest first (doc 04 §4).
+            for (const p of await this.goalParents(gs, goal)) {
+              phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', text: p.text, salience: p.salience, forUser: userKey });
+              queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', payload: p.text, salience: p.salience, forGoal: p.uri });
+            }
           }
         }
         // E4 — bias action selection with learned skills for this goal type.
@@ -927,7 +996,7 @@ export class CycleManager {
             sessionId,
             cycleId,
             cycleUri,
-            goal.goalType,
+            goalType,
             cogUserKey(envelope.sender),
           );
           if (skillsText) {
@@ -951,7 +1020,7 @@ export class CycleManager {
         }
         // G2 — seed the `[Self]` block from the queryable self-model.
         if (options.selfModelEnabled) {
-          const selfText = await this.renderSelfBlock(goal.goalType);
+          const selfText = await this.renderSelfBlock(goalType);
           if (selfText) {
             sections.push(selfText.text);
             if (promptMode !== 'off') {
@@ -964,7 +1033,7 @@ export class CycleManager {
             }
           }
         }
-        return sections.join('\n\n');
+        return sections.length > 0 ? sections.join('\n\n') : undefined;
       } catch (e) {
         this.onError?.(e);
         return undefined;
@@ -996,10 +1065,16 @@ export class CycleManager {
         const unknown = mcOn && isUnknownQuestion(perception?.intent, comprehension);
         const unknownNudge =
           unknown && (promptMode === 'shadow' || userKey === OWNER_USER_KEY || options.unknownNudgeAllUsers === true);
+        // Live prompt: what the previous cycle of this session and user carries
+        // forward (read-only, bounded, scoped to the sender).
+        const carried =
+          promptMode === 'live'
+            ? await this.carriedPromptEntries(sessionId, userKey, options.promptSettings?.theta ?? DEFAULT_THETA, cycleId)
+            : [];
         const composed = this.composeCognitivePrompt(promptMode, legacy, {
           perception,
           comprehension,
-          phaseView,
+          phaseView: carried.length > 0 ? [...phaseView, ...carried] : phaseView,
           userKey,
           unknownNudge,
           options,
@@ -1387,6 +1462,13 @@ export class CycleManager {
         this.onError?.(e);
       }
     }
+    if (goal.supersede) {
+      try {
+        await this.supersedeIdleLosers(envelope, sessionId, cycleId, episodicEnabled, goal.supersede);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
     if (goal.implicitUri) {
       try {
         // The implicit goal serves one cycle only (doc 07 §5.1), so sessions do
@@ -1401,6 +1483,85 @@ export class CycleManager {
         ).setStatus(goal.implicitUri, 'resolved');
       } catch (e) {
         this.onError?.(e);
+      }
+    }
+  }
+
+  /**
+   * Goal-competition losers (docs/cognitive-architecture/07 §5): a goal that
+   * lost to a newer intent stays active until something closes it. One turn of
+   * the session and user is counted per call. A substantive goal the user's
+   * decision tree created (not armed, not long-term, not the turn's winner) that
+   * was neither chosen nor touched (its `updatedAt` unchanged) for `afterTurns`
+   * turns is abandoned with {@link SUPERSEDED_REASON}, and the goal-abandoned
+   * episode is written for the goal's owner.
+   *
+   * The bookkeeping is in memory and bounded: a goal is first seen at the turn
+   * this process first reads it, so a restart only delays an abandonment, never
+   * hastens one. Goals with a mandate or a wake belong to the owner's order and
+   * are never superseded here.
+   */
+  private async supersedeIdleLosers(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    episodicEnabled: boolean,
+    rule: { afterTurns: number; winner: string },
+  ): Promise<void> {
+    const userKey = cogUserKey(envelope.sender);
+    const key = `${sessionId}\u0000${userKey}`;
+    let track = this.goalTurns.get(key);
+    if (!track) {
+      track = { turn: 0, goals: new Map() };
+      this.goalTurns.set(key, track);
+      if (this.goalTurns.size > LAST_CYCLE_MAX) {
+        const oldest = this.goalTurns.keys().next().value;
+        if (oldest !== undefined) this.goalTurns.delete(oldest);
+      }
+    }
+    track.turn++;
+    const transitions: GoalTransition[] = [];
+    const gs = new GoalStack(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      sessionId,
+      undefined,
+      this.viewerOf(envelope),
+      (t) => {
+        transitions.push({ ...t, reason: SUPERSEDED_REASON });
+      },
+    );
+    const active = (await gs.active()).filter((g) => g.goalType !== RESPOND_TO_USER && goalBelongsTo(g, userKey));
+    const live = new Set(active.map((g) => g.uri));
+    for (const uri of [...track.goals.keys()]) if (!live.has(uri)) track.goals.delete(uri);
+    for (const g of active) {
+      let rec = track.goals.get(g.uri);
+      if (!rec) {
+        if (track.goals.size >= MAX_TRACKED_GOALS) continue;
+        rec = { lastActiveTurn: track.turn, updatedAt: g.updatedAt };
+        track.goals.set(g.uri, rec);
+        continue;
+      }
+      if (g.uri === rule.winner || compareIso(g.updatedAt, rec.updatedAt) !== 0) {
+        rec.lastActiveTurn = track.turn;
+        rec.updatedAt = g.updatedAt;
+        continue;
+      }
+      const armed = g.mandatedBy !== undefined || g.wakeAt !== undefined || g.wakeEvery !== undefined;
+      if (armed || g.longTerm === true || !SUPERSEDABLE_TYPES.has(g.goalType)) continue;
+      if (track.turn - rec.lastActiveTurn < rule.afterTurns) continue;
+      await gs.setStatus(g.uri, 'abandoned', SUPERSEDED_REASON);
+      track.goals.delete(g.uri);
+    }
+    if (episodicEnabled && transitions.length > 0) {
+      const em = new EpisodicMemory(this.triplestore, this.agentId);
+      for (const t of transitions) {
+        try {
+          await writeGoalEpisode(em, t, { sessionId, cycleId });
+        } catch (e) {
+          this.onError?.(e);
+        }
       }
     }
   }
@@ -1425,6 +1586,55 @@ export class CycleManager {
     ];
     for (const l of choice.losers) lines.push(`<${uri}> <${COGT}loser> ${sparqlIri(l)} .`);
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+  }
+
+  /**
+   * The entries the previous cycle of this session and user carries into this
+   * one, for the live prompt (docs/cognitive-architecture/04 §11). The carry
+   * itself is written by the queued persist after the turn, so the prompt reads
+   * the previous graph and applies the carry rule: flagged (`carryForward`),
+   * not expired, written for exactly this sender, with the carry decay on the
+   * salience, kept only above θ. Self and goal entries are rebuilt every turn
+   * and are not read; the nudge kinds are fixed sentences of the current turn.
+   * Read-only, at most {@link CARRIED_PROMPT_READ} rows, text neutralised. A
+   * failed or empty read gives no entries and never reaches the reply.
+   */
+  private async carriedPromptEntries(
+    sessionId: string,
+    userKey: string,
+    theta: number,
+    cycleId: string,
+  ): Promise<WorkspaceEntry[]> {
+    try {
+      if (userKey === '') return [];
+      const prevCycleId = this.lastCycle.get(`${sessionId}\u0000${userKey}`);
+      if (!prevCycleId || prevCycleId === cycleId) return [];
+      const prev = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, prevCycleId, userKey);
+      const rows = await prev.read({ carryForwardOnly: true, forUser: userKey, limit: CARRIED_PROMPT_READ });
+      const out: WorkspaceEntry[] = [];
+      for (const e of rows) {
+        if (e.forUser !== userKey) continue;
+        if (e.expiresAfter !== undefined && e.expiresAfter <= 0) continue;
+        if (e.buffer === 'selfBuffer' || e.buffer === 'goalBuffer' || e.buffer === 'perceptionBuffer') continue;
+        if (e.entryKind === UNKNOWN_NUDGE_ENTRY_KIND || e.entryKind === CHURN_ENTRY_KIND) continue;
+        const salience = e.salience * CARRY_DECAY;
+        if (salience < theta) continue;
+        const text = neutraliseQuoted(e.payload, MAX_QUOTED_LINE);
+        if (text === '') continue;
+        out.push({
+          buffer: e.buffer,
+          entryKind: e.entryKind,
+          text,
+          salience,
+          ...(e.retrievalScore !== undefined ? { retrievalScore: e.retrievalScore * CARRY_DECAY } : {}),
+          forUser: userKey,
+        });
+      }
+      return out;
+    } catch (e) {
+      this.onError?.(e);
+      return [];
+    }
   }
 
   /** The goal-forest view of this turn's sender (see {@link GoalStack}). */
@@ -1537,19 +1747,21 @@ export class CycleManager {
     sessionId: string,
     cycleId: string,
     cycleUri: string,
-    goalType: string,
+    goalType: string | undefined,
     userKey: string,
   ): Promise<{ text: string; items: Array<{ kind: string; text: string; score: number; tools: string[] }> } | undefined> {
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
     // Only skills that have worked: a success rate of at least 0.7 over at
     // least 3 recorded calls (a low-success tool is never suggested).
     const [skills, sequences] = await Promise.all([
-      pm.suggestSkills(goalType, SKILL_SUGGESTION_K, {
+      pm.suggestSkills(goalType ?? '', SKILL_SUGGESTION_K, {
         minSuccessRate: SUGGESTION_MIN_SUCCESS_RATE,
         minSamples: SUGGESTION_MIN_SAMPLES,
+        ...(goalType === undefined ? { untyped: true } : {}),
       }),
-      pm.suggestSequenceSkills(goalType, SEQUENCE_SUGGESTION_K, {
+      pm.suggestSequenceSkills(goalType ?? '', SEQUENCE_SUGGESTION_K, {
         minSuccessRate: SUGGESTION_MIN_SUCCESS_RATE,
+        ...(goalType === undefined ? { untyped: true } : {}),
       }),
     ]);
     if (skills.length === 0 && sequences.length === 0) return undefined;
@@ -1612,7 +1824,7 @@ export class CycleManager {
    * capabilities/constraints yet, so an unmigrated agent adds nothing.
    */
   private async renderSelfBlock(
-    goalType: string,
+    goalType: string | undefined,
   ): Promise<
     { text: string; caps: Array<{ text: string; salience: number }>; cons: string[] } | undefined
   > {
@@ -2304,6 +2516,9 @@ export class CycleManager {
 
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
     const rules = await new CognitiveConfig(this.triplestore, this.agentId).argRedactionRules();
+    // The key is fetched (and its file created) only when an argument is masked.
+    let digestKey: Buffer | undefined;
+    let digestKeyRead = false;
     const suggested = suggestedTools && suggestedTools.length > 0 ? new Set(suggestedTools) : undefined;
     let adhered = 0;
     const sequenceLen = order.length;
@@ -2313,10 +2528,17 @@ export class CycleManager {
       const c = calls.get(callId)!;
       pos++;
       // The brief is keys only; a masked value is kept as its sha256 alone.
-      const redacted =
+      let redacted =
         c.args !== undefined
           ? redactToolArgs(c.args, rules)
-          : { brief: looksLikeSecret(c.argsBrief) ? '' : (c.argsBrief ?? ''), masked: [] };
+          : { brief: looksLikeSecret(c.argsBrief) ? '' : (c.argsBrief ?? ''), masked: [] as MaskedArg[] };
+      if (c.args !== undefined && redacted.masked.length > 0) {
+        if (!digestKeyRead) {
+          digestKeyRead = true;
+          digestKey = await (this.argDigestKey ?? this.defaults.argDigestKey)?.get();
+        }
+        if (digestKey) redacted = redactToolArgs(c.args, rules, digestKey);
+      }
       const brief = redacted.brief;
       // Adherence is recorded on every traced call, but only when the prompt
       // showed suggestions this turn; otherwise it is left unset.
@@ -2341,7 +2563,9 @@ export class CycleManager {
         sequenceLen,
         previousTrace,
         forUser: userKey,
-        ...(redacted.masked.length > 0 ? { maskedArgs: redacted.masked } : {}),
+        ...(redacted.masked.some((m) => m.digest !== undefined)
+          ? { maskedArgs: redacted.masked.flatMap((m) => (m.digest !== undefined ? [{ path: m.path, digest: m.digest, scheme: m.scheme ?? ('hmac-sha256' as const) }] : [])) }
+          : {}),
         ...(adherence !== undefined ? { proceduralAdherence: adherence } : {}),
       };
       previousTrace = await pm.recordTrace(trace);

@@ -367,9 +367,19 @@ there are no new reads or writes and the prompt is unchanged.
   nicht" are dissatisfied; "not bad", "nicht schlecht" are satisfied), and
   returns ambiguous for questions, contrast ("but", "aber") and long messages.
 - **Argument redaction.** A trace stores argument keys only. Every argument the
-  rules mask is stored as `cogt:maskedArg "<path>=sha256:<hex>"`, so equality can
-  be checked without keeping the value (a low-entropy value, such as a short PIN,
-  can still be guessed from its hash). Built-in rules: keys matching
+  rules mask is stored as `cogt:maskedArg "<path>=hmac-sha256:<hex>"`: the
+  HMAC-SHA256 of the value under a key that only this instance holds, so equality
+  can be checked without keeping the value and a weak value (a short PIN) cannot
+  be guessed from the stored text without the key. The key is 32 random bytes,
+  generated once, in the file `arg-digest.key` of the agent's state directory
+  (the parent of its sessions directory), mode 0600, created atomically (written
+  to a private temporary file and linked to its name, so a concurrent creator
+  never leaves a half-written key). It is never logged, printed, stored in the
+  triplestore or passed in a command line. Without a key (no state directory, or
+  the file cannot be read or created) no digest is stored, only the path of the
+  masked argument. Values written before this change keep the form
+  `<path>=sha256:<hex>`; the prefix names the scheme, two digests compare only
+  within one scheme, and there is no migration. Built-in rules: keys matching
   `token|secret|passw|key|auth|cookie|credential` (at any depth), values that
   match a known credential shape, hex runs of 32+ characters, base64-like runs of
   40+, and `Bearer`/`Basic` credentials. The setup graph may add rules with one

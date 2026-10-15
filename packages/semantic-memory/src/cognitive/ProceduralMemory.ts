@@ -60,17 +60,24 @@ export interface TraceInput {
   /** The cognitive user key of the turn's sender. */
   forUser?: string;
   /**
-   * Arguments the caller masked: a (sanitised) path and the sha256 of the raw
-   * value. The value itself never reaches this class; only the hash is stored,
-   * so two calls can be compared for equality without keeping the value.
+   * Arguments the caller masked: a (sanitised) path and a digest of the raw
+   * value (HMAC-SHA256 under the instance's key). The value itself never reaches
+   * this class; only the digest is stored, so two calls can be compared for
+   * equality without keeping the value.
    */
   maskedArgs?: MaskedArgHash[];
 }
 
-/** One masked tool argument: where it was and the sha256 (hex) of its value. */
+/**
+ * One masked tool argument: where it was and the digest (hex) of its value. The
+ * scheme names how the digest was made and is part of the stored text
+ * (`<path>=<scheme>:<hex>`); two digests compare only within one scheme. An
+ * absent scheme means the unkeyed `sha256` of older callers.
+ */
 export interface MaskedArgHash {
   path: string;
-  sha256: string;
+  digest: string;
+  scheme?: 'hmac-sha256' | 'sha256';
 }
 
 /** One cycle's summary of whether the LLM used the suggestions shown to it. */
@@ -170,6 +177,11 @@ export interface SuggestOptions {
   minSuccessRate?: number;
   /** Keep only skills with at least this many recorded calls. */
   minSamples?: number;
+  /**
+   * Keep only skills and sequences recorded without a goal type (the turns of
+   * an agent whose goal stack was off). Used with an empty goal type.
+   */
+  untyped?: boolean;
 }
 
 export interface TraceRetentionReport {
@@ -368,9 +380,10 @@ export class ProceduralMemory {
       );
     if (t.forUser) lines.push(`<${uri}> <${COGT}forUser> "${escapeLiteral(t.forUser)}" .`);
     for (const m of (t.maskedArgs ?? []).slice(0, 20)) {
-      if (!SHA256_HEX.test(m.sha256)) continue; // only a real digest is stored
+      if (!SHA256_HEX.test(m.digest)) continue; // only a real digest is stored
+      const scheme = m.scheme === 'hmac-sha256' ? 'hmac-sha256' : 'sha256';
       lines.push(
-        `<${uri}> <${COGT}maskedArg> "${escapeLiteral(`${safePath(m.path)}=sha256:${m.sha256}`)}" .`,
+        `<${uri}> <${COGT}maskedArg> "${escapeLiteral(`${safePath(m.path)}=${scheme}:${m.digest}`)}" .`,
       );
     }
 
@@ -545,6 +558,7 @@ export class ProceduralMemory {
     const eps = 1e-9;
     const skills = (await this.readSkills(forGoalType)).filter(
       (s) =>
+        (opts.untyped !== true || s.forGoalType === undefined) &&
         (opts.minSuccessRate === undefined || s.successRate >= opts.minSuccessRate - eps) &&
         (opts.minSamples === undefined || (s.sampleCount ?? s.successCount) >= opts.minSamples),
     );
@@ -560,10 +574,12 @@ export class ProceduralMemory {
   async suggestSequenceSkills(
     forGoalType: string,
     k = 3,
-    opts: Pick<SuggestOptions, 'minSuccessRate'> = {},
+    opts: Pick<SuggestOptions, 'minSuccessRate' | 'untyped'> = {},
   ): Promise<SequenceSkillSuggestion[]> {
     const seqs = (await this.readSequenceSkills(forGoalType)).filter(
-      (q) => opts.minSuccessRate === undefined || q.successRate >= opts.minSuccessRate - 1e-9,
+      (q) =>
+        (opts.untyped !== true || q.forGoalType === undefined) &&
+        (opts.minSuccessRate === undefined || q.successRate >= opts.minSuccessRate - 1e-9),
     );
     seqs.sort((a, b) => {
       if (b.successRate !== a.successRate) return b.successRate - a.successRate;

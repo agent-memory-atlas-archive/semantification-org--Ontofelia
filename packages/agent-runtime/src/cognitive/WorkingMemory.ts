@@ -106,6 +106,12 @@ export interface WMReadFilter {
   entryKind?: EntryKind;
   /** Inclusive lower bound on salience. */
   minSalience?: number;
+  /** Only entries written for exactly this user key (`cogt:forUser`). */
+  forUser?: string;
+  /** Only entries flagged `cogt:carryForward true`. */
+  carryForwardOnly?: boolean;
+  /** At most this many entries, highest salience first (a whole-graph read when absent). */
+  limit?: number;
 }
 
 /**
@@ -137,7 +143,7 @@ export const GOAL_BOOST = 0.2;
  */
 export const CARRY_FLOOR = 0.1;
 /** Salience multiplier applied to entries carried into the next cycle (§6). */
-const CARRY_DECAY = 0.7;
+export const CARRY_DECAY = 0.7;
 /** Default global-workspace cutoff (doc 04 §4). */
 export const DEFAULT_THETA = 0.5;
 
@@ -314,6 +320,12 @@ export class WorkingMemory {
     if (filter.entryKind) filters.push(`FILTER(?kind = "${escapeLiteral(filter.entryKind)}")`);
     if (filter.minSalience !== undefined)
       filters.push(`FILTER(?salience >= ${clamp01(filter.minSalience)})`);
+    if (filter.forUser !== undefined) filters.push(`FILTER(BOUND(?forUser) && ?forUser = "${escapeLiteral(filter.forUser)}")`);
+    if (filter.carryForwardOnly) filters.push(`FILTER(BOUND(?carryForward) && ?carryForward = true)`);
+    const limit =
+      filter.limit !== undefined && Number.isInteger(filter.limit) && filter.limit >= 1
+        ? `ORDER BY DESC(?salience) LIMIT ${Math.min(filter.limit, EXTRA_CAPACITY_MAX)}`
+        : '';
 
     const sparql = `
       SELECT ?entry ?buffer ?writtenBy ?writtenAt ?kind ?payload ?salience
@@ -345,7 +357,7 @@ export class WorkingMemory {
           OPTIONAL { ?entry <${COGT}durationMs>     ?durationMs . }
           ${filters.join('\n          ')}
         }
-      }`;
+      } ${limit}`;
 
     const res = await this.triplestore.query(sparql);
     const rows = res.bindings ?? [];

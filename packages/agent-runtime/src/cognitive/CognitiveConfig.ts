@@ -50,10 +50,14 @@ export interface PromptSettings {
  *
  *   cog.salienceThreshold       θ in [0,1]; default 0.5 (shared with the assembler)
  *   cog.workingMemoryCapacity   entries per cycle graph, integer 1..10000; default 200
+ *   cog.goalSupersedeAfterTurns idle competition losers are abandoned after this many turns; 1..1000, default 10 (goal stack on)
  *
  * A missing, unparseable or out-of-range value falls back to the default, which
  * equals the behaviour before the keys existed.
  */
+/** Default of `cog.goalSupersedeAfterTurns`. */
+export const DEFAULT_GOAL_SUPERSEDE_TURNS = 10;
+
 export interface AttentionSettings {
   theta: number;
   capacity: number;
@@ -307,6 +311,15 @@ export class CognitiveConfig {
       recalledTokenCap: cap(recalled, DEFAULT_RECALLED_TOKEN_CAP),
       totalTokenCap: cap(total, DEFAULT_TOTAL_TOKEN_CAP),
     };
+  }
+
+  /**
+   * Turns after which an idle competition loser is abandoned (setup key
+   * `cog.goalSupersedeAfterTurns`, integer 1..1000, default 10).
+   */
+  async goalSupersedeAfterTurns(): Promise<number> {
+    const n = await this.readNumber('goalSupersedeAfterTurns').catch(() => undefined);
+    return n !== undefined && Number.isInteger(n) && n >= 1 && n <= 1000 ? n : DEFAULT_GOAL_SUPERSEDE_TURNS;
   }
 
   /** θ and the working-memory capacity (see {@link AttentionSettings}). */

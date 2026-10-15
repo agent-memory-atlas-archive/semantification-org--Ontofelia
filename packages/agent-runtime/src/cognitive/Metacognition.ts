@@ -262,7 +262,7 @@ export class Metacognition {
   async flagImpasse(input: ImpasseInput): Promise<FlaggedImpasse> {
     const graph = this.metaGraphUri();
     const at = (input.occurredAt ?? new Date()).toISOString();
-    const recent = await this.countRecentImpasses(input.kind, input.occurredAt ?? new Date());
+    const recent = await this.countRecentImpasses(input.kind, input.occurredAt ?? new Date(), input.forUser);
     const cap = DAILY_CAP[input.kind] ?? DEFAULT_CAP;
     const chronic = recent >= cap;
     const uri = `urn:${this.agentId}:cog:impasse:${newId()}`;
@@ -489,13 +489,20 @@ export class Metacognition {
     return `${subject} <${COGT}forUser> "${escapeLiteral(user)}" .`;
   }
 
-  private async countRecentImpasses(kind: ImpasseKind, now: Date): Promise<number> {
+  /**
+   * The impasses of `kind` in the last 24 h for the daily cap, of one user: the
+   * owner's scope (the default, when no user is given) also holds the records
+   * written before the user key existed; another user counts only their own.
+   */
+  private async countRecentImpasses(kind: ImpasseKind, now: Date, forUser?: string): Promise<number> {
     const graph = this.metaGraphUri();
+    const user = forUser && forUser !== '' ? forUser : OWNER_USER_KEY;
     const res = await this.triplestore.query(`
       SELECT ?i ?at WHERE {
         GRAPH <${graph}> {
           ?i a <${COGT}Impasse> ; <${COGT}impasseKind> "${escapeLiteral(kind)}" ;
              <${COGT}flaggedAt> ?at .
+          ${this.userPattern('?i', user, 'c')}
         }
       }`);
     const cutoff = now.getTime() - 24 * 3_600_000;

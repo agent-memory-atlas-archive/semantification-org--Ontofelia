@@ -286,6 +286,14 @@ The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
 | `flagInitiative` | `initiative` | off | Allow self-started goal wakes (kill switch for unattended work). |
 | `flagEpisodicConsolidation` | `episodicConsolidation` | off | Daily, promote facts a user asserted in several independent episodes into that user's own graph (never the worldview). |
 
+In live mode (`flagWorkingMemoryPrompt`) every cognitive block depends only on its
+own flag and the live flag: `[Self]` on the self-model flag, `[Skills that
+worked ...]` on the procedural flag, `[Recalled]` on the recall flag, `[Note]`
+on metacognition. The goal stack is needed for the goal blocks only; with it off
+`[Active goal]` is absent, skills are drawn from those learned without a goal
+type, and `[Self]` shows the generally relevant capabilities and all constraints.
+The shadow and the legacy path keep their dependency on the goal stack.
+
 Setup keys that are **not** feature flags (same config subject, same graph):
 
 | Key | Kind | Default | Effect |
@@ -296,6 +304,7 @@ Setup keys that are **not** feature flags (same config subject, same graph):
 | `recalledTokenCap` | integer | `600` | Cap of the recalled block, in estimated tokens. |
 | `promptTokenCap` | integer | `1200` | Cap of all cognitive prompt blocks together. |
 | `workingMemoryCapacity` | integer 1..10000 | `200` | Entries per cycle graph. |
+| `goalSupersedeAfterTurns` | integer 1..1000 | `10` | With the goal stack on: turns after which a competition loser that was neither chosen nor touched is abandoned. |
 | `consolidationMinEpisodes` | integer 1..100 | `3` | Episodes needed to promote a fact. |
 | `consolidationMinGroups` | integer 1..100 | `2` | Independent groups needed to promote a fact. |
 

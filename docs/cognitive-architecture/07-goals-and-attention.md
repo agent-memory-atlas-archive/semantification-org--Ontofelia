@@ -400,7 +400,21 @@ is read or written.
 **Competition.** When goals compete the most recent intent (newest goal) wins;
 priority no longer decides. A `cogt:ChooseGoal` record in the cycle graph names
 the `winner`, the `loser`s and the rule (`chosenBecause`), with `forUser`. The
-losers stay active; they end by a cue, a tool or a later cleanup.
+losers stay active; they end by a cue, a tool, the supersession below or a
+later cleanup.
+
+**Superseded losers.** One turn of the session and user is counted when a turn's
+records are written (queued persist). A goal that the decision tree created from
+an intent (`AnswerQuestion`, `ExecuteCommand`, `HandleRequest`, `AnswerInTopic`),
+that is not the turn's winner and was neither chosen nor touched (its `updatedAt`
+unchanged) for N turns is set to `abandoned` with the reason
+"superseded by newer intent". N is the setup key `goalSupersedeAfterTurns`
+(integer 1 to 1000, default 10). The goal-abandoned episode is written for the
+goal's owner (`forUser`) while episodic memory is on, its text carrying the
+reason. Goals with a mandate or a wake, long-term goals and every other goal type
+are never superseded. The bookkeeping is in memory: a goal counts from the turn
+this process first read it, so a restart only delays an abandonment. Gated by
+`flagGoalStack`; without it nothing is read or written.
 
 **Episodes.** Every transition writes `goal-pushed`, `goal-resolved`,
 `goal-abandoned` or `goal-blocked` with `partOfGoal` and `forUser` (the goal's
