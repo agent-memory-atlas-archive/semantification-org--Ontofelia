@@ -128,6 +128,31 @@ export function isUserAliasSubject(subject: string): boolean {
   return USER_ALIASES.has((subject || '').trim().toLowerCase());
 }
 
+/** One-hop fact about a perceived entity, as returned by {@link KnowledgeEngine.getEntityFacts}. */
+export interface EntityFact {
+  /** The entity IRI the fact was read for. */
+  entity: string;
+  /** `out`: the entity is the subject; `in`: it is the object. */
+  direction: 'out' | 'in';
+  subject: string;
+  subjectLabel: string;
+  predicate: string;
+  predicateLabel: string;
+  /** IRI, or the literal value when `objectIsIri` is false. */
+  object: string;
+  objectLabel: string;
+  objectIsIri: boolean;
+  /** Graph the triple was read from. */
+  graph: string;
+  /** `user`: the sender's own graph; `worldview`: the shared worldview graph. */
+  scope: 'user' | 'worldview';
+  /**
+   * Set when a later fact replaced an earlier value for the same
+   * subject/predicate in the same graph (belief revision).
+   */
+  superseded?: { previousObject: string; previousLabel: string; supersededAt?: string };
+}
+
 export class KnowledgeEngine {
   private reasoner?: ReasonableEngine;
   private claimService: ClaimProvenanceService;
@@ -687,6 +712,189 @@ export class KnowledgeEngine {
 
     if (facts.length === 0) return '';
     return facts.join('\n');
+  }
+
+  /**
+   * Structured one-hop facts about the given entity IRIs, for cognitive recall
+   * (Comprehension, doc 03 phase 2). Read-only. It reads exactly the graphs the
+   * other recall reads use (see `knowledgeGraphsFor`): the worldview and the
+   * given user's own graph, never another user's. Each fact says which of the
+   * two it came from (`scope`), so the caller can rank the user's own fact above
+   * the shared worldview one.
+   *
+   * Facts are the triples that have the entity as subject (`out`, minus
+   * rdf:type and rdfs:label) or as object (`in`). For an `out` fact whose
+   * subject/predicate was superseded in the same graph (a conflict of type
+   * "supersession" whose superseded claim was asserted in a graph the user may
+   * read), `superseded` names the value it replaced and when, so a later phase
+   * can say "this changed". Supersessions asserted in a graph the user may not
+   * read are never looked at.
+   *
+   * Entity IRIs that are not safe IRIs are skipped; at most `maxEntities` are
+   * read and at most `limitPerEntity` facts are returned per entity (user facts
+   * first, then by predicate and object, so the choice is deterministic).
+   */
+  async getEntityFacts(
+    entityIris: string[],
+    scope: { agentId: string; userId?: string },
+    opts: { limitPerEntity?: number; maxEntities?: number } = {},
+  ): Promise<EntityFact[]> {
+    const limitPerEntity = opts.limitPerEntity ?? 8;
+    const maxEntities = opts.maxEntities ?? 5;
+    const entities: string[] = [];
+    for (const e of entityIris) {
+      if (entities.length >= maxEntities) break;
+      try {
+        sparqlIri(e);
+      } catch {
+        continue;
+      }
+      if (!entities.includes(e)) entities.push(e);
+    }
+    if (entities.length === 0) return [];
+
+    const userGraph = scope.userId ? GraphUriResolver.getUserGraph(scope.agentId, scope.userId) : undefined;
+    const graphs = this.knowledgeGraphsFor(scope.agentId, scope.userId);
+    const valuesG = this.graphValuesClause(graphs, '?g');
+    const labelGraphs = this.labelGraphsFor(scope.agentId, scope.userId);
+    const plg = this.graphValuesClause(labelGraphs, '?plg');
+    const olg = this.graphValuesClause(labelGraphs, '?olg');
+    const elg = this.graphValuesClause(labelGraphs, '?elg');
+    const out: EntityFact[] = [];
+
+    for (const entity of entities) {
+      const e = sparqlIri(entity);
+      let rows: Array<Record<string, { value: string; type?: string }>> = [];
+      try {
+        const res = await this.triplestore.query(`
+          PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+          SELECT ?g ?pred ?predLabel ?other ?otherLabel ?direction ?entityLabel WHERE {
+            ${valuesG}
+            {
+              GRAPH ?g { ${e} ?pred ?other . }
+              BIND("out" AS ?direction)
+              FILTER(?pred != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+              FILTER(?pred != <http://www.w3.org/2000/01/rdf-schema#label>)
+            } UNION {
+              GRAPH ?g { ?other ?pred ${e} . }
+              BIND("in" AS ?direction)
+              FILTER(?pred != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+            }
+            OPTIONAL { ${plg} GRAPH ?plg { ?pred rdfs:label ?predLabel } }
+            OPTIONAL { ${olg} GRAPH ?olg { ?other rdfs:label ?otherLabel } }
+            OPTIONAL { ${elg} GRAPH ?elg { ${e} rdfs:label ?entityLabel } }
+          }
+          LIMIT 400
+        `);
+        if (res?.type === 'bindings' && res.bindings) rows = res.bindings as typeof rows;
+      } catch {
+        continue; // skip the entity on a read error, as the other recall reads do
+      }
+      const seen = new Set<string>();
+      const facts: EntityFact[] = [];
+      for (const b of rows) {
+        const graph = b['g']?.value;
+        const pred = b['pred']?.value;
+        const other = b['other'];
+        const direction = b['direction']?.value;
+        if (!graph || !pred || !other || (direction !== 'out' && direction !== 'in')) continue;
+        if (graph !== userGraph && graph !== GraphUriResolver.getWorldviewGraph(scope.agentId)) continue;
+        const otherIsIri = other.type === 'uri';
+        const key = `${graph}\u0000${direction}\u0000${pred}\u0000${other.value}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const entityLabel = b['entityLabel']?.value || this.uriToLabel(entity);
+        const predLabel = b['predLabel']?.value || this.uriToLabel(pred);
+        const otherLabel = b['otherLabel']?.value || (otherIsIri ? this.uriToLabel(other.value) : other.value);
+        facts.push({
+          entity,
+          direction,
+          subject: direction === 'out' ? entity : other.value,
+          subjectLabel: direction === 'out' ? entityLabel : otherLabel,
+          predicate: pred,
+          predicateLabel: predLabel,
+          object: direction === 'out' ? other.value : entity,
+          objectLabel: direction === 'out' ? otherLabel : entityLabel,
+          objectIsIri: direction === 'out' ? otherIsIri : true,
+          graph,
+          scope: graph === userGraph ? 'user' : 'worldview',
+        });
+      }
+      facts.sort(
+        (a, b) =>
+          (a.scope === b.scope ? 0 : a.scope === 'user' ? -1 : 1) ||
+          (a.predicateLabel < b.predicateLabel ? -1 : a.predicateLabel > b.predicateLabel ? 1 : 0) ||
+          (a.object < b.object ? -1 : a.object > b.object ? 1 : 0) ||
+          (a.subject < b.subject ? -1 : a.subject > b.subject ? 1 : 0),
+      );
+      out.push(...facts.slice(0, limitPerEntity));
+    }
+
+    await this.attachSupersessions(out, scope.agentId, graphs, labelGraphs);
+    return out;
+  }
+
+  /**
+   * Mark the `out` facts whose subject/predicate was superseded in the same
+   * graph (see {@link getEntityFacts}). Reads the conflicts graph joined to the
+   * claims graph, restricted to claims asserted in `readableGraphs`.
+   */
+  private async attachSupersessions(
+    facts: EntityFact[],
+    agentId: string,
+    readableGraphs: string[],
+    labelGraphs: string[],
+  ): Promise<void> {
+    const subjects = [...new Set(facts.filter((f) => f.direction === 'out').map((f) => f.subject))];
+    if (subjects.length === 0) return;
+    let rows: Array<Record<string, { value: string; type?: string }>> = [];
+    try {
+      const res = await this.triplestore.query(`
+        PREFIX core: <urn:shared:ontology#>
+        SELECT ?s ?p ?o ?oLabel ?g ?at WHERE {
+          GRAPH ${sparqlIri(GraphUriResolver.getConflictsGraph(agentId))} {
+            ?c core:conflictType "supersession" ;
+               core:supersededClaim ?claim .
+          }
+          GRAPH ${sparqlIri(GraphUriResolver.getClaimsGraph(agentId))} {
+            ?claim core:claimSubject ?s ;
+                   core:claimPredicate ?p ;
+                   core:claimObject ?o ;
+                   core:assertedInGraph ?g .
+            OPTIONAL { ?claim core:supersededAt ?at }
+          }
+          VALUES ?s { ${subjects.map((s) => sparqlIri(s)).join(' ')} }
+          ${this.graphValuesClause(readableGraphs, '?g')}
+          OPTIONAL {
+            ${this.graphValuesClause(labelGraphs, '?olg')}
+            GRAPH ?olg { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?oLabel }
+          }
+        }
+      `);
+      if (res?.type === 'bindings' && res.bindings) rows = res.bindings as typeof rows;
+    } catch {
+      return; // no conflict information; the facts stay unflagged
+    }
+    for (const f of facts) {
+      if (f.direction !== 'out') continue;
+      let best: { value: string; label: string; at: string } | undefined;
+      for (const r of rows) {
+        if (r['s']?.value !== f.subject || r['p']?.value !== f.predicate || r['g']?.value !== f.graph) continue;
+        const old = r['o']?.value;
+        if (old === undefined || old === f.object) continue; // not a change of value
+        const at = r['at']?.value ?? '';
+        if (!best || at > best.at) {
+          best = { value: old, label: r['oLabel']?.value || this.uriToLabel(old), at };
+        }
+      }
+      if (best) {
+        f.superseded = {
+          previousObject: best.value,
+          previousLabel: best.label,
+          ...(best.at ? { supersededAt: best.at } : {}),
+        };
+      }
+    }
   }
 
   /**

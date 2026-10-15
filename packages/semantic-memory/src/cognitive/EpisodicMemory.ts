@@ -17,7 +17,7 @@
 
 import { ALL_USERS_SCOPE, OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
-import { escapeSparqlStringContent, sparqlIri } from '../utils/SparqlSyntax.js';
+import { escapeSparqlStringContent, sparqlIri, sparqlStringLiteral } from '../utils/SparqlSyntax.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 const CORE = 'urn:shared:ontology#';
@@ -423,10 +423,25 @@ export class EpisodicMemory {
     return hits.sort((a, b) => (a.episodeId < b.episodeId ? 1 : a.episodeId > b.episodeId ? -1 : 0));
   }
 
-  /** Episodes referencing an entity IRI via cogt:about, newest-first. */
-  async findByEntity(entity: string, userScope: UserScope): Promise<EpisodeHit[]> {
+  /**
+   * Episodes referencing an entity IRI via cogt:about, newest-first. With
+   * `opts.limit` only the newest `limit` episodes inside the scope are loaded in
+   * full (see {@link runSelectNewest}); without it every one is.
+   */
+  async findByEntity(entity: string, userScope: UserScope, opts: { limit?: number } = {}): Promise<EpisodeHit[]> {
     assertScope(userScope);
-    const hits = await this.runSelect(`?ep <${COGT}about> ${sparqlIri(entity)} .`, userScope);
+    const constraint = `?ep <${COGT}about> ${sparqlIri(entity)} .`;
+    if (opts.limit !== undefined) return this.runSelectNewest(constraint, userScope, opts.limit);
+    const hits = await this.runSelect(constraint, userScope);
+    return hits.sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
+  }
+
+  /** Episodes that are part of a goal (`cogt:partOfGoal`), newest-first. */
+  async findByGoal(goal: string, userScope: UserScope, opts: { limit?: number } = {}): Promise<EpisodeHit[]> {
+    assertScope(userScope);
+    const constraint = `?ep <${COGT}partOfGoal> ${sparqlIri(goal)} .`;
+    if (opts.limit !== undefined) return this.runSelectNewest(constraint, userScope, opts.limit);
+    const hits = await this.runSelect(constraint, userScope);
     return hits.sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
   }
 
@@ -700,6 +715,58 @@ export class EpisodicMemory {
         WHERE  { GRAPH <${graph}> { ${epIri} ?p ?o } }`);
     }
     return { deleted: doomed.size, relinked };
+  }
+
+  /**
+   * The newest `limit` episodes inside `userScope` that satisfy `constraint`,
+   * newest first. A first query reads only what is needed to choose (IRI and
+   * time), ordered and limited by the store; the full record (payload, links,
+   * tags) is then loaded for the chosen episodes only. For a heavily linked
+   * entity this reads a few dozen records in full instead of thousands.
+   *
+   * The scope narrows the first query so the limit applies inside it: a concrete
+   * user key matches `cogt:forUser` exactly (the key is written as an escaped
+   * literal, see {@link sparqlStringLiteral}); the owner's key also takes the
+   * legacy episodes without a user key (owner-only by rule); the all-users scope
+   * is not narrowed. The scope is then applied again to the full records, as in
+   * {@link runSelect}, so the narrowing can only ever lose episodes, never add
+   * one from outside the scope.
+   */
+  private async runSelectNewest(constraint: string, userScope: UserScope, limit: number): Promise<EpisodeHit[]> {
+    const n = Math.max(0, Math.trunc(limit));
+    if (n === 0) return [];
+    const graph = this.graphUri();
+    const pick = async (scopePattern: string): Promise<Array<{ uri: string; t: number }>> => {
+      const res = await this.triplestore.query(`
+        SELECT ?ep ?when WHERE {
+          GRAPH <${graph}> {
+            ${constraint}
+            ${scopePattern}
+            ?ep <${COGT}occurredAt> ?when .
+            ?ep a <${COGT}Episode> .
+          }
+        } ORDER BY DESC(?when) ?ep LIMIT ${n}`);
+      return (res.bindings ?? []).map((r) => ({ uri: r.ep.value, t: Date.parse(r.when.value) }));
+    };
+    const key = sparqlStringLiteral(userScope === ALL_USERS_SCOPE ? '' : userScope);
+    let found: Array<{ uri: string; t: number }>;
+    if (userScope === ALL_USERS_SCOPE) {
+      found = await pick('');
+    } else if (userScope === OWNER_USER_KEY) {
+      found = [
+        ...(await pick(`?ep <${COGT}forUser> ${key} .`)),
+        ...(await pick(`FILTER NOT EXISTS { ?ep <${COGT}forUser> ?anyUser . }`)),
+      ];
+    } else {
+      found = await pick(`?ep <${COGT}forUser> ${key} .`);
+    }
+    const chosen = [...new Map(found.map((f) => [f.uri, f])).values()]
+      .sort((a, b) => (b.t || 0) - (a.t || 0) || (a.uri < b.uri ? -1 : a.uri > b.uri ? 1 : 0))
+      .slice(0, n);
+    if (chosen.length === 0) return [];
+    const values = chosen.map((c) => sparqlIri(c.uri)).join(' ');
+    const hits = await this.runSelect(`VALUES ?ep { ${values} }`, userScope);
+    return hits.sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
   }
 
   private async runSelect(constraint: string, userScope: UserScope): Promise<EpisodeHit[]> {
