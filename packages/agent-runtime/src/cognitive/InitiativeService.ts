@@ -24,7 +24,7 @@
  * so tests drive the hourly/daily caps and cooldown with a fake clock.
  */
 
-import { createLogger, type MessageEnvelope, type TriplestoreAdapter } from '@ontofelia/core';
+import { OWNER_USER_KEY, createLogger, type MessageEnvelope, type TriplestoreAdapter } from '@ontofelia/core';
 import { EpisodicMemory, GraphRegistry, GraphUriResolver } from '@ontofelia/semantic-memory';
 import { CognitiveConfig } from './CognitiveConfig.js';
 import { GoalStack, addIso8601Duration, type Goal } from './GoalStack.js';
@@ -557,6 +557,7 @@ export class InitiativeService {
         episodeType: 'initiative',
         occurredAt: now,
         actor: `urn:${this.agentId}:self#${this.agentId}`,
+        forUser: OWNER_USER_KEY,
         payload: `initiative skipped for goal "${goal.goalLabel}" (${goal.uri}): ${reason}`,
         outcome: 'success',
         partOfGoal: goal.uri,

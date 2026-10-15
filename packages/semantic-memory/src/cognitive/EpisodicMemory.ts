@@ -15,9 +15,9 @@
  *    which the embedded Oxigraph WASM build cannot evaluate.
  */
 
-import type { TriplestoreAdapter } from '@ontofelia/core';
+import { ALL_USERS_SCOPE, OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
-import { escapeSparqlStringContent } from '../utils/SparqlSyntax.js';
+import { escapeSparqlStringContent, sparqlIri } from '../utils/SparqlSyntax.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 const CORE = 'urn:shared:ontology#';
@@ -48,6 +48,19 @@ export type EpisodeType =
 
 export type EpisodeId = string;
 
+/**
+ * Whose episodes a read may return: a user key (the id of the per-user graph,
+ * `urn:<agent>:user:<id>`) or the explicit {@link ALL_USERS_SCOPE} (`"all"`),
+ * which only owner/operator code paths may pass.
+ *
+ * Every episode carries `cogt:forUser`, the sender's user key. A scoped read
+ * returns exactly the episodes whose `forUser` equals the scope. Episodes
+ * written before the key existed carry no `forUser` and are treated as
+ * owner-only: they are returned for the owner's key and for `"all"`, never for
+ * another user.
+ */
+export type UserScope = string;
+
 export interface EpisodeInput {
   episodeType: EpisodeType;
   occurredAt?: Date;
@@ -62,6 +75,17 @@ export interface EpisodeInput {
    * marker means "not known to be the owner" (also for older episodes).
    */
   actorIsOwner?: boolean;
+  /**
+   * The sender's user key (`cogt:forUser`). Initiative and system episodes carry
+   * the owner's key. Absent only on episodes written before the key existed;
+   * those are owner-only on read (see {@link UserScope}).
+   */
+  forUser?: string;
+  /**
+   * Privacy class (`core:privacyClass`), e.g. `"secret"`: the retention sweep
+   * moves secret-classed episodes to the cold tier early.
+   */
+  privacyClass?: 'secret';
   /** Entity IRIs this episode is about. */
   about?: string[];
   /** Explicit predecessor; when omitted, append() chains to the session's last. */
@@ -87,6 +111,8 @@ export interface EpisodeHit {
   precededBy?: string;
   partOfGoal?: string;
   actor?: string;
+  /** The sender's user key; absent on legacy episodes (owner-only). */
+  forUser?: string;
   about: string[];
   payload?: string;
   transcriptRef?: string;
@@ -97,6 +123,20 @@ export interface EpisodeHit {
   salience: number;
   /** Populated by retrieve(); 0 for plain reads. */
   relevanceScore: number;
+}
+
+/** Fail closed on a missing scope (JS callers, casts): never read unscoped. */
+function assertScope(userScope: UserScope): void {
+  if (typeof userScope !== 'string' || userScope === '') {
+    throw new Error('EpisodicMemory: a userScope (user key or "all") is required');
+  }
+}
+
+/** Is the episode inside the scope? Legacy episodes (no forUser) are owner-only. */
+function inScope(hit: { forUser?: string }, userScope: UserScope): boolean {
+  if (userScope === ALL_USERS_SCOPE) return true;
+  if (hit.forUser === undefined) return userScope === OWNER_USER_KEY;
+  return hit.forUser === userScope;
 }
 
 export interface RetrieveOpts {
@@ -226,7 +266,9 @@ export class EpisodicMemory {
     let seq = 1;
     let precededBy = ep.precededBy;
     if (ep.sessionId) {
-      const existing = await this.findInSession(ep.sessionId);
+      // Internal: the chain and the sequence number span the whole session,
+      // whoever spoke (a group session has several senders).
+      const existing = await this.findInSession(ep.sessionId, ALL_USERS_SCOPE);
       seq = existing.length + 1;
       if (!precededBy && existing.length > 0) {
         // existing is newest-first; chain to the most recent.
@@ -246,11 +288,15 @@ export class EpisodicMemory {
     if (ep.sessionId) lines.push(`<${uri}> <${COGT}sessionId> "${escapeLiteral(ep.sessionId)}" .`);
     if (ep.cycleId) lines.push(`<${uri}> <${COGT}cycleId> "${escapeLiteral(ep.cycleId)}" .`);
     if (ep.channel) lines.push(`<${uri}> <${COGT}channel> "${escapeLiteral(ep.channel)}" .`);
-    if (ep.actor) lines.push(`<${uri}> <${COGT}actor> <${ep.actor}> .`);
+    if (ep.actor) lines.push(`<${uri}> <${COGT}actor> ${sparqlIri(ep.actor)} .`);
     if (ep.actorIsOwner === true) lines.push(`<${uri}> <${COGT}actorIsOwner> "true"^^<${XSD}boolean> .`);
-    for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> <${a}> .`);
-    if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> <${precededBy}> .`);
-    if (ep.partOfGoal) lines.push(`<${uri}> <${COGT}partOfGoal> <${ep.partOfGoal}> .`);
+    if (ep.forUser !== undefined && ep.forUser !== '')
+      lines.push(`<${uri}> <${COGT}forUser> "${escapeLiteral(ep.forUser)}" .`);
+    if (ep.privacyClass === 'secret')
+      lines.push(`<${uri}> <${CORE}privacyClass> "secret" .`);
+    for (const a of ep.about ?? []) lines.push(`<${uri}> <${COGT}about> ${sparqlIri(a)} .`);
+    if (precededBy) lines.push(`<${uri}> <${COGT}precededBy> ${sparqlIri(precededBy)} .`);
+    if (ep.partOfGoal) lines.push(`<${uri}> <${COGT}partOfGoal> ${sparqlIri(ep.partOfGoal)} .`);
     if (ep.payload) lines.push(`<${uri}> <${COGT}payload> "${escapeLiteral(ep.payload)}" .`);
     if (ep.transcriptRef)
       lines.push(`<${uri}> <${COGT}transcriptRef> "${escapeLiteral(ep.transcriptRef)}" .`);
@@ -268,10 +314,19 @@ export class EpisodicMemory {
   /**
    * Retrieve up to `k` episodes ranked by relevance to `query`, newest-first as
    * the tiebreak. Relevance blends text overlap with recency (1-week-ish
-   * half-life). Returns `[]` (never throws) when there are no episodes.
+   * half-life). Returns `[]` when there are no episodes in `userScope`; throws
+   * only when `userScope` is missing.
    */
-  async retrieve(query: string, k: number, opts: RetrieveOpts = {}): Promise<EpisodeHit[]> {
-    const all = opts.sessionId ? await this.findInSession(opts.sessionId) : await this.readAll();
+  async retrieve(
+    query: string,
+    k: number,
+    userScope: UserScope,
+    opts: RetrieveOpts = {},
+  ): Promise<EpisodeHit[]> {
+    assertScope(userScope);
+    const all = opts.sessionId
+      ? await this.findInSession(opts.sessionId, userScope)
+      : await this.readAll(userScope);
     if (all.length === 0) return [];
 
     const now = Date.now();
@@ -290,16 +345,19 @@ export class EpisodicMemory {
 
   /**
    * Walk the `cogt:precededBy` chain backwards from `fromUri`, returning the
-   * episodes oldest-first (the start episode last). Capped at `max` hops.
+   * episodes oldest-first (the start episode last). Capped at `max` hops. The
+   * walk stops at the first episode outside `userScope`, so a scoped chain never
+   * crosses into another user's episodes.
    */
-  async chainFrom(fromUri: EpisodeId, max = 50): Promise<EpisodeHit[]> {
+  async chainFrom(fromUri: EpisodeId, userScope: UserScope, max = 50): Promise<EpisodeHit[]> {
+    assertScope(userScope);
     const out: EpisodeHit[] = [];
     let cursor: string | undefined = fromUri;
     const seen = new Set<string>();
     while (cursor && out.length < max && !seen.has(cursor)) {
       seen.add(cursor);
       const hit = await this.readOne(cursor);
-      if (!hit) break;
+      if (!hit || !inScope(hit, userScope)) break;
       out.push(hit);
       cursor = hit.precededBy;
     }
@@ -307,16 +365,19 @@ export class EpisodicMemory {
   }
 
   /** All episodes of a session, newest-first (by episodeId, which is sortable). */
-  async findInSession(sessionId: string): Promise<EpisodeHit[]> {
+  async findInSession(sessionId: string, userScope: UserScope): Promise<EpisodeHit[]> {
+    assertScope(userScope);
     const hits = await this.runSelect(
       `?ep <${COGT}sessionId> "${escapeLiteral(sessionId)}" .`,
+      userScope,
     );
     return hits.sort((a, b) => (a.episodeId < b.episodeId ? 1 : a.episodeId > b.episodeId ? -1 : 0));
   }
 
   /** Episodes referencing an entity IRI via cogt:about, newest-first. */
-  async findByEntity(entity: string): Promise<EpisodeHit[]> {
-    const hits = await this.runSelect(`?ep <${COGT}about> <${entity}> .`);
+  async findByEntity(entity: string, userScope: UserScope): Promise<EpisodeHit[]> {
+    assertScope(userScope);
+    const hits = await this.runSelect(`?ep <${COGT}about> ${sparqlIri(entity)} .`, userScope);
     return hits.sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
   }
 
@@ -325,8 +386,9 @@ export class EpisodicMemory {
    * timelines). When `entity` is given, restricts to episodes referencing it
    * via cogt:about.
    */
-  async recent(limit = 50, entity?: string): Promise<EpisodeHit[]> {
-    const hits = entity ? await this.findByEntity(entity) : await this.readAll();
+  async recent(userScope: UserScope, limit = 50, entity?: string): Promise<EpisodeHit[]> {
+    assertScope(userScope);
+    const hits = entity ? await this.findByEntity(entity, userScope) : await this.readAll(userScope);
     return hits
       .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt))
       .slice(0, Math.max(0, limit));
@@ -506,20 +568,96 @@ export class EpisodicMemory {
     }
   }
 
-  private async readAll(): Promise<EpisodeHit[]> {
-    return this.runSelect('');
+  private async readAll(userScope: UserScope): Promise<EpisodeHit[]> {
+    return this.runSelect('', userScope);
   }
 
+  /** One episode by IRI, unscoped: callers check {@link inScope} themselves. */
   private async readOne(uri: string): Promise<EpisodeHit | undefined> {
-    const hits = await this.runSelect(`VALUES ?ep { <${uri}> }`);
+    let iri: string;
+    try {
+      iri = sparqlIri(uri);
+    } catch {
+      return undefined; // not an IRI: no such episode
+    }
+    const hits = await this.runSelect(`VALUES ?ep { ${iri} }`, ALL_USERS_SCOPE);
     return hits[0];
   }
 
-  private async runSelect(constraint: string): Promise<EpisodeHit[]> {
+  /**
+   * Delete every episode written for `userId` (their `cogt:forUser`) and keep
+   * the `cogt:precededBy` chain consistent: a surviving episode that pointed at
+   * a deleted one is re-linked to the nearest surviving predecessor, or loses
+   * the link when there is none. Returns the counts.
+   *
+   * The matching is done on the values read back from the store (never by
+   * interpolating `userId` into a query), and the deletes address episodes by
+   * validated IRI. Only the episode resources go; legacy episodes without a
+   * `forUser`, other users' episodes and daily summaries are untouched. The
+   * owner's key and the all-users scope are refused here: erasing the owner's
+   * record is not a user deletion.
+   */
+  async deleteForUser(userId: string): Promise<{ deleted: number; relinked: number }> {
+    if (typeof userId !== 'string' || userId === '' || userId === ALL_USERS_SCOPE) {
+      throw new Error('EpisodicMemory.deleteForUser: a concrete user key is required');
+    }
+    if (userId === OWNER_USER_KEY) {
+      throw new Error('EpisodicMemory.deleteForUser: refusing to delete the owner\'s episodes');
+    }
+    const graph = this.graphUri();
+    const res = await this.triplestore.query(`
+      SELECT ?ep ?forUser ?precededBy WHERE {
+        GRAPH <${graph}> {
+          ?ep a <${COGT}Episode> .
+          OPTIONAL { ?ep <${COGT}forUser>    ?forUser . }
+          OPTIONAL { ?ep <${COGT}precededBy> ?precededBy . }
+        }
+      }`);
+    const prev = new Map<string, string | undefined>();
+    const doomed = new Set<string>();
+    for (const r of res.bindings ?? []) {
+      prev.set(r.ep.value, r.precededBy?.value);
+      if (r.forUser?.value === userId) doomed.add(r.ep.value);
+    }
+    if (doomed.size === 0) return { deleted: 0, relinked: 0 };
+
+    // Re-link survivors whose predecessor is going away.
+    let relinked = 0;
+    for (const [ep, p] of prev) {
+      if (doomed.has(ep) || p === undefined || !doomed.has(p)) continue;
+      let cursor: string | undefined = p;
+      const seen = new Set<string>();
+      while (cursor !== undefined && doomed.has(cursor) && !seen.has(cursor)) {
+        seen.add(cursor);
+        cursor = prev.get(cursor);
+      }
+      const survivor = cursor !== undefined && !doomed.has(cursor) ? cursor : undefined;
+      const epIri = sparqlIri(ep);
+      await this.triplestore.update(`
+        DELETE { GRAPH <${graph}> { ${epIri} <${COGT}precededBy> ?old } }
+        WHERE  { GRAPH <${graph}> { ${epIri} <${COGT}precededBy> ?old } }`);
+      if (survivor !== undefined) {
+        await this.triplestore.update(
+          `INSERT DATA { GRAPH <${graph}> { ${epIri} <${COGT}precededBy> ${sparqlIri(survivor)} . } }`,
+        );
+      }
+      relinked++;
+    }
+
+    for (const ep of doomed) {
+      const epIri = sparqlIri(ep);
+      await this.triplestore.update(`
+        DELETE { GRAPH <${graph}> { ${epIri} ?p ?o } }
+        WHERE  { GRAPH <${graph}> { ${epIri} ?p ?o } }`);
+    }
+    return { deleted: doomed.size, relinked };
+  }
+
+  private async runSelect(constraint: string, userScope: UserScope): Promise<EpisodeHit[]> {
     const graph = this.graphUri();
     const sparql = `
       SELECT ?ep ?episodeId ?type ?when ?salience ?sessionId ?precededBy ?partOfGoal
-             ?actor ?payload ?transcriptRef ?outcome ?durationMs ?errorClass
+             ?actor ?forUser ?payload ?transcriptRef ?outcome ?durationMs ?errorClass
       WHERE {
         GRAPH <${graph}> {
           ?ep a <${COGT}Episode> ;
@@ -532,6 +670,7 @@ export class EpisodicMemory {
           OPTIONAL { ?ep <${COGT}precededBy>    ?precededBy . }
           OPTIONAL { ?ep <${COGT}partOfGoal>    ?partOfGoal . }
           OPTIONAL { ?ep <${COGT}actor>         ?actor . }
+          OPTIONAL { ?ep <${COGT}forUser>       ?forUser . }
           OPTIONAL { ?ep <${COGT}payload>       ?payload . }
           OPTIONAL { ?ep <${COGT}transcriptRef> ?transcriptRef . }
           OPTIONAL { ?ep <${COGT}outcome>       ?outcome . }
@@ -540,7 +679,11 @@ export class EpisodicMemory {
         }
       }`;
     const res = await this.triplestore.query(sparql);
-    const rows = res.bindings ?? [];
+    // The scope is applied to the values read back, never interpolated into the
+    // query, so a user key with quotes or newlines cannot alter the query.
+    const rows = (res.bindings ?? []).filter((r) =>
+      inScope({ forUser: r.forUser?.value }, userScope),
+    );
 
     // `about` and `tags` are multi-valued; fetch them in a second pass and group.
     const about = await this.multiValued(`<${COGT}about>`, true);
@@ -562,6 +705,7 @@ export class EpisodicMemory {
       if (r.precededBy) hit.precededBy = r.precededBy.value;
       if (r.partOfGoal) hit.partOfGoal = r.partOfGoal.value;
       if (r.actor) hit.actor = r.actor.value;
+      if (r.forUser) hit.forUser = r.forUser.value;
       if (r.payload) hit.payload = r.payload.value;
       if (r.transcriptRef) hit.transcriptRef = r.transcriptRef.value;
       if (r.outcome) hit.outcome = r.outcome.value;

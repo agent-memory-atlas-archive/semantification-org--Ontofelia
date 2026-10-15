@@ -303,6 +303,24 @@ The retention job is policy-driven (uses `core:retentionPolicy` from
 `urn:shared:meta`). Privacy-classed episodes (`core:privacyClass "secret"`)
 go cold after 7 days regardless.
 
+### 7.1 Per-user scope
+
+`cog:episodic` is agent-wide, so every episode carries `cogt:forUser`, the
+sender's user key (the id of the per-user graph `urn:<agent>:user:<id>`; the
+verified owner is `owner`, and initiative and system episodes are the owner's).
+Every read (`retrieve`, `findInSession`, `findByEntity`, `recent`, `chainFrom`)
+takes a mandatory `userScope`: a user key, or `"all"` for owner/operator code
+paths. A scoped read never returns another user's episode, and a chain walk
+stops at the user boundary. **Episodes written before the key existed have no
+`cogt:forUser` and are treated as owner-only**: they are returned for the
+owner's key and for `"all"`, never for another user.
+
+An episode whose payload matches a credential shape is also written with
+`core:privacyClass "secret"`, so the rule above (cold after 7 days) applies.
+`EpisodicMemory.deleteForUser(userId)` deletes all episodes of one user and
+re-links the `cogt:precededBy` chain around them; it is not yet called from a
+user-facing command.
+
 Hard-delete cascade (when user requests):
 1. Delete the `cogt:Episode` triples.
 2. Delete linked `core:Claim` and `core:Evidence` records (existing

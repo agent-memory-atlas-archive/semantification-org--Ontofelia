@@ -21,7 +21,14 @@
  * of the LLM call.
  */
 
-import { createLogger, isHumanOwnerTurn, type MessageEnvelope, type TriplestoreAdapter } from '@ontofelia/core';
+import {
+  OWNER_USER_KEY,
+  cogUserKey,
+  createLogger,
+  isHumanOwnerTurn,
+  type MessageEnvelope,
+  type TriplestoreAdapter,
+} from '@ontofelia/core';
 import {
   GraphRegistry,
   GraphUriResolver,
@@ -32,7 +39,8 @@ import {
   type SelfView,
 } from '@ontofelia/semantic-memory';
 import { WorkingMemory } from './WorkingMemory.js';
-import { GoalStack, RESPOND_TO_USER, type Goal } from './GoalStack.js';
+import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
+import { looksLikeSecret } from './privacyClass.js';
 import {
   Metacognition,
   type ImpasseInput,
@@ -247,7 +255,14 @@ export class CycleManager {
     const prepareGoals: GoalContextProvider = async (sessionId) => {
       if (!options.goalsEnabled) return undefined;
       try {
-        const gs = new GoalStack(this.triplestore, this.registry, this.agentId, sessionId);
+        const gs = new GoalStack(
+          this.triplestore,
+          this.registry,
+          this.agentId,
+          sessionId,
+          undefined,
+          this.viewerOf(envelope),
+        );
         const managed = await this.manageGoals(gs, envelope, mode, options.initiativeGoalUri);
         const goal = managed.goal;
         goalConflict = managed.conflict;
@@ -262,6 +277,7 @@ export class CycleManager {
             cycleId,
             cycleUri,
             goal.goalType,
+            cogUserKey(envelope.sender),
           );
           if (skillsText) sections.push(skillsText);
         }
@@ -400,11 +416,17 @@ export class CycleManager {
         goalLabel: intent.label,
         priority: 0.7,
         triggeredByUser: actor,
+        forUser: cogUserKey(envelope.sender),
       });
       const created = await gs.get(uri);
       if (created) return { goal: created, conflict: false };
     }
     return { goal: await gs.ensureImplicit(), conflict: false };
+  }
+
+  /** The goal-forest view of this turn's sender (see {@link GoalStack}). */
+  private viewerOf(envelope: MessageEnvelope): GoalViewer {
+    return { userId: cogUserKey(envelope.sender), isOwner: envelope.sender?.isOwner === true };
   }
 
   /** Map an inbound message to a goal type, or undefined for plain RespondToUser. */
@@ -447,6 +469,7 @@ export class CycleManager {
     cycleId: string,
     cycleUri: string,
     goalType: string,
+    userKey: string,
   ): Promise<string | undefined> {
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
     const [skills, sequences] = await Promise.all([
@@ -455,7 +478,7 @@ export class CycleManager {
     ]);
     if (skills.length === 0 && sequences.length === 0) return undefined;
 
-    const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId);
+    const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId, userKey);
     const goalPhaseUri = `${cycleUri}_3`;
     const procGraph = pm.graphUri();
     const pct = (n: number) => `${Math.round(n * 100)}%`;
@@ -587,7 +610,14 @@ export class CycleManager {
       await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '');
       await this.writeSkillTraces(sessionId, cycleId, toolEvents, activeGoalUri, activeGoalType);
     }
-    await this.writeCycleAndPhases(sessionId, cycleUri, startedAt, endedAt, status);
+    await this.writeCycleAndPhases(
+      sessionId,
+      cycleUri,
+      startedAt,
+      endedAt,
+      status,
+      mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
+    );
     // Phase 6 reflection. With metacognition ON, detect impasses, run the
     // S1–S4 subcycle for each, and write the *full* marker; OFF restores the
     // minimal Phase B marker exactly (the flag-off equivalence guarantee).
@@ -894,6 +924,11 @@ export class CycleManager {
     }
   }
 
+  /** `core:privacyClass "secret"` for a payload that matches a credential shape. */
+  private privacyOf(payload: string | undefined): { privacyClass?: 'secret' } {
+    return looksLikeSecret(payload) ? { privacyClass: 'secret' } : {};
+  }
+
   /**
    * C2 — append the `message-received` perception episode (actor = sender,
    * payload = text, transcriptRef = session). D4 — backfills the turn's active
@@ -923,6 +958,8 @@ export class CycleManager {
       channel,
       actor,
       ...(actorIsOwner ? { actorIsOwner: true } : {}),
+      forUser: cogUserKey(envelope.sender),
+      ...this.privacyOf(envelope.text),
       payload: envelope.text || '',
       transcriptRef: `${sessionId}.jsonl`,
       partOfGoal: activeGoalUri,
@@ -958,6 +995,7 @@ export class CycleManager {
     const em = new EpisodicMemory(this.triplestore, this.agentId);
     const text = envelope.text || '';
     const channel = envelope.channel ? String(envelope.channel) : undefined;
+    const userKey = cogUserKey(envelope.sender);
 
     // C2 — perception episode (already written ahead of the core on a
     // conversational turn; see runCycle).
@@ -968,7 +1006,9 @@ export class CycleManager {
     // C4 — pull relevant *past* episodes into the retrieval buffer (excluding
     // the one we just wrote for this turn).
     if (text) {
-      const hits = (await em.retrieve(text, RETRIEVAL_K, { sessionId })).filter(
+      // Scoped to this sender: never another user's episodes (legacy episodes
+      // without a user key are owner-only, see EpisodicMemory).
+      const hits = (await em.retrieve(text, RETRIEVAL_K, userKey, { sessionId })).filter(
         (h) => h.uri !== perceptionEpUri,
       );
       retrievalHits = hits.length;
@@ -979,6 +1019,7 @@ export class CycleManager {
           this.agentId,
           sessionId,
           cycleId,
+          userKey,
         );
         const comprehensionPhaseUri = `${cycleUri}_2`;
         for (const h of hits) {
@@ -1006,7 +1047,9 @@ export class CycleManager {
           occurredAt: ev.occurredAt,
           sessionId,
           cycleId,
+          forUser: userKey,
           payload: ev.argsBrief ? `${ev.toolName} (${ev.argsBrief})` : ev.toolName,
+          ...this.privacyOf(ev.argsBrief),
           tags: [ev.callId],
         });
       } else {
@@ -1015,6 +1058,7 @@ export class CycleManager {
           occurredAt: ev.occurredAt,
           sessionId,
           cycleId,
+          forUser: userKey,
           payload: `${ev.toolName} -> ${ev.outcome ?? 'unknown'}`,
           outcome: ev.outcome,
           durationMs: ev.durationMs,
@@ -1033,6 +1077,8 @@ export class CycleManager {
         cycleId,
         channel,
         actor: `urn:${this.agentId}:self#${this.agentId}`,
+        forUser: userKey,
+        ...this.privacyOf(responseText),
         payload: responseText,
         transcriptRef: `${sessionId}.jsonl`,
         partOfGoal: activeGoalUri,
@@ -1082,6 +1128,8 @@ export class CycleManager {
       cycleId,
       channel: envelope.channel ? String(envelope.channel) : undefined,
       actor: `urn:${this.agentId}:self#${this.agentId}`,
+      // Unattended work is the owner's: initiative episodes carry the owner's key.
+      forUser: OWNER_USER_KEY,
       payload,
       outcome,
       partOfGoal: goalUri,
@@ -1096,7 +1144,14 @@ export class CycleManager {
     cycleId: string,
     phaseUri: string,
   ): Promise<void> {
-    const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId);
+    const wm = new WorkingMemory(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      sessionId,
+      cycleId,
+      cogUserKey(envelope.sender),
+    );
     const text = envelope.text || '';
     if (text) {
       await wm.write(
@@ -1135,6 +1190,7 @@ export class CycleManager {
     startedAt: Date,
     endedAt: Date,
     status: 'completed' | 'aborted',
+    userKey: string,
   ): Promise<void> {
     const graph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
     this.registry.assertWritable(graph);
@@ -1148,6 +1204,7 @@ export class CycleManager {
       `<${cycleUri}> <${COGT}cycleStatus> "${status}" .`,
       `<${cycleUri}> <${COGT}startedAt> ${dt(tStart)} .`,
       `<${cycleUri}> <${COGT}endedAt> ${dt(tEnd)} .`,
+      `<${cycleUri}> <${COGT}forUser> "${escapeLiteral(userKey)}" .`,
     ];
 
     // Phase timings: 1-2 precede the core, 3-5 span it, 6 follows. With no

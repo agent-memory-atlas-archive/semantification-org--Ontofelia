@@ -302,6 +302,14 @@ incrementally on production.
 Plus Pino structured logs at level `info` for every phase boundary, level
 `warn` for every impasse, level `error` for every cycle abort.
 
+The debug-panel routes `/api/cog/inspect/*` (everything except `/api/cog/health`)
+need the debug-panel flag **and** the gateway bearer token, and they refuse to
+serve when the gateway runs without a token requirement. The gateway has one
+credential, the operator's, so the output is additionally scoped to the owner's
+records (episodes, goals, cycles and working memory written for the owner, plus
+records without a user key); `?scope=all` returns every user's records. Any
+other `scope` value is a 400.
+
 ---
 
 ## 10. Risks and mitigations

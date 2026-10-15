@@ -77,6 +77,11 @@ export interface WMEntryInput {
 }
 
 export interface WMEntry extends WMEntryInput {
+  /**
+   * The sender's user key (`cogt:forUser`) the entry was written for. Absent on
+   * entries written before the key existed (treated as owner-only by readers).
+   */
+  forUser?: string;
   id: WMEntryId;
   writtenBy: PhaseRef;
   writtenAt: string;
@@ -134,6 +139,8 @@ export class WorkingMemory {
     private readonly agentId: string,
     private readonly sessionId: string,
     private readonly cycleId: string,
+    /** The sender's user key; written as `cogt:forUser` on every entry. */
+    private readonly forUser?: string,
   ) {}
 
   graphUri(): string {
@@ -180,6 +187,7 @@ export class WorkingMemory {
         `<${id}> <${COGT}expiresAfter> "${Math.trunc(entry.expiresAfter)}"^^<${XSD}integer> .`,
       );
     if (entry.forGoal) lines.push(`<${id}> <${COGT}forGoal> <${entry.forGoal}> .`);
+    if (this.forUser) lines.push(`<${id}> <${COGT}forUser> "${escapeLiteral(this.forUser)}" .`);
 
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
     await this.enforceCap();
@@ -198,7 +206,7 @@ export class WorkingMemory {
     const sparql = `
       SELECT ?entry ?buffer ?writtenBy ?writtenAt ?kind ?payload ?salience
              ?refersTo ?sourceGraph ?retrievalScore ?carryForward ?expiresAfter
-             ?forGoal ?carriedFrom
+             ?forGoal ?carriedFrom ?forUser
       WHERE {
         GRAPH <${graph}> {
           ?entry a <${COGT}WorkingMemoryEntry> ;
@@ -215,6 +223,7 @@ export class WorkingMemory {
           OPTIONAL { ?entry <${COGT}expiresAfter>   ?expiresAfter . }
           OPTIONAL { ?entry <${COGT}forGoal>        ?forGoal . }
           OPTIONAL { ?entry <${COGT}carriedFrom>    ?carriedFrom . }
+          OPTIONAL { ?entry <${COGT}forUser>        ?forUser . }
           ${filters.join('\n          ')}
         }
       }`;
@@ -240,6 +249,7 @@ export class WorkingMemory {
       if (r.expiresAfter) entry.expiresAfter = num('expiresAfter');
       if (r.forGoal) entry.forGoal = r.forGoal.value;
       if (r.carriedFrom) entry.carriedFrom = r.carriedFrom.value;
+      if (r.forUser) entry.forUser = r.forUser.value;
       return entry;
     });
   }
@@ -310,6 +320,7 @@ export class WorkingMemory {
       lines.push(`<${id}> <${COGT}payload> "${escapeLiteral(e.payload)}" .`);
       lines.push(`<${id}> <${COGT}salience> "${salience}"^^<${XSD}decimal> .`);
       lines.push(`<${id}> <${COGT}carriedFrom> <${e.id}> .`);
+      if (e.forUser) lines.push(`<${id}> <${COGT}forUser> "${escapeLiteral(e.forUser)}" .`);
       if (e.carryForward !== undefined)
         lines.push(`<${id}> <${COGT}carryForward> "${e.carryForward}"^^<${XSD}boolean> .`);
       if (e.expiresAfter !== undefined)

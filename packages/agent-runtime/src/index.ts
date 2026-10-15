@@ -1,4 +1,4 @@
-import { AgentConfig, AgentLifecycle, AgentState, ProviderAdapter, MessageEnvelope, ChatMessage, SessionRecord, SessionOrigin, ToolCall, ToolContext, createLogger, isHumanOwnerTurn } from '@ontofelia/core';
+import { AgentConfig, AgentLifecycle, AgentState, ProviderAdapter, MessageEnvelope, ChatMessage, SessionRecord, SessionOrigin, ToolCall, ToolContext, createLogger, isHumanOwnerTurn, cogUserKey, OWNER_USER_KEY } from '@ontofelia/core';
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { SessionStore } from '@ontofelia/session-store';
 import { ToolRegistry, AuditLog } from '@ontofelia/tools';
@@ -26,7 +26,7 @@ import {
   type CycleDetail,
   type ResponseExplanation,
 } from './cognitive/CogInspector.js';
-import type { Goal } from './cognitive/GoalStack.js';
+import type { Goal, GoalViewer } from './cognitive/GoalStack.js';
 import { summarizeGoal, orderGoals, isOpenGoal } from './cognitive/goalSummary.js';
 import type { GoalSummary } from './cognitive/goalSummary.js';
 import type { EpisodeHit } from '@ontofelia/semantic-memory';
@@ -48,12 +48,12 @@ export type {
   WakeOutcome,
   Clock,
 } from './cognitive/InitiativeService.js';
-export { GoalStack, addIso8601Duration } from './cognitive/GoalStack.js';
+export { GoalStack, addIso8601Duration, goalOwnerKey, goalBelongsTo } from './cognitive/GoalStack.js';
 export { updateGoalStep } from './cognitive/updateGoalStep.js';
 export type { UpdateGoalStepRequest, UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 export { armGoal, OWNER_REQUESTED_WORK } from './cognitive/armGoal.js';
 export type { ArmGoalRequest, ArmGoalResult, ArmGoalDeps } from './cognitive/armGoal.js';
-export type { Goal, GoalInput, GoalStatus } from './cognitive/GoalStack.js';
+export type { Goal, GoalInput, GoalStatus, GoalViewer } from './cognitive/GoalStack.js';
 export { summarizeGoal, orderGoals, isOpenGoal, nextAction } from './cognitive/goalSummary.js';
 export type { GoalSummary } from './cognitive/goalSummary.js';
 // The single shared initiative allowlist (advertisement filter + execution gate
@@ -1273,7 +1273,12 @@ Users can use these commands:
    * absent or the goal stack is disabled, so flag-off behaviour is unchanged.
    * Returns the number migrated.
    */
-  async migrateGoalsForSession(sessionId: string, now: Date = new Date()): Promise<number> {
+  async migrateGoalsForSession(
+    sessionId: string,
+    now: Date = new Date(),
+    /** The sender closing the session; goals without an owner are stamped with their key. */
+    viewer?: GoalViewer,
+  ): Promise<number> {
     if (!this.knowledgeEngine || !this.cognitiveConfig) return 0;
     if (!(await this.cognitiveConfig.isGoalStackEnabled())) return 0;
     const gs = new GoalStack(
@@ -1281,6 +1286,8 @@ Users can use these commands:
       this.knowledgeEngine.registry,
       this.agentId,
       sessionId,
+      undefined,
+      viewer,
     );
     const migrated = await gs.migrateLongterm(now);
     if (migrated > 0) {
@@ -1305,7 +1312,11 @@ Users can use these commands:
   // (the service's guard config lives in the gateway); the counters are real.
   // ────────────────────────────────────────────────────────────────────────
 
-  /** A GoalStack over the current session + long-term goal graphs, or undefined. */
+  /**
+   * A GoalStack over the current session + long-term goal graphs, or undefined.
+   * Unscoped: its callers (/goals, list_goals, arm_goal, update_goal_step) are
+   * owner-only. The cycle builds its own stack scoped to the sender.
+   */
   private goalStackFor(sessionId: string): GoalStack | undefined {
     if (!this.knowledgeEngine) return undefined;
     return new GoalStack(
@@ -1314,6 +1325,11 @@ Users can use these commands:
       this.agentId,
       sessionId,
     );
+  }
+
+  /** The goal-forest view of an envelope's sender. */
+  private goalViewerOf(envelope: MessageEnvelope): GoalViewer {
+    return { userId: cogUserKey(envelope.sender), isOwner: envelope.sender?.isOwner === true };
   }
 
   /** All goals across the session + long-term graphs, or undefined if no engine. */
@@ -1438,7 +1454,8 @@ Users can use these commands:
   ): Promise<EpisodeHit[] | undefined> {
     if (!this.knowledgeEngine) return undefined;
     const em = new EpisodicMemory(this.knowledgeEngine['triplestore'], this.agentId);
-    const all = await em.recent(500);
+    // Initiative and notification episodes are the owner's (owner-only callers).
+    const all = await em.recent(OWNER_USER_KEY, 500);
     return all.filter((e) => e.episodeType === episodeType).slice(0, Math.max(0, limit));
   }
 
@@ -1607,43 +1624,55 @@ Users can use these commands:
     );
   }
 
+  /**
+   * The inspection wrappers below take a mandatory `userScope` (a user key, or
+   * `"all"` for the operator's unrestricted view); see {@link CogInspector}.
+   */
+
   /** Cycles in a session, newest-first; `undefined` when inspection is gated off. */
   async cogListCycles(
     sessionId: string,
+    userScope: string,
     limit?: number,
   ): Promise<CycleSummary[] | undefined> {
     const ins = await this.cogInspector();
-    return ins?.listCycles(sessionId, limit);
+    return ins?.listCycles(sessionId, userScope, limit);
   }
 
   /** Full detail for one cycle; `undefined` when gated off or the cycle is unknown. */
-  async cogGetCycle(sessionId: string, cycleId: string): Promise<CycleDetail | undefined> {
+  async cogGetCycle(
+    sessionId: string,
+    cycleId: string,
+    userScope: string,
+  ): Promise<CycleDetail | undefined> {
     const ins = await this.cogInspector();
-    return ins?.getCycle(sessionId, cycleId);
+    return ins?.getCycle(sessionId, cycleId, userScope);
   }
 
   /** Every goal in a session + long-term graph; `undefined` when gated off. */
-  async cogListGoals(sessionId: string): Promise<Goal[] | undefined> {
+  async cogListGoals(sessionId: string, userScope: string): Promise<Goal[] | undefined> {
     const ins = await this.cogInspector();
-    return ins?.listGoals(sessionId);
+    return ins?.listGoals(sessionId, userScope);
   }
 
   /** Recent episodes (optionally per-entity); `undefined` when gated off. */
   async cogListEpisodes(
+    userScope: string,
     entity?: string,
     limit?: number,
   ): Promise<EpisodeHit[] | undefined> {
     const ins = await this.cogInspector();
-    return ins?.listEpisodes(entity, limit);
+    return ins?.listEpisodes(userScope, entity, limit);
   }
 
   /** WM→action→goal→episode chain for a response; `undefined` when gated off. */
   async cogExplainResponse(
     sessionId: string,
     cycleId: string,
+    userScope: string,
   ): Promise<ResponseExplanation | undefined> {
     const ins = await this.cogInspector();
-    return ins?.explainResponse(sessionId, cycleId);
+    return ins?.explainResponse(sessionId, cycleId, userScope);
   }
 
   /**
@@ -2134,7 +2163,7 @@ Users can use these commands:
       // H3 — session close is the migration point: lift resolved / long-term
       // goals into the long-term graph before the session is archived. No-op
       // unless the goal stack is enabled.
-      await this.migrateGoalsForSession(session.sessionId).catch((e) =>
+      await this.migrateGoalsForSession(session.sessionId, new Date(), this.goalViewerOf(envelope)).catch((e) =>
         this.emitDebug('error', `goal migration failed: ${(e as Error).message}`),
       );
       await this.sessionStore.updateSession(session.sessionId, { status: 'archived' });
@@ -2180,7 +2209,7 @@ Users can use these commands:
         return { text: `🔭 Metacog scan: ${r.cyclesScanned} cycles, ${r.chronicImpassesRaised} chronic impasse(s), ${r.capabilityGapsRaised} capability gap(s), drift ${r.driftDetected}.`, sessionId: session.sessionId };
       }
       if (sub === 'migrate') {
-        const n = await this.migrateGoalsForSession(session.sessionId);
+        const n = await this.migrateGoalsForSession(session.sessionId, new Date(), this.goalViewerOf(envelope));
         return { text: `📦 Goal migration: ${n} goal(s) moved to long-term.`, sessionId: session.sessionId };
       }
       // Phase I — debug-panel flag toggle + read-only inspection.
@@ -2245,13 +2274,13 @@ Users can use these commands:
         };
       }
       if (sub === 'cycles') {
-        const cycles = await this.cogListCycles(session.sessionId, 20);
+        const cycles = await this.cogListCycles(session.sessionId, OWNER_USER_KEY, 20);
         if (!cycles) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(cycles, null, 2) + '\n```', sessionId: session.sessionId };
       }
       if (sub.startsWith('explain ')) {
         const cycleId = sub.slice('explain '.length).trim();
-        const exp = await this.cogExplainResponse(session.sessionId, cycleId);
+        const exp = await this.cogExplainResponse(session.sessionId, cycleId, OWNER_USER_KEY);
         if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
       }

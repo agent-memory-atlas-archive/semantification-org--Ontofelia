@@ -19,7 +19,7 @@
  * logic with a fake clock and a capturing fake channel over an in-memory store.
  */
 
-import { createLogger, type TriplestoreAdapter } from '@ontofelia/core';
+import { OWNER_USER_KEY, createLogger, type TriplestoreAdapter } from '@ontofelia/core';
 import {
   EpisodicMemory,
   GraphUriResolver,
@@ -404,6 +404,7 @@ export class NotificationService implements NotificationSink {
         episodeType: 'notification',
         occurredAt: now,
         actor: `urn:${this.agentId}:self#${this.agentId}`,
+        forUser: OWNER_USER_KEY,
         payload: JSON.stringify({ priority, reason, ...(goalId ? { goalId } : {}) }),
         outcome: 'success',
         ...(goalId ? { partOfGoal: goalId } : {}),

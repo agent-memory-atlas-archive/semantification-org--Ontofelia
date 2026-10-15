@@ -5,6 +5,7 @@
  * a port; every write goes through the existing GoalStack API.
  */
 
+import { OWNER_USER_KEY } from '@ontofelia/core';
 import { GoalStack, MAX_WAKE_INTERVAL_MS, addIso8601Duration, type Goal } from './GoalStack.js';
 import { isOpenGoal } from './goalSummary.js';
 
@@ -134,6 +135,8 @@ export async function armGoal(deps: ArmGoalDeps, req: ArmGoalRequest): Promise<A
     }
     uri = g.uri;
     await gs.setMandate(uri, req.mandateEpisodeUri, now);
+    // An armed goal is the owner's agenda: other users must not see it.
+    await gs.setOwner(uri, OWNER_USER_KEY);
     await gs.setWake(uri, { wakeAt, wakeEvery: every }, now);
     if (g.status === 'proposed') {
       await gs.setStatus(uri, 'active', undefined, now);
@@ -151,6 +154,7 @@ export async function armGoal(deps: ArmGoalDeps, req: ArmGoalRequest): Promise<A
         goalLabel: label,
         priority: req.priority ?? 0.6,
         longTerm: true,
+        forUser: OWNER_USER_KEY,
         mandatedBy: req.mandateEpisodeUri,
         wakeAt,
         wakeEvery: every,

@@ -11,15 +11,16 @@
  * embedded Oxigraph WASM build cannot evaluate SPARQL aggregates.
  */
 
-import type { TriplestoreAdapter } from '@ontofelia/core';
+import { ALL_USERS_SCOPE, OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
 import {
   EpisodicMemory,
   GraphRegistry,
   GraphUriResolver,
   type EpisodeHit,
+  type UserScope,
 } from '@ontofelia/semantic-memory';
 import { WorkingMemory, type WMEntry } from './WorkingMemory.js';
-import { GoalStack, type Goal } from './GoalStack.js';
+import { GoalStack, goalBelongsTo, type Goal } from './GoalStack.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 
@@ -88,6 +89,27 @@ export interface ResponseExplanation {
   retrievals: ExplainRetrieval[];
 }
 
+/** Fail closed on a missing scope: an inspection is never unscoped by accident. */
+function assertScope(userScope: UserScope): void {
+  if (typeof userScope !== 'string' || userScope === '') {
+    throw new Error('CogInspector: a userScope (user key or "all") is required');
+  }
+}
+
+/** Is a record keyed `forUser` inside the scope? Legacy (no key) is owner-only. */
+function keyInScope(forUser: string | undefined, userScope: UserScope): boolean {
+  if (userScope === ALL_USERS_SCOPE) return true;
+  if (forUser === undefined) return userScope === OWNER_USER_KEY;
+  return forUser === userScope;
+}
+
+/**
+ * Every projection takes a mandatory `userScope`: a user key, or `"all"` for
+ * the operator's unrestricted view. A scoped call returns only records written
+ * for that user; records without a user key (written before it existed) belong
+ * to the owner's scope. Cycle phases and markers carry no content and follow
+ * their cycle.
+ */
 export class CogInspector {
   constructor(
     private readonly triplestore: TriplestoreAdapter,
@@ -107,18 +129,21 @@ export class CogInspector {
   }
 
   /** Cycles in a session, newest-first, sliced to `limit`. */
-  async listCycles(sessionId: string, limit = 50): Promise<CycleSummary[]> {
+  async listCycles(sessionId: string, userScope: UserScope, limit = 50): Promise<CycleSummary[]> {
+    assertScope(userScope);
     const graph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
     const res = await this.triplestore.query(`
-      SELECT ?c ?st ?s ?e WHERE {
+      SELECT ?c ?st ?s ?e ?forUser WHERE {
         GRAPH <${graph}> {
           ?c a <${COGT}Cycle> ;
              <${COGT}cycleStatus> ?st ;
              <${COGT}startedAt>   ?s ;
              <${COGT}endedAt>     ?e .
+          OPTIONAL { ?c <${COGT}forUser> ?forUser . }
         }
       }`);
     return (res.bindings ?? [])
+      .filter((b) => keyInScope(b.forUser?.value, userScope))
       .map((b) => this.toCycleSummary(b.c.value, b.st.value, b.s.value, b.e.value))
       .sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))
       .slice(0, Math.max(0, limit));
@@ -140,26 +165,32 @@ export class CogInspector {
    * cycle, the episodes it wrote (by `cogt:cycleId`) and the reflective marker
    * that reflects on it. Returns `undefined` when the cycle is unknown.
    */
-  async getCycle(sessionId: string, cycleId: string): Promise<CycleDetail | undefined> {
+  async getCycle(
+    sessionId: string,
+    cycleId: string,
+    userScope: UserScope,
+  ): Promise<CycleDetail | undefined> {
+    assertScope(userScope);
     const cyclesGraph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
     const cycleUri = this.cycleUriFor(cycleId);
     const head = await this.triplestore.query(`
-      SELECT ?st ?s ?e WHERE {
+      SELECT ?st ?s ?e ?forUser WHERE {
         GRAPH <${cyclesGraph}> {
           <${cycleUri}> a <${COGT}Cycle> ;
              <${COGT}cycleStatus> ?st ;
              <${COGT}startedAt>   ?s ;
              <${COGT}endedAt>     ?e .
+          OPTIONAL { <${cycleUri}> <${COGT}forUser> ?forUser . }
         }
       }`);
     const h = (head.bindings ?? [])[0];
-    if (!h) return undefined;
+    if (!h || !keyInScope(h.forUser?.value, userScope)) return undefined;
     const cycle = this.toCycleSummary(cycleUri, h.st.value, h.s.value, h.e.value);
 
     const [phases, buffer, episodes, marker] = await Promise.all([
       this.readPhases(cyclesGraph, cycleUri),
-      this.readBuffer(sessionId, cycleId),
-      this.episodesInCycle(cycleId),
+      this.readBuffer(sessionId, cycleId, userScope),
+      this.episodesInCycle(cycleId, userScope),
       this.readMarker(cycleUri),
     ]);
 
@@ -189,9 +220,13 @@ export class CogInspector {
       .sort((a, b) => a.ordinal - b.ordinal);
   }
 
-  private async readBuffer(sessionId: string, cycleId: string): Promise<WMEntry[]> {
+  private async readBuffer(
+    sessionId: string,
+    cycleId: string,
+    userScope: UserScope,
+  ): Promise<WMEntry[]> {
     const wm = new WorkingMemory(this.triplestore, this.registry, this.agentId, sessionId, cycleId);
-    return wm.read();
+    return (await wm.read()).filter((e) => keyInScope(e.forUser, userScope));
   }
 
   /**
@@ -199,7 +234,7 @@ export class CogInspector {
    * does not surface `cycleId`, so the cycle's episode URIs are selected
    * directly and then resolved to full hits.
    */
-  private async episodesInCycle(cycleId: string): Promise<EpisodeHit[]> {
+  private async episodesInCycle(cycleId: string, userScope: UserScope): Promise<EpisodeHit[]> {
     const graph = GraphUriResolver.getCogEpisodicGraph(this.agentId);
     const res = await this.triplestore.query(`
       SELECT ?ep WHERE {
@@ -209,7 +244,7 @@ export class CogInspector {
       }`);
     const uris = new Set((res.bindings ?? []).map((b) => b.ep.value));
     if (uris.size === 0) return [];
-    const all = await this.episodicMemory().recent(5000);
+    const all = await this.episodicMemory().recent(userScope, 5000);
     return all.filter((e) => uris.has(e.uri));
   }
 
@@ -240,13 +275,15 @@ export class CogInspector {
   }
 
   /** Every goal in the session + long-term graphs (read-only). */
-  async listGoals(sessionId: string): Promise<Goal[]> {
-    return this.goalStack(sessionId).list();
+  async listGoals(sessionId: string, userScope: UserScope): Promise<Goal[]> {
+    assertScope(userScope);
+    const goals = await this.goalStack(sessionId).list();
+    return userScope === ALL_USERS_SCOPE ? goals : goals.filter((g) => goalBelongsTo(g, userScope));
   }
 
   /** Most-recent episodes, optionally restricted to an entity IRI. */
-  async listEpisodes(entity?: string, limit = 50): Promise<EpisodeHit[]> {
-    return this.episodicMemory().recent(limit, entity);
+  async listEpisodes(userScope: UserScope, entity?: string, limit = 50): Promise<EpisodeHit[]> {
+    return this.episodicMemory().recent(userScope, limit, entity);
   }
 
   /**
@@ -255,9 +292,14 @@ export class CogInspector {
    * serves and the episode that triggered that goal; retrieval entries surface
    * the episodes they pulled into the workspace.
    */
-  async explainResponse(sessionId: string, cycleId: string): Promise<ResponseExplanation> {
+  async explainResponse(
+    sessionId: string,
+    cycleId: string,
+    userScope: UserScope,
+  ): Promise<ResponseExplanation> {
+    assertScope(userScope);
     const cycleUri = this.cycleUriFor(cycleId);
-    const buffer = await this.readBuffer(sessionId, cycleId);
+    const buffer = await this.readBuffer(sessionId, cycleId, userScope);
     if (buffer.length === 0) {
       return { cycleId, cycleUri, found: false, actions: [], retrievals: [] };
     }
@@ -268,10 +310,12 @@ export class CogInspector {
     );
     const actions: ExplainAction[] = [];
     for (const e of actionEntries) {
-      const goal = e.forGoal ? await gs.get(e.forGoal) : undefined;
+      const found = e.forGoal ? await gs.get(e.forGoal) : undefined;
+      const goal =
+        found && (userScope === ALL_USERS_SCOPE || goalBelongsTo(found, userScope)) ? found : undefined;
       const triggeringEpisode =
         goal?.triggeredByEpisode !== undefined
-          ? await this.episodeByUri(goal.triggeredByEpisode)
+          ? await this.episodeByUri(goal.triggeredByEpisode, userScope)
           : undefined;
       actions.push({
         entryId: e.id,
@@ -287,7 +331,7 @@ export class CogInspector {
     );
     const retrievals: ExplainRetrieval[] = [];
     for (const e of retrievalEntries) {
-      const episode = e.refersTo ? await this.episodeByUri(e.refersTo) : undefined;
+      const episode = e.refersTo ? await this.episodeByUri(e.refersTo, userScope) : undefined;
       retrievals.push({
         entryId: e.id,
         payload: e.payload,
@@ -300,8 +344,8 @@ export class CogInspector {
     return { cycleId, cycleUri, found: true, actions, retrievals };
   }
 
-  private async episodeByUri(uri: string): Promise<EpisodeHit | undefined> {
-    const all = await this.episodicMemory().recent(5000);
+  private async episodeByUri(uri: string, userScope: UserScope): Promise<EpisodeHit | undefined> {
+    const all = await this.episodicMemory().recent(userScope, 5000);
     return all.find((e) => e.uri === uri);
   }
 

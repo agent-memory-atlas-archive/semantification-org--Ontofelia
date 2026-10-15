@@ -13,3 +13,4 @@ export * from './errors.js';
 export * from './logger.js';
 export * from './result.js';
 export * from './humanTurn.js';
+export * from './cogUserKey.js';

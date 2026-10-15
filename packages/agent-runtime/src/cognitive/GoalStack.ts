@@ -18,8 +18,8 @@
  *    active set, so sorting in-process is both safe and cheap.
  */
 
-import type { TriplestoreAdapter } from '@ontofelia/core';
-import { GraphRegistry, GraphUriResolver } from '@ontofelia/semantic-memory';
+import { OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
+import { GraphRegistry, GraphUriResolver, sparqlIri } from '@ontofelia/semantic-memory';
 
 const COGT = 'urn:shared:ontology#cog/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -118,6 +118,11 @@ export interface GoalInput {
   parentGoal?: GoalId;
   triggeredByEpisode?: string; // URI
   triggeredByUser?: string; // URI
+  /**
+   * The user key the goal belongs to (`cogt:forUser`). Defaults to the stack's
+   * viewer when it has one. Owner-armed goals belong to {@link OWNER_USER_KEY}.
+   */
+  forUser?: string;
   plannedSteps?: string;
   currentStep?: string;
   tags?: string[];
@@ -152,6 +157,8 @@ export interface Goal {
   parentGoal?: string;
   triggeredByEpisode?: string;
   triggeredByUser?: string;
+  /** The user key the goal belongs to; absent on legacy goals (see {@link goalOwnerKey}). */
+  forUser?: string;
   plannedSteps?: string;
   currentStep?: string;
   stepProgress?: string;
@@ -181,6 +188,48 @@ function escapeLiteral(s: string): string {
     .replace(/\t/g, '\\t');
 }
 
+/** Who is looking at the goal forest: the current sender. */
+export interface GoalViewer {
+  /** The sender's user key (`cogUserKey`). */
+  userId: string;
+  /** True for the verified owner (and the synthetic envelopes that claim it). */
+  isOwner: boolean;
+}
+
+const SENDER_ENTITY_PREFIX = 'urn:entity:agent-sender:';
+
+/**
+ * The user key a goal belongs to, or undefined when it has no owner. Goals
+ * carry `cogt:forUser`; a legacy goal written before the key existed falls back
+ * to the sender entity in `cogt:triggeredByUser`. A goal with neither (the
+ * implicit RespondToUser goal, owner-less legacy long-term goals) has no owner.
+ */
+export function goalOwnerKey(goal: Pick<Goal, 'forUser' | 'triggeredByUser'>): string | undefined {
+  if (goal.forUser) return goal.forUser;
+  if (goal.triggeredByUser?.startsWith(SENDER_ENTITY_PREFIX)) {
+    try {
+      return decodeURIComponent(goal.triggeredByUser.slice(SENDER_ENTITY_PREFIX.length));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Strict ownership: does the goal belong to `userKey`? An owner-less goal
+ * belongs to the owner only, except the generic RespondToUser goal, which
+ * carries no user content and belongs to everyone.
+ */
+export function goalBelongsTo(
+  goal: Pick<Goal, 'forUser' | 'triggeredByUser' | 'goalType'>,
+  userKey: string,
+): boolean {
+  const owner = goalOwnerKey(goal);
+  if (owner !== undefined) return owner === userKey;
+  return goal.goalType === RESPOND_TO_USER || userKey === OWNER_USER_KEY;
+}
+
 export class GoalStack {
   private readonly minWakeIntervalMs: number;
 
@@ -191,8 +240,21 @@ export class GoalStack {
     private readonly sessionId: string,
     /** Injectable floor for recurring wakes (design §5). Defaults to the cooldown. */
     minWakeIntervalMs: number = DEFAULT_MIN_WAKE_INTERVAL_MS,
+    /**
+     * The current sender. With a viewer, a non-owner sees only goals that belong
+     * to them ({@link goalBelongsTo}) in every read, in the session and in the
+     * long-term graph; the owner sees every goal. New goals are stamped with the
+     * viewer's key. Without a viewer the stack is unscoped, which is for the
+     * owner-only commands and tools and the unattended initiative runtime.
+     */
+    private readonly viewer?: GoalViewer,
   ) {
     this.minWakeIntervalMs = minWakeIntervalMs;
+  }
+
+  private visible(goal: Goal): boolean {
+    if (!this.viewer || this.viewer.isOwner) return true;
+    return goalBelongsTo(goal, this.viewer.userId);
   }
 
   /**
@@ -283,7 +345,9 @@ export class GoalStack {
     if (input.triggeredByEpisode)
       lines.push(`<${uri}> <${COGT}triggeredByEpisode> <${input.triggeredByEpisode}> .`);
     if (input.triggeredByUser)
-      lines.push(`<${uri}> <${COGT}triggeredByUser> <${input.triggeredByUser}> .`);
+      lines.push(`<${uri}> <${COGT}triggeredByUser> ${sparqlIri(input.triggeredByUser)} .`);
+    const forUser = input.forUser ?? this.viewer?.userId;
+    if (forUser) lines.push(`<${uri}> <${COGT}forUser> "${escapeLiteral(forUser)}" .`);
     if (input.plannedSteps)
       lines.push(`<${uri}> <${COGT}plannedSteps> "${escapeLiteral(input.plannedSteps)}" .`);
     if (input.currentStep)
@@ -561,7 +625,13 @@ export class GoalStack {
 
   /** Fetch a single goal by IRI (searches both graphs). */
   async get(uri: GoalId): Promise<Goal | undefined> {
-    const goals = await this.readWhere(`VALUES ?goal { <${uri}> }`);
+    let iri: string;
+    try {
+      iri = sparqlIri(uri);
+    } catch {
+      return undefined; // not an IRI: no such goal
+    }
+    const goals = await this.readWhere(`VALUES ?goal { ${iri} }`);
     return goals[0];
   }
 
@@ -608,7 +678,31 @@ export class GoalStack {
     await this.triplestore.update(`
       DELETE { GRAPH <${session}> { <${goalId}> ?p ?o } }
       WHERE  { GRAPH <${session}> { <${goalId}> ?p ?o } }`);
+    // The long-term graph is shared by every user: a goal must not enter it
+    // without an owner, or it would be owner-only legacy (or worse, ambiguous).
+    // Keep an existing key; else derive it from the sender; else use the viewer.
+    const moved = await this.rawGoal(longterm, goalId);
+    if (moved && !moved.forUser) {
+      const owner = goalOwnerKey(moved) ?? this.viewer?.userId;
+      if (owner) await this.setOwner(goalId, owner);
+    }
     return true;
+  }
+
+  /**
+   * Make a goal belong to `userKey` (replaces `cogt:forUser`). Used when the
+   * owner arms a goal: an armed goal is the owner's, never another user's.
+   */
+  async setOwner(goalId: GoalId, userKey: string): Promise<void> {
+    const graph = await this.graphOf(goalId);
+    if (!graph) return;
+    this.registry.assertWritable(graph);
+    await this.replaceOne(graph, goalId, `${COGT}forUser`, `"${escapeLiteral(userKey)}"`);
+  }
+
+  /** One goal by IRI from a given graph, ignoring the viewer (internal). */
+  private async rawGoal(graph: string, uri: GoalId): Promise<Goal | undefined> {
+    return (await this.readGraph(graph, `VALUES ?goal { ${sparqlIri(uri)} }`))[0];
   }
 
   /**
@@ -665,14 +759,14 @@ export class GoalStack {
     for (const graph of this.goalGraphs()) {
       out.push(...(await this.readGraph(graph, constraint)));
     }
-    return out;
+    return out.filter((g) => this.visible(g));
   }
 
   private async readGraph(graph: string, constraint = ''): Promise<Goal[]> {
     const sparql = `
       SELECT ?goal ?goalId ?goalType ?goalLabel ?status ?priority ?createdAt ?updatedAt
              ?successCriterion ?deadline ?resolvedAt ?abandonedAt ?blockedReason
-             ?parentGoal ?triggeredByEpisode ?triggeredByUser ?plannedSteps
+             ?parentGoal ?triggeredByEpisode ?triggeredByUser ?forUser ?plannedSteps
              ?currentStep ?stepProgress ?longTerm
              ?wakeAt ?wakeEvery ?mandatedBy ?servesDrive ?lastWakeAt ?wakeCount
              ?consecutiveFailures
@@ -695,6 +789,7 @@ export class GoalStack {
           OPTIONAL { ?goal <${COGT}parentGoal>         ?parentGoal . }
           OPTIONAL { ?goal <${COGT}triggeredByEpisode> ?triggeredByEpisode . }
           OPTIONAL { ?goal <${COGT}triggeredByUser>    ?triggeredByUser . }
+          OPTIONAL { ?goal <${COGT}forUser>            ?forUser . }
           OPTIONAL { ?goal <${COGT}plannedSteps>       ?plannedSteps . }
           OPTIONAL { ?goal <${COGT}currentStep>        ?currentStep . }
           OPTIONAL { ?goal <${COGT}stepProgress>       ?stepProgress . }
@@ -732,6 +827,7 @@ export class GoalStack {
       if (r.parentGoal) goal.parentGoal = r.parentGoal.value;
       if (r.triggeredByEpisode) goal.triggeredByEpisode = r.triggeredByEpisode.value;
       if (r.triggeredByUser) goal.triggeredByUser = r.triggeredByUser.value;
+      if (r.forUser) goal.forUser = r.forUser.value;
       if (r.plannedSteps) goal.plannedSteps = r.plannedSteps.value;
       if (r.currentStep) goal.currentStep = r.currentStep.value;
       if (r.stepProgress) goal.stepProgress = r.stepProgress.value;
