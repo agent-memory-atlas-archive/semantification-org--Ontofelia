@@ -2,7 +2,7 @@
  * Micro-benchmark for the cognitive layer's hot paths.
  *
  *   LOG_LEVEL=silent npx tsx scripts/bench-cog.ts [--traces N] [--episodes M] [--appends K] [--cycles C]
- *                                                 [--recalls R] [--hot 1]
+ *                                                 [--recalls R] [--hot 1] [--turns T] [--persist-only 1]
  *
  * Defaults are small (200 traces, 1000 episodes, 200 appends, 30 cycles, 60 recalls). Needs
  * the packages built (`pnpm turbo run build`). Always run it under a memory cap:
@@ -23,6 +23,11 @@
  *    the session). `--hot 1` makes every seeded episode about one shared entity
  *    (the worst case for entity-anchored recall: each user then has M/5 episodes
  *    about it).
+ *
+ *  - turn persist: T full turns (all cognitive flags on, persistence awaited) on the
+ *    seeded store; prints dumps per turn (full-dataset serialisations, counted by
+ *    wrapping the store's dump) and p50/p95/max of the awaited turn time. With
+ *    `--persist-only 1` the run stops after this section (use it for the 2k/10k sizes).
  *
  * Budgets are printed as information; nothing here fails the build or the tests.
  * Seeding goes through one bulk load per graph (an `update` re-writes the whole
@@ -62,6 +67,8 @@ const K_APPENDS = arg('appends', 200);
 const C_CYCLES = arg('cycles', 30);
 const R_RECALLS = arg('recalls', 60);
 const HOT = arg('hot', 0) > 0;
+const T_TURNS = arg('turns', 30);
+const PERSIST_ONLY = arg('persist-only', 0) > 0;
 
 function pct(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -122,6 +129,54 @@ async function main() {
     if (trLines.length) await store.putGraph(pm.graphUri(), trLines.join('\n'));
   });
   console.log(`seed       ${M_EPISODES} episodes + ${N_TRACES} traces in ${ms(seedMs)} (bulk load)`);
+
+  // --- Turn persist: dumps per turn and awaited turn time ------------------
+  {
+    const raw = (store as unknown as { store: { dump: (...a: unknown[]) => string } }).store;
+    const origDump = raw.dump.bind(raw);
+    let dumps = 0;
+    raw.dump = (...a: unknown[]) => { dumps++; return origDump(...a); };
+    const env = (i: number) => ({
+      id: `tp${i}`, channel: 'webchat', accountId: 'a', chatType: 'web',
+      sender: { id: 'user:owner', channelPrefix: 'webchat', isOwner: true },
+      timestamp: new Date().toISOString(), text: `what is item ${i}?`, mentions: [], attachments: [],
+    });
+    const tcore = async () => ({ text: 'ok', sessionId: 'bench-turn-session' });
+    const cm = new CycleManager(store, registry, AGENT, undefined, { awaitPersist: true });
+    const times: number[] = [];
+    const perTurn: number[] = [];
+    for (let i = 0; i < T_TURNS; i++) {
+      const before = dumps;
+      times.push(await time(() => cm.runCycle(env(i) as never, tcore, (r: { sessionId: string }) => r.sessionId, (r: { text: string }) => r.text, {
+        episodicEnabled: true, goalsEnabled: true, proceduralEnabled: true, metacognitionEnabled: true, selfModelEnabled: true,
+      })));
+      await cm.flushPending();
+      perTurn.push(dumps - before);
+    }
+    // Concurrent burst: 9 independent writes issued together (what coalescing targets).
+    const burst: number[] = [];
+    const burstDumps: number[] = [];
+    for (let r = 0; r < Math.max(5, Math.floor(T_TURNS / 2)); r++) {
+      const before = dumps;
+      burst.push(await time(() => Promise.all(Array.from({ length: 9 }, (_, k) =>
+        store.update(`INSERT DATA { GRAPH <urn:bench:burst> { <urn:bench:b${r}> <urn:bench:p${k}> "${k}" . } }`)))));
+      burstDumps.push(dumps - before);
+    }
+    raw.dump = origDump;
+    const ts = stats(times);
+    const dsorted = [...perTurn].sort((x, y) => x - y);
+    console.log(`\nturn persist (${M_EPISODES} episodes seeded, ${T_TURNS} turns, all flags on, persist awaited)`);
+    console.log(`  dumps per turn: mean=${(perTurn.reduce((x, y) => x + y, 0) / Math.max(1, perTurn.length)).toFixed(2)} max=${dsorted[dsorted.length - 1] ?? 0} total=${dumps}`);
+    line('turn time incl. awaited persist', ts);
+    console.log(`  burst of 9 concurrent writes: dumps mean=${(burstDumps.reduce((x, y) => x + y, 0) / burstDumps.length).toFixed(2)}`);
+    line('burst of 9 concurrent writes, awaited', stats(burst));
+    console.log(`  dataset file ${((await fs.stat(path.join(dataDir, 'dataset.nq'))).size / 2 ** 20).toFixed(1)} MiB, RSS ${(process.resourceUsage().maxRSS / 1024).toFixed(0)} MiB`);
+    if (PERSIST_ONLY) {
+      await store.stop().catch(() => undefined);
+      await fs.rm(dataDir, { recursive: true, force: true });
+      return;
+    }
+  }
 
   // --- Episode append ---------------------------------------------------
   console.log('\nepisode append (session of growing size, M episodes elsewhere in the graph)');

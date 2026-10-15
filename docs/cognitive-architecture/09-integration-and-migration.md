@@ -321,6 +321,32 @@ Setup keys that are **not** feature flags (same config subject, same graph):
 | Performance | Add a bench: cycle latency under 1000-trace, 10k-episode memory |
 | Determinism | Same input → same WM contents (modulo timestamps); ensures prompt assembly is reproducible |
 
+### Performance and the persistence model
+
+The embedded Oxigraph adapter keeps the dataset in memory and persists it by
+serialising the whole dataset to one N-Quads file (temp file, then atomic
+rename). A mutating call changes the store and then awaits that flush, so the
+cost of a write grows with the dataset size.
+
+- **Coalescing.** Flushes run one at a time. If a flush is queued and has not
+  started, a new write joins it instead of queueing another one. A burst of
+  concurrent writes therefore costs one or two dumps instead of one per write.
+- **Guarantee.** A caller's awaited promise resolves only after a flush that
+  started after its own write has completed. Durability is "after the awaited
+  write resolves". A crash before that point loses the in-flight writes, the
+  same as before coalescing. If a flush fails, every caller that joined it gets
+  the rejection and the next write tries again.
+- **Limit.** Coalescing only helps writes that are in flight at the same time.
+  Writers that await each write before issuing the next (the persist phase of a
+  turn today) still pay one dump per write: 9 dumps per turn with all flags on.
+  Delaying the dump (debouncing) would not help them either without letting a
+  caller's await resolve before its write is on disk, which the guarantee above
+  rules out. Reducing the dumps per turn means issuing the turn's writes
+  together or as fewer updates; that is a change in the writers, not the adapter.
+- **Measuring.** `scripts/bench-cog.ts --persist-only 1 --episodes N` prints
+  dumps per turn, the p95 awaited turn time, and the dumps and time of a burst
+  of 9 concurrent writes.
+
 ---
 
 ## 9. Observability
