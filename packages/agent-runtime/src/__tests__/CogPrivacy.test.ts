@@ -71,7 +71,10 @@ describe('cognitive per-user privacy (cycle manager level)', () => {
     cm = new CycleManager(store, registry, AGENT, (e) => errors.push(e), { awaitPersist: true });
     em = new EpisodicMemory(store, AGENT);
   });
-  afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); });
+  afterEach(async () => {
+    await cm.flushPending();
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
 
   /** One turn; returns the `[Active goal]` prompt block the core would receive. */
   async function turn(sender: MessageEnvelope['sender'], text: string, session: string, over = {}) {
@@ -336,7 +339,11 @@ describe('cognitive per-user privacy (runtime level)', () => {
     );
     cfg = new CognitiveConfig(store, AGENT);
   });
-  afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); });
+  afterEach(async () => {
+    // Let the queued cognitive writes finish before the store directory goes.
+    await runtime.flushCognitiveWrites();
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
 
   const cogTypes = ['Episode', 'WorkingMemoryEntry', 'Cycle', 'Goal', 'ReflectiveMarker', 'SkillTrace'].map((t) => `${COGT}${t}`);
 
