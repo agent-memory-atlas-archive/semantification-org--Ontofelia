@@ -65,8 +65,22 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     this.status = 'running';
   }
 
-  /** Serialise the full dataset back to disk. */
-  private async flush(): Promise<void> {
+  /** Tail of the flush queue: writers share one temp file, so flushes must not overlap. */
+  private flushTail: Promise<void> = Promise.resolve();
+
+  /**
+   * Serialise the full dataset back to disk. Flushes run one at a time; a flush
+   * dumps the store when its turn comes, so it always writes the latest state.
+   * Without this, two overlapping updates raced on the shared temp file and the
+   * second rename failed (queued background writers made overlap likely).
+   */
+  private flush(): Promise<void> {
+    const run = this.flushTail.then(() => this.flushNow());
+    this.flushTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async flushNow(): Promise<void> {
     try {
       const nquads = this.store.dump({ format: OxigraphAdapter.NQUADS_MIME });
       // Atomic write: write to a temp file then rename

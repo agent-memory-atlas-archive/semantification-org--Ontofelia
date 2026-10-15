@@ -68,7 +68,7 @@ describe('cognitive per-user privacy (cycle manager level)', () => {
     ({ store, dir } = await makeStore());
     registry = GraphRegistry.create([AGENT]);
     errors = [];
-    cm = new CycleManager(store, registry, AGENT, (e) => errors.push(e));
+    cm = new CycleManager(store, registry, AGENT, (e) => errors.push(e), { awaitPersist: true });
     em = new EpisodicMemory(store, AGENT);
   });
   afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); });

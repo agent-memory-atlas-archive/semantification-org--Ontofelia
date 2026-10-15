@@ -154,6 +154,13 @@ export interface RunCycleOptions {
    */
   onPhase?: (phase: 'perception' | 'goal_management' | 'reflection', label: string, data?: unknown) => void;
   /**
+   * When true, `runCycle` resolves only after this cycle's cognitive records are
+   * written (the pre-queue behaviour). Default false: the records are queued per
+   * session, in order, and the reply returns without waiting for them. Tests set
+   * it to read the records straight after the call.
+   */
+  awaitPersist?: boolean;
+  /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
    * unattended cycle: Phase 3 does NOT seed the implicit RESPOND_TO_USER goal
@@ -200,6 +207,14 @@ function newId(): string {
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+/** New skill traces after which a consolidation is requested (doc 06 §5). */
+export const CONSOLIDATION_TRACE_THRESHOLD = 50;
+
+export interface CycleManagerOptions {
+  /** Default for {@link RunCycleOptions.awaitPersist}; a per-call value wins. */
+  awaitPersist?: boolean;
+}
+
 export class CycleManager {
   constructor(
     private readonly triplestore: TriplestoreAdapter,
@@ -207,7 +222,84 @@ export class CycleManager {
     private readonly agentId: string,
     /** Optional sink for cognitive-write failures (kept off the user path). */
     private readonly onError?: (err: unknown) => void,
+    private readonly defaults: CycleManagerOptions = {},
   ) {}
+
+  /**
+   * Tail of the persistence queue per session: a cycle's records are written
+   * only after the previous cycle of the same session finished writing, so the
+   * episode chain and the prior-cycle satisfaction backfill keep their order.
+   * Different sessions run independently.
+   */
+  private readonly persistTails = new Map<string, Promise<void>>();
+  /** Background work (queued persists, triggered consolidations) not yet settled. */
+  private readonly inFlight = new Set<Promise<unknown>>();
+
+  private tracesSinceConsolidation = 0;
+  private consolidationTrigger?: () => Promise<unknown>;
+  private consolidationThreshold = CONSOLIDATION_TRACE_THRESHOLD;
+
+  /**
+   * Register the callback that runs a consolidation once enough new traces have
+   * been written. The check is a counter increment; the callback does the work
+   * (no model call) in the background and its failures go to `onError`.
+   */
+  setConsolidationTrigger(
+    trigger: (() => Promise<unknown>) | undefined,
+    threshold = CONSOLIDATION_TRACE_THRESHOLD,
+  ): void {
+    this.consolidationTrigger = trigger;
+    this.consolidationThreshold = threshold;
+  }
+
+  /** Reset the new-trace counter (a consolidation just ran, whoever started it). */
+  resetTraceCounter(): void {
+    this.tracesSinceConsolidation = 0;
+  }
+
+  private noteTracesWritten(n: number): void {
+    if (n <= 0 || !this.consolidationTrigger) return;
+    this.tracesSinceConsolidation += n;
+    if (this.tracesSinceConsolidation < this.consolidationThreshold) return;
+    this.tracesSinceConsolidation = 0;
+    this.track(
+      Promise.resolve()
+        .then(() => this.consolidationTrigger?.())
+        .catch((e) => this.onError?.(e)),
+    );
+  }
+
+  private track<P extends Promise<unknown>>(p: P): P {
+    this.inFlight.add(p);
+    const done = () => {
+      this.inFlight.delete(p);
+    };
+    p.then(done, done);
+    return p;
+  }
+
+  /**
+   * Resolve once every queued cycle record (and any triggered consolidation) has
+   * settled. The runtime calls this on a clean stop so queued writes are not lost.
+   */
+  async flushPending(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+  }
+
+  /** Queue `job` behind the session's earlier jobs; resolves when `job` is done. */
+  private enqueuePersist(sessionId: string, job: () => Promise<void>): Promise<void> {
+    const prev = this.persistTails.get(sessionId) ?? Promise.resolve();
+    // The tail never rejects: a failed job reports to onError and the queue goes on.
+    const run = prev.then(job).catch((e) => this.onError?.(e));
+    this.persistTails.set(sessionId, run);
+    this.track(run);
+    run.then(() => {
+      if (this.persistTails.get(sessionId) === run) this.persistTails.delete(sessionId);
+    });
+    return run;
+  }
 
   private readonly logger = createLogger('cognitive-cycle');
 
@@ -334,14 +426,20 @@ export class CycleManager {
       emitPhase('reflection', 'Reflection');
     }
 
+    let sessionId = 'unknown';
+    let responseText: string | undefined;
     try {
-      const sessionId =
+      sessionId =
         (status === 'completed' && result !== undefined ? sessionIdOf(result) : undefined) ||
         envelope.routingHints?.sessionId ||
         'unknown';
-      const responseText =
+      responseText =
         status === 'completed' && result !== undefined ? responseTextOf?.(result) : undefined;
-      await this.persist(
+    } catch (extractErr) {
+      this.onError?.(extractErr);
+    }
+    const queued = this.enqueuePersist(sessionId, () =>
+      this.persist(
         envelope,
         sessionId,
         cycleId,
@@ -361,10 +459,9 @@ export class CycleManager {
         options.initiativeGoalUri,
         inboundEpisodeUri,
         options.episodicEnabled !== false,
-      );
-    } catch (persistErr) {
-      this.onError?.(persistErr);
-    }
+      ),
+    );
+    if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
 
     if (coreError) throw coreError;
     return result;
@@ -608,7 +705,14 @@ export class CycleManager {
       // only prior cycles (this cycle's traces aren't written yet, and we also
       // exclude the current cycleId explicitly).
       await this.backfillPriorSatisfaction(sessionId, cycleId, envelope.text || '');
-      await this.writeSkillTraces(sessionId, cycleId, toolEvents, activeGoalUri, activeGoalType);
+      const written = await this.writeSkillTraces(
+        sessionId,
+        cycleId,
+        toolEvents,
+        activeGoalUri,
+        activeGoalType,
+      );
+      this.noteTracesWritten(written);
     }
     await this.writeCycleAndPhases(
       sessionId,
@@ -862,7 +966,7 @@ export class CycleManager {
     toolEvents: ToolEpisodeEvent[],
     activeGoalUri?: string,
     activeGoalType?: string,
-  ): Promise<void> {
+  ): Promise<number> {
     // Pair events by callId, preserving first-seen order.
     interface Call {
       callId: string;
@@ -891,7 +995,7 @@ export class CycleManager {
         call.errorClass = ev.errorClass;
       }
     }
-    if (order.length === 0) return;
+    if (order.length === 0) return 0;
 
     const pm = new ProceduralMemory(this.triplestore, this.agentId);
     const sequenceLen = order.length;
@@ -922,6 +1026,7 @@ export class CycleManager {
       };
       previousTrace = await pm.recordTrace(trace);
     }
+    return order.length;
   }
 
   /** `core:privacyClass "secret"` for a payload that matches a credential shape. */

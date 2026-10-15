@@ -85,6 +85,7 @@ describe('/cog flags and /cog flag <name> on|off', () => {
   });
 
   afterEach(async () => {
+    await runtime.flushCognitiveWrites();
     await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
   });
 
@@ -187,6 +188,7 @@ describe('/cog flags and /cog flag <name> on|off', () => {
     await runtime.handleMessage(env('/cog cycle on'));
     const res = await runtime.handleMessage(env('hello there'));
     expect(res.text).toBe('a reply');
+    await runtime.flushCognitiveWrites(); // records are queued off the reply path
     expect(await episodeCount()).toBe(0);
     expect(await countCycleResources(`${COGT}Cycle`)).toBe(1);
     expect(await countCycleResources(`${COGT}WorkingMemoryEntry`)).toBeGreaterThan(0);
@@ -197,6 +199,7 @@ describe('/cog flags and /cog flag <name> on|off', () => {
     await runtime.handleMessage(env('/cog cycle on'));
     await runtime.handleMessage(env('/cog flag episodicmemory on'));
     await runtime.handleMessage(env('hello there'));
+    await runtime.flushCognitiveWrites();
     expect(await episodeCount()).toBeGreaterThanOrEqual(2); // message-received + response-sent
     expect(await countCycleResources(`${COGT}Cycle`)).toBe(1);
     expect(await countTyped(GraphUriResolver.getCogMetaGraph(AGENT), `${COGT}ReflectiveMarker`)).toBe(1);

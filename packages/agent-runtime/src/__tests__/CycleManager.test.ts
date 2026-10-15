@@ -45,7 +45,7 @@ describe('CycleManager', () => {
   beforeEach(async () => {
     store = await makeStore();
     registry = GraphRegistry.create([AGENT]);
-    cm = new CycleManager(store, registry, AGENT);
+    cm = new CycleManager(store, registry, AGENT, undefined, { awaitPersist: true });
   });
 
   it('returns the core result unchanged and persists a completed cycle with 6 phases', async () => {
@@ -714,7 +714,7 @@ describe('CycleManager', () => {
   it('a cognitive-write failure never breaks the user response', async () => {
     // An agent the registry does not know — assertWritable throws on every cog
     // graph, so persistence fails, but runCycle must still return the result.
-    const rogue = new CycleManager(store, GraphRegistry.create(['someoneelse']), AGENT);
+    const rogue = new CycleManager(store, GraphRegistry.create(['someoneelse']), AGENT, undefined, { awaitPersist: true });
     const out = await rogue.runCycle(
       makeEnvelope('hi'),
       async () => ({ text: 'ok', sessionId: 'sX' }),

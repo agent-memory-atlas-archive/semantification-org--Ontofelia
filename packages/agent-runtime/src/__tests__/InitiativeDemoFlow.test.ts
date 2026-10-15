@@ -140,6 +140,7 @@ describe('initiative demo flow (docs/demo-initiative.md)', () => {
   });
 
   afterEach(async () => {
+    await runtime.flushCognitiveWrites();
     await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
   });
 
@@ -205,6 +206,8 @@ describe('initiative demo flow (docs/demo-initiative.md)', () => {
     expect(after.mandatedBy).toBe(goal.mandatedBy);
 
     // Step 5: /initiative shows the cycle and the counter; /goals shows the step.
+    // The cycle record is queued off the reply path: let it land first.
+    await runtime.flushCognitiveWrites();
     const initiativeText = (await runtime.handleMessage(ownerEnv('/initiative'))).text;
     expect(initiativeText).toContain('Initiative: ON');
     expect(initiativeText).toContain('1/4');

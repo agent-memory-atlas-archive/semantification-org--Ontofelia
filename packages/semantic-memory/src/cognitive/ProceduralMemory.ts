@@ -21,6 +21,7 @@
 
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
+import type { GraphRegistry } from '../utils/GraphRegistry.js';
 import { escapeSparqlStringContent } from '../utils/SparqlSyntax.js';
 
 const COGT = 'urn:shared:ontology#cog/';
@@ -142,11 +143,96 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, idx)];
 }
 
+/**
+ * Traces newer than this are left for the next incremental consolidation: a
+ * cycle's traces are persisted after the reply, so a trace whose tool started
+ * just before a run may not be written yet. Holding the window's upper edge back
+ * keeps the watermark from stepping over it.
+ */
+export const CONSOLIDATION_LAG_MS = 120_000;
+
+/** Window used by the first incremental run, when no watermark exists yet. */
+export const DEFAULT_FIRST_WINDOW_MS = 24 * 3_600_000;
+
+export interface IncrementalOptions {
+  /** Upper edge of the window; defaults to now minus {@link CONSOLIDATION_LAG_MS}. */
+  until?: Date;
+  /** Look-back of the very first run (no watermark yet); default 24 h. */
+  firstWindowMs?: number;
+}
+
 export class ProceduralMemory {
   constructor(
     private readonly triplestore: TriplestoreAdapter,
     private readonly agentId: string,
+    /**
+     * Needed only for the watermark: its write goes through
+     * {@link GraphRegistry.assertWritable}. Without it, incremental consolidation
+     * is unavailable and the plain `consolidate(window)` is unaffected.
+     */
+    private readonly registry?: GraphRegistry,
   ) {}
+
+  /** Subject of the consolidation state in the agent's setup graph. */
+  private stateSubject(): string {
+    return `urn:${this.agentId}:setup:cognitive-procedural`;
+  }
+
+  /** The `lastConsolidatedAt` watermark, or undefined before the first run. */
+  async getWatermark(): Promise<Date | undefined> {
+    const graph = GraphUriResolver.getSetupGraph(this.agentId);
+    const res = await this.triplestore.query(`
+      SELECT ?v WHERE {
+        GRAPH <${graph}> { <${this.stateSubject()}> <${COGT}lastConsolidatedAt> ?v }
+      } LIMIT 1`);
+    const v = res.bindings?.[0]?.v?.value;
+    if (!v) return undefined;
+    const t = Date.parse(v);
+    return Number.isNaN(t) ? undefined : new Date(t);
+  }
+
+  private async setWatermark(at: Date): Promise<void> {
+    const graph = GraphUriResolver.getSetupGraph(this.agentId);
+    this.registry?.assertWritable(graph);
+    const subject = this.stateSubject();
+    await this.triplestore.update(`
+      DELETE { GRAPH <${graph}> { <${subject}> <${COGT}lastConsolidatedAt> ?old } }
+      WHERE  { GRAPH <${graph}> { <${subject}> <${COGT}lastConsolidatedAt> ?old } }`);
+    await this.triplestore.update(`
+      INSERT DATA { GRAPH <${graph}> {
+        <${subject}> <${COGT}lastConsolidatedAt> "${at.toISOString()}"^^<${XSD}dateTime> .
+      } }`);
+  }
+
+  /**
+   * Idempotent consolidation: aggregate only the traces after the stored
+   * `lastConsolidatedAt` watermark (exclusive) up to `until` (inclusive), then
+   * advance the watermark to `until`. Running it again over the same period finds
+   * nothing new, so counts are never added twice. The first run (no watermark)
+   * looks back `firstWindowMs`, as the old fixed window did. The watermark never
+   * moves backwards, and only moves after a successful consolidation.
+   */
+  async consolidateIncremental(opts: IncrementalOptions = {}): Promise<ConsolidationReport> {
+    if (!this.registry) {
+      throw new Error('ProceduralMemory.consolidateIncremental needs a GraphRegistry');
+    }
+    const until = opts.until ?? new Date(Date.now() - CONSOLIDATION_LAG_MS);
+    const mark = await this.getWatermark();
+    const since = mark ?? new Date(until.getTime() - (opts.firstWindowMs ?? DEFAULT_FIRST_WINDOW_MS));
+    if (mark && until.getTime() <= mark.getTime()) {
+      return {
+        since: mark.toISOString(),
+        until: until.toISOString(),
+        tracesScanned: 0,
+        skillsUpserted: 0,
+        sequenceSkillsCreated: 0,
+        sequenceSkillsReinforced: 0,
+      };
+    }
+    const report = await this.consolidate({ since, until }, { sinceExclusive: mark !== undefined });
+    await this.setWatermark(until);
+    return report;
+  }
 
   graphUri(): string {
     return GraphUriResolver.getCogProceduralGraph(this.agentId);
@@ -277,11 +363,15 @@ export class ProceduralMemory {
 
   /**
    * Aggregate the traces in `[since, until]` into Skill summaries and detect
-   * recurring tool sequences (doc 06 §5). Idempotent-ish: re-running over the
-   * same window double-counts, so callers pass a fresh window each tick.
+   * recurring tool sequences (doc 06 §5). Not idempotent by itself: re-running
+   * over the same window double-counts. Scheduled and triggered runs use
+   * {@link consolidateIncremental}, which derives the window from a watermark.
    */
-  async consolidate(window: { since: Date; until: Date }): Promise<ConsolidationReport> {
-    const traces = await this.readTraces(window);
+  async consolidate(
+    window: { since: Date; until: Date },
+    opts: { sinceExclusive?: boolean } = {},
+  ): Promise<ConsolidationReport> {
+    const traces = await this.readTraces(window, opts.sinceExclusive === true);
     const report: ConsolidationReport = {
       since: window.since.toISOString(),
       until: window.until.toISOString(),
@@ -524,7 +614,10 @@ export class ProceduralMemory {
   // Reads
   // ---------------------------------------------------------------------------
 
-  private async readTraces(window: { since: Date; until: Date }): Promise<TraceHit[]> {
+  private async readTraces(
+    window: { since: Date; until: Date },
+    sinceExclusive = false,
+  ): Promise<TraceHit[]> {
     const graph = this.graphUri();
     const res = await this.triplestore.query(`
       SELECT ?t ?traceId ?toolName ?hash ?brief ?when ?dur ?outcome ?errorClass
@@ -554,7 +647,7 @@ export class ProceduralMemory {
     for (const r of res.bindings ?? []) {
       const when = r.when.value;
       const ts = Date.parse(when);
-      if (ts < since || ts > until) continue;
+      if (ts < since || ts > until || (sinceExclusive && ts === since)) continue;
       const hit: TraceHit = {
         uri: r.t.value,
         traceId: r.traceId.value,

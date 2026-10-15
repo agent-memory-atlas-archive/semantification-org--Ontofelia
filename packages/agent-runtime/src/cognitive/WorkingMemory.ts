@@ -343,11 +343,24 @@ export class WorkingMemory {
   /**
    * Enforce the per-cycle entry cap by dropping the lowest-salience entries
    * first (doc 04 §7). No-op while under the cap.
+   *
+   * Incremental: each write first runs a bounded probe that asks only whether an
+   * entry exists beyond the cap (`LIMIT 1 OFFSET MAX_ENTRIES`). The probe stops
+   * after at most MAX_ENTRIES + 1 rows and returns at most one, so a write on a
+   * graph under the cap never lists the whole graph. Only when the cap is
+   * actually exceeded is the ordered list read and trimmed.
    */
   private async enforceCap(): Promise<void> {
     const graph = this.graphUri();
     // Avoid SPARQL COUNT/aggregates: the embedded Oxigraph (WASM) build throws
-    // "unreachable" on them. List entries salience-ascending and count in TS.
+    // "unreachable" on them.
+    const probe = await this.triplestore.query(`
+      SELECT ?e WHERE {
+        GRAPH <${graph}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s }
+      } LIMIT 1 OFFSET ${MAX_ENTRIES}`);
+    if ((probe.bindings ?? []).length === 0) return;
+
+    // Over the cap: list salience-ascending and trim in TS.
     const res = await this.triplestore.query(`
       SELECT ?e WHERE {
         GRAPH <${graph}> { ?e a <${COGT}WorkingMemoryEntry> ; <${COGT}salience> ?s }

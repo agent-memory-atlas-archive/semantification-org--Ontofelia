@@ -24,6 +24,9 @@ const CORE = 'urn:shared:ontology#';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 
+/** Episodes per VALUES block when fetching multi-valued properties. */
+const MULTI_VALUE_CHUNK = 200;
+
 /** Minimal per-episode facts the retention sweep classifies on. */
 interface RetentionRecord {
   uri: string;
@@ -268,11 +271,11 @@ export class EpisodicMemory {
     if (ep.sessionId) {
       // Internal: the chain and the sequence number span the whole session,
       // whoever spoke (a group session has several senders).
-      const existing = await this.findInSession(ep.sessionId, ALL_USERS_SCOPE);
-      seq = existing.length + 1;
-      if (!precededBy && existing.length > 0) {
-        // existing is newest-first; chain to the most recent.
-        precededBy = existing[0].uri;
+      const tail = await this.sessionTail(ep.sessionId);
+      seq = tail.count + 1;
+      if (!precededBy && tail.latestUri) {
+        // Chain to the most recent episode of the session.
+        precededBy = tail.latestUri;
       }
     }
     const episodeId = `ep_${occurredAt.replace(/[:.]/g, '-')}_${String(seq).padStart(4, '0')}`;
@@ -309,6 +312,38 @@ export class EpisodicMemory {
 
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
     return uri;
+  }
+
+  /**
+   * The size of a session's episode chain and its newest episode, from a query
+   * that selects only the two columns needed (no payloads, no `about`/`tags`).
+   * "Newest" follows {@link findInSession}: the greatest `episodeId`.
+   */
+  private async sessionTail(sessionId: string): Promise<{ count: number; latestUri?: string }> {
+    const graph = this.graphUri();
+    const res = await this.triplestore.query(`
+      SELECT ?ep ?episodeId WHERE {
+        GRAPH <${graph}> {
+          ?ep <${COGT}sessionId> "${escapeLiteral(sessionId)}" .
+          ?ep a <${COGT}Episode> ;
+              <${COGT}episodeId>   ?episodeId ;
+              <${COGT}episodeType> ?type ;
+              <${COGT}occurredAt>  ?when ;
+              <${COGT}salience>    ?salience .
+        }
+      }`);
+    let latestUri: string | undefined;
+    let latestId = '';
+    let count = 0;
+    for (const r of res.bindings ?? []) {
+      count++;
+      const id = r.episodeId.value;
+      if (latestUri === undefined || id > latestId) {
+        latestId = id;
+        latestUri = r.ep.value;
+      }
+    }
+    return { count, latestUri };
   }
 
   /**
@@ -660,12 +695,12 @@ export class EpisodicMemory {
              ?actor ?forUser ?payload ?transcriptRef ?outcome ?durationMs ?errorClass
       WHERE {
         GRAPH <${graph}> {
+          ${constraint}
           ?ep a <${COGT}Episode> ;
               <${COGT}episodeId>   ?episodeId ;
               <${COGT}episodeType> ?type ;
               <${COGT}occurredAt>  ?when ;
               <${COGT}salience>    ?salience .
-          ${constraint}
           OPTIONAL { ?ep <${COGT}sessionId>     ?sessionId . }
           OPTIONAL { ?ep <${COGT}precededBy>    ?precededBy . }
           OPTIONAL { ?ep <${COGT}partOfGoal>    ?partOfGoal . }
@@ -685,9 +720,11 @@ export class EpisodicMemory {
       inScope({ forUser: r.forUser?.value }, userScope),
     );
 
-    // `about` and `tags` are multi-valued; fetch them in a second pass and group.
-    const about = await this.multiValued(`<${COGT}about>`, true);
-    const tags = await this.multiValued(`<${COGT}tags>`, false);
+    // `about` and `tags` are multi-valued; fetch them in a second pass, only for
+    // the episodes that survived the scope, and group.
+    const uris = rows.map((r) => r.ep.value);
+    const about = await this.multiValued(`<${COGT}about>`, uris);
+    const tags = await this.multiValued(`<${COGT}tags>`, uris);
 
     return rows.map((r) => {
       const uri = r.ep.value;
@@ -715,19 +752,29 @@ export class EpisodicMemory {
     });
   }
 
-  private async multiValued(predicate: string, isIri: boolean): Promise<Map<string, string[]>> {
+  /**
+   * Values of a multi-valued predicate for the given episodes only. The IRIs
+   * come from the store itself; they are re-validated before being placed in a
+   * VALUES block, and the block is chunked to keep each query small.
+   */
+  private async multiValued(predicate: string, uris: string[]): Promise<Map<string, string[]>> {
     const graph = this.graphUri();
-    const res = await this.triplestore.query(`
-      SELECT ?ep ?v WHERE {
-        GRAPH <${graph}> { ?ep a <${COGT}Episode> ; ${predicate} ?v }
-      }`);
     const map = new Map<string, string[]>();
-    for (const r of res.bindings ?? []) {
-      const key = r.ep.value;
-      const val = r.v.value;
-      const arr = map.get(key) ?? [];
-      arr.push(isIri ? val : val);
-      map.set(key, arr);
+    for (let i = 0; i < uris.length; i += MULTI_VALUE_CHUNK) {
+      const chunk = uris.slice(i, i + MULTI_VALUE_CHUNK).map((u) => sparqlIri(u));
+      const res = await this.triplestore.query(`
+        SELECT ?ep ?v WHERE {
+          GRAPH <${graph}> {
+            VALUES ?ep { ${chunk.join(' ')} }
+            ?ep ${predicate} ?v .
+          }
+        }`);
+      for (const r of res.bindings ?? []) {
+        const key = r.ep.value;
+        const arr = map.get(key) ?? [];
+        arr.push(r.v.value);
+        map.set(key, arr);
+      }
     }
     return map;
   }

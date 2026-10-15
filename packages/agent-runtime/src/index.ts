@@ -14,6 +14,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
+import { CogCleanup, type CleanupReport } from './cognitive/CogCleanup.js';
 import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder } from './cognitive/CycleManager.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
@@ -310,6 +311,9 @@ export class AgentRuntime {
         this.agentId,
         (err) => this.emitDebug('error', `cognitive write failed: ${(err as Error).message}`),
       );
+      // "After N new traces" consolidation trigger (doc 06 §5): a counter check
+      // after trace writes; the work itself is the same idempotent consolidation.
+      this.cycleManager.setConsolidationTrigger(() => this.consolidateProceduralMemory());
     }
     // Initialize Semantic Parser (Ontology Learning pipeline)
     if (provider && knowledgeEngine) {
@@ -393,6 +397,19 @@ export class AgentRuntime {
 
   async stop(): Promise<void> {
     this.lifecycle = 'stopped';
+    // Cognitive records are queued off the reply path; let them land before the
+    // process goes away.
+    await this.flushCognitiveWrites();
+  }
+
+  /**
+   * Wait until every queued cognitive record (cycle, episodes, working memory,
+   * traces) has been written. Called on a clean stop; also lets a caller that
+   * reads those graphs right after a reply see the finished state. Best-effort:
+   * a failed write was already reported through the debug stream.
+   */
+  async flushCognitiveWrites(): Promise<void> {
+    await this.cycleManager?.flushPending().catch(() => undefined);
   }
 
   // Sessions for which the user pressed "Approve all" — dangerous tools then
@@ -1184,8 +1201,58 @@ Users can use these commands:
     };
     if (!this.knowledgeEngine || !this.cognitiveConfig) return empty;
     if (!(await this.cognitiveConfig.isProceduralMemoryEnabled())) return empty;
-    const pm = new ProceduralMemory(this.knowledgeEngine['triplestore'], this.agentId);
-    return pm.consolidate({ since, until });
+    // One consolidation at a time: the cron job, the trace-count trigger and a
+    // manual command may overlap, and two runs reading the same watermark would
+    // count the same traces twice.
+    if (this.consolidationInFlight) return this.consolidationInFlight;
+    const run = (async () => {
+      const pm = new ProceduralMemory(
+        this.knowledgeEngine!['triplestore'],
+        this.agentId,
+        this.knowledgeEngine!.registry,
+      );
+      // The window is "since the last run" (watermark); `windowHours` only
+      // bounds the very first run, which has no watermark yet.
+      const report = await pm.consolidateIncremental({ firstWindowMs: windowHours * 3_600_000 });
+      this.cycleManager?.resetTraceCounter();
+      return report;
+    })();
+    this.consolidationInFlight = run;
+    try {
+      return await run;
+    } finally {
+      this.consolidationInFlight = undefined;
+    }
+  }
+
+  private consolidationInFlight?: Promise<ConsolidationReport>;
+
+  /**
+   * Daily hygiene of the per-cycle cognitive graphs: drops working-memory graphs
+   * 7 days after their last write and cycle graphs 30 days after theirs. Only
+   * graphs the registry classifies as cog working/cycles of this agent are
+   * touched (see {@link CogCleanup}). A no-op without a knowledge engine.
+   */
+  async runCogCleanup(now: Date = new Date()): Promise<CleanupReport> {
+    const empty: CleanupReport = {
+      now: now.toISOString(),
+      workingScanned: 0,
+      workingDropped: 0,
+      cyclesScanned: 0,
+      cyclesDropped: 0,
+      undated: 0,
+    };
+    if (!this.knowledgeEngine) return empty;
+    const report = await new CogCleanup(
+      this.knowledgeEngine['triplestore'],
+      this.knowledgeEngine.registry,
+      this.agentId,
+    ).run(now);
+    this.logger.info(
+      { job: 'cog.cleanup', ...report },
+      `cog cleanup: dropped ${report.workingDropped} working and ${report.cyclesDropped} cycle graph(s)`,
+    );
+    return report;
   }
 
   /**
@@ -2204,6 +2271,10 @@ Users can use these commands:
         const r = await this.consolidateProceduralMemory();
         return { text: `🧩 Consolidation: ${r.tracesScanned} traces, ${r.skillsUpserted} skills, ${r.sequenceSkillsCreated} new sequences.`, sessionId: session.sessionId };
       }
+      if (sub === 'cleanup') {
+        const r = await this.runCogCleanup();
+        return { text: `🧹 Cleanup: dropped ${r.workingDropped}/${r.workingScanned} working graph(s) and ${r.cyclesDropped}/${r.cyclesScanned} cycle graph(s).`, sessionId: session.sessionId };
+      }
       if (sub === 'scan') {
         const r = await this.runMetacognitiveScan();
         return { text: `🔭 Metacog scan: ${r.cyclesScanned} cycles, ${r.chronicImpassesRaised} chronic impasse(s), ${r.capabilityGapsRaised} capability gap(s), drift ${r.driftDetected}.`, sessionId: session.sessionId };
@@ -2284,7 +2355,7 @@ Users can use these commands:
         if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.
