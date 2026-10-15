@@ -379,7 +379,7 @@ function CyclesView({
                     backgroundColor: 'var(--color-surface)',
                   }}
                 >
-                  {p.ordinal}. {p.phaseKind}
+                  {p.phaseIndex}. {p.phaseKind}{p.phaseStatus && p.phaseStatus !== 'completed' ? ` (${p.phaseStatus})` : ''}
                 </span>
               ))}
             </div>
@@ -416,16 +416,26 @@ function CyclesView({
 
             {explanation && (
               <div style={{ ...card, marginTop: 'var(--space-3)', borderColor: 'var(--color-primary, #6366f1)' }}>
-                <div style={label}>Why this response — WM → action → goal → episode</div>
+                <div style={label}>Why this response — response → action → goal → WM → episode</div>
+                {explanation.response && (
+                  <div style={{ fontSize: 'var(--font-size-sm)', marginTop: 'var(--space-2)' }}>
+                    response: {explanation.response.payload}
+                  </div>
+                )}
                 {explanation.actions.length === 0 ? (
                   <Empty text="No action entries to explain." />
                 ) : (
                   explanation.actions.map((a) => (
                     <div key={a.entryId} style={{ marginTop: 'var(--space-2)' }}>
-                      <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600 }}>action: {a.payload}</div>
-                      {a.goal && <div style={mono}>↳ goal: {a.goal.goalLabel} ({a.goal.status})</div>}
+                      <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600 }}>
+                        action: {a.toolName ?? a.payload}
+                        {a.outcome ? ` → ${a.outcome === 'success' ? 'ok' : 'error'}${a.denialClass ? ` (${a.denialClass})` : ''}` : ''}
+                        {a.durationMs !== undefined ? `, ${a.durationMs} ms` : ''}
+                      </div>
+                      {a.args !== undefined && <div style={mono}>↳ args: {a.args || '(none)'}</div>}
+                      {a.goal && <div style={mono}>↳ goal: {a.goal.goalLabel} ({a.goal.goalStatus})</div>}
                       {a.triggeringEpisode && (
-                        <div style={mono}>↳ triggered by: {a.triggeringEpisode.payload ?? a.triggeringEpisode.episodeId}</div>
+                        <div style={mono}>↳ triggered by: {a.triggeringEpisode.payload ?? a.triggeringEpisode.uri}</div>
                       )}
                     </div>
                   ))
@@ -436,7 +446,7 @@ function CyclesView({
                     {explanation.retrievals.map((r) => (
                       <div key={r.entryId} style={mono}>
                         • {r.payload}
-                        {r.episode ? ` ← ${r.episode.episodeId}` : ''}
+                        {r.episode ? ` ← ${r.episode.uri}` : ''}
                       </div>
                     ))}
                   </div>

@@ -115,7 +115,7 @@ describe('CogInspector', () => {
   it('returns full cycle detail: phases, buffer, episodes, marker', async () => {
     const d = await inspector.getCycle(SESSION, 'cyc1', 'all');
     expect(d).toBeDefined();
-    expect(d!.phases.map((p) => p.ordinal)).toEqual([1, 3]);
+    expect(d!.phases.map((p) => p.phaseIndex)).toEqual([1, 3]);
     expect(d!.phases[0].phaseKind).toBe('perception');
     expect(d!.buffer.length).toBe(2);
     expect(d!.episodes.map((e) => e.uri)).toEqual([episodeUri]);

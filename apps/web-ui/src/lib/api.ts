@@ -152,8 +152,9 @@ export interface CogCycleSummary {
 
 export interface CogPhase {
   phaseUri: string;
-  ordinal: number;
+  phaseIndex: number;
   phaseKind: string;
+  phaseStatus?: string;
   startedAt: string;
   endedAt: string;
 }
@@ -221,12 +222,36 @@ export interface CogInitiativeReport {
   notifications: Array<{ at: string; delivered: boolean; reason: string; priority: string | null }>;
 }
 
+export interface CogEpisodeBrief {
+  uri: string;
+  episodeType: string;
+  occurredAt: string;
+  payload?: string;
+  partOfGoal?: string;
+  tags: string[];
+}
+
+export interface CogGoalBrief {
+  uri: string;
+  goalLabel: string;
+  goalType: string;
+  goalStatus: string;
+  priority: number;
+}
+
 export interface CogExplainAction {
   entryId: string;
   payload: string;
   forGoal?: string;
-  goal?: CogGoal;
-  triggeringEpisode?: CogEpisode;
+  goal?: CogGoalBrief;
+  triggeringEpisode?: CogEpisodeBrief;
+  callId?: string;
+  toolName?: string;
+  args?: string;
+  outcome?: 'success' | 'error';
+  denialClass?: string;
+  durationMs?: number;
+  episodes: CogEpisodeBrief[];
 }
 
 export interface CogExplainRetrieval {
@@ -234,15 +259,21 @@ export interface CogExplainRetrieval {
   payload: string;
   refersTo?: string;
   sourceGraph?: string;
-  episode?: CogEpisode;
+  episode?: CogEpisodeBrief;
 }
 
 export interface CogExplanation {
   cycleId: string;
   cycleUri: string;
   found: boolean;
+  status?: string;
+  startedAt?: string;
+  response?: CogEpisodeBrief;
+  goals: CogGoalBrief[];
   actions: CogExplainAction[];
   retrievals: CogExplainRetrieval[];
+  workingMemory: Array<{ buffer: string; count: number; kinds: string[] }>;
+  episodes: CogEpisodeBrief[];
 }
 
 /** Thrown when the debug panel flag is off (HTTP 403). */

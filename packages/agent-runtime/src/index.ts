@@ -27,6 +27,7 @@ import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js'
 import { CogHealth, type CogHealthReport } from './cognitive/CogHealth.js';
 import {
   CogInspector,
+  renderExplanation,
   type CycleSummary,
   type CycleDetail,
   type ResponseExplanation,
@@ -2667,13 +2668,20 @@ Users can use these commands:
         if (!cycles) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(cycles, null, 2) + '\n```', sessionId: session.sessionId };
       }
-      if (sub.startsWith('explain ')) {
-        const cycleId = sub.slice('explain '.length).trim();
-        const exp = await this.cogExplainResponse(session.sessionId, cycleId, OWNER_USER_KEY);
-        if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
-        return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
+      // Explain the reply of one cycle (default: the newest of this session) as
+      // fixed-format text. The JSON of the same chain is the inspect/explain route.
+      if (sub === 'explain' || sub.startsWith('explain ')) {
+        if (!this.cognitiveConfig || !(await this.cognitiveConfig.isCycleManagerEnabled().catch(() => false))) {
+          return { text: 'The cognitive cycle is off (flagCycleManager). Nothing was read. Enable with /cog cycle on.', sessionId: session.sessionId };
+        }
+        const ins = await this.cogInspector();
+        if (!ins) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
+        const cycleId = sub.slice('explain'.length).trim() || (await ins.latestCycleId(session.sessionId, OWNER_USER_KEY));
+        if (!cycleId) return { text: 'No cycle has been recorded in this session yet.', sessionId: session.sessionId };
+        const exp = await ins.explainResponse(session.sessionId, cycleId, OWNER_USER_KEY);
+        return { text: renderExplanation(exp), sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|consolidate-episodes|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|consolidate-episodes|cleanup|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain [cycleId]]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.
