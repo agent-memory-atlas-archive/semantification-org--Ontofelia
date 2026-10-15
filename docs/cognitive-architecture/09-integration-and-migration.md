@@ -5,10 +5,14 @@
 > with rollback points.
 >
 > **Implementation status (2026-10-15):** phases A to I and the later slices are
-> implemented behind the flags in §7. **All flags default to off**; no part of
-> the cognitive layer runs unless an operator switches it on. §7 lists every
-> flag with its default; §12 records where the code's names differ from this
-> specification.
+> implemented behind the flags in §7. **On by default for new installs since
+> the staged default-on rollout (2026-10-15); existing installs keep their flags
+> and opt in with `/cog defaults apply`; retention stays off.** A flag that is
+> missing from the setup graph still counts as off, so an install that was
+> running before the rollout behaves exactly as it did. §7 lists every flag with
+> its default and its value on a new install, §7.1 to §7.3 describe the
+> rollout, the rollback and the migration, and §12 records where the code's names
+> differ from this specification.
 
 ---
 
@@ -267,24 +271,27 @@ per message, so they toggle without a restart. The owner lists them with
 `/cog cycle on|off` sets the cycle flag. Each flag respects the previous
 behaviour when off: the legacy path runs and nothing is written.
 
+The *Default* column is what a flag is when it has no triple (always off). The
+*New install* column is what the boot step of §7.1 writes on a new install.
+
 The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
 `CognitiveConfig.ts`; the test `CogDocsSync` keeps this table in step with it):
 
-| Flag | Short key | Default | What it switches on |
-|---|---|---|---|
-| `flagCycleManager` | `cycleManager` | off | Route messages through the six-phase cycle (cycle and phase records, working memory, action buffer, reflective marker). The other flags refine what the cycle does or what runs beside it. |
-| `flagEpisodicMemory` | `episodicMemory` | off | The cycle writes episodes (messages, tools, replies, goal transitions, `impasse-flagged`, `meta-reflected`); `arm_goal` needs this. |
-| `flagEpisodicRecall` | `episodicRecall` | off | Allow the recalled episodes and facts into the prompt; only the working-memory prompt mode renders them. The recall itself follows the cycle flag. |
-| `flagGoalStack` | `goalStack` | off | Manage an explicit goal stack in the cycle. |
-| `flagProceduralMemory` | `proceduralMemory` | off | Record skill traces per tool call and suggest skills. |
-| `flagMetacognition` | `metacognition` | off | Raise impasses, write the full reflective marker and its signals. |
-| `flagSelfModelQuery` | `selfModelQuery` | off | Add a self-model block to the prompt. |
-| `flagRetention` | `retention` | off | Let the retention sweep tier old episodes (destructive). |
-| `flagDebugPanel` | `debugPanel` | off | Expose the read-only inspection routes (`/api/cog/inspect/*`) and `/cog cycles`, `/cog explain`. |
-| `flagPromptShadow` | `promptShadow` | off | Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged. |
-| `flagWorkingMemoryPrompt` | `workingMemoryPrompt` | off | Build the cognitive prompt blocks from working memory instead of the legacy strings (wins over the shadow flag). |
-| `flagInitiative` | `initiative` | off | Allow self-started goal wakes (kill switch for unattended work). |
-| `flagEpisodicConsolidation` | `episodicConsolidation` | off | Daily, promote facts a user asserted in several independent episodes into that user's own graph (never the worldview). |
+| Flag | Short key | Default | New install | What it switches on |
+|---|---|---|---|---|
+| `flagCycleManager` | `cycleManager` | off | on | Route messages through the six-phase cycle (cycle and phase records, working memory, action buffer, reflective marker). The other flags refine what the cycle does or what runs beside it. |
+| `flagEpisodicMemory` | `episodicMemory` | off | on | The cycle writes episodes (messages, tools, replies, goal transitions, `impasse-flagged`, `meta-reflected`); `arm_goal` needs this. |
+| `flagEpisodicRecall` | `episodicRecall` | off | on | Allow the recalled episodes and facts into the prompt; only the working-memory prompt mode renders them. The recall itself follows the cycle flag. |
+| `flagGoalStack` | `goalStack` | off | on | Manage an explicit goal stack in the cycle. |
+| `flagProceduralMemory` | `proceduralMemory` | off | on | Record skill traces per tool call and suggest skills. |
+| `flagMetacognition` | `metacognition` | off | on | Raise impasses, write the full reflective marker and its signals. |
+| `flagSelfModelQuery` | `selfModelQuery` | off | on | Add a self-model block to the prompt. |
+| `flagRetention` | `retention` | off | off | Let the retention sweep tier old episodes (destructive). |
+| `flagDebugPanel` | `debugPanel` | off | on | Expose the read-only inspection routes (`/api/cog/inspect/*`) and `/cog cycles`, `/cog explain`. |
+| `flagPromptShadow` | `promptShadow` | off | on | Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged. |
+| `flagWorkingMemoryPrompt` | `workingMemoryPrompt` | off | on | Build the cognitive prompt blocks from working memory instead of the legacy strings (wins over the shadow flag). |
+| `flagInitiative` | `initiative` | off | off | Allow self-started goal wakes (kill switch for unattended work). |
+| `flagEpisodicConsolidation` | `episodicConsolidation` | off | on | Daily, promote facts a user asserted in several independent episodes into that user's own graph (never the worldview). |
 
 In live mode (`flagWorkingMemoryPrompt`) every cognitive block depends only on its
 own flag and the live flag: `[Self]` on the self-model flag, `[Skills that
@@ -307,6 +314,88 @@ Setup keys that are **not** feature flags (same config subject, same graph):
 | `goalSupersedeAfterTurns` | integer 1..1000 | `10` | With the goal stack on: turns after which a competition loser that was neither chosen nor touched is abandoned. |
 | `consolidationMinEpisodes` | integer 1..100 | `3` | Episodes needed to promote a fact. |
 | `consolidationMinGroups` | integer 1..100 | `2` | Independent groups needed to promote a fact. |
+
+### 7.1 Default-on for new installs
+
+The cognitive layer is **on by default for new installs**; existing installs
+are not changed. The default-on set is every flag in the table above except two:
+
+- `flagRetention` stays off: it tiers episodes destructively (it deletes
+  payloads and collapses episodes), and whether it should ever default on is an
+  open decision.
+- `flagInitiative` stays off: it is the only flag whose feature makes model
+  calls of its own (a self-started wake runs a full model turn with no user
+  message). Every other flag works with SPARQL and rules only, so the default-on
+  set adds no model call per message.
+
+The setup keys keep their defaults: `unknownNudgeAllUsers` stays `false` (the
+"I don't know" nudge remains an owner-only canary), and all thresholds and caps
+keep the values in the table above. With `flagWorkingMemoryPrompt` on, the
+prompt gets the cognitive blocks of §7 (bounded by the caps), and
+`flagPromptShadow` is inert beside it (live wins).
+
+**Who counts as a new install.** The gateway boot writes the default set once,
+in a single update together with a marker, and only when the store is fresh:
+
+1. the self graph was seeded in this very boot (it was empty before), **and**
+2. the setup graph holds no cognitive triple at all (no flag, no setup key, no
+   marker), **and**
+3. no other graph of the agent holds a single triple.
+
+An install that has any data but no flag triples is an existing install, and
+nothing is written. A second boot writes nothing: the self graph is no longer
+fresh and the marker is there. The marker is two triples on the config subject:
+`cogt:defaultsSeededAt` (the time, `xsd:dateTime`) and `cogt:defaultsVersion`
+(the revision of the default-on set, currently `1`). A factory reset empties the
+store, so the next boot counts as a new install again.
+
+**Existing installs** adopt the defaults with the owner-only commands (a live
+owner turn for `apply`):
+
+- `/cog defaults` shows the default-on set next to the current flags and what
+  would change. It writes nothing.
+- `/cog defaults apply` turns on every default-on flag that is currently
+  missing or off (that includes a flag the owner had switched off on purpose),
+  never turns on `flagRetention` or `flagInitiative`, never touches a setup key,
+  writes the marker, and lists every flag it changed in the reply.
+
+### 7.2 Rollback
+
+Every step back is one owner command and needs no restart (flags are read per
+message):
+
+- `/cog flag <name> off` turns one flag off, any of the thirteen.
+- `/cog cycle off` turns the whole layer off for messages: they run on the
+  legacy path again, and no new cycle, episode, skill-trace, working-memory or
+  reflective record is written by a message. The other flags may stay on; they
+  have no effect on messages without the cycle. A scheduled background job
+  that has a flag of its own (the daily episodic consolidation) keeps running
+  until that flag is off too, so turn it off as well for a full stop.
+- With every flag off the system prompt is byte for byte the legacy prompt (the
+  golden test `PromptGolden.test.ts` holds this for the existing-install path).
+
+**What stays in the store after turning off.** Nothing is deleted by switching a
+flag off. Episodes, goals, skill traces and skills, the reflective markers, the
+self-model, cycle and working-memory graphs, and the setup triples stay as they
+are, and they are read again when the flag is turned back on. They are removed
+only by an explicit action: the cleanup job (`/cog cleanup`, working and cycle
+graphs of finished sessions and old procedural traces), the retention sweep
+(only with `flagRetention` on, which no default switches on), or a factory reset.
+Note that the episodic graph holds message text of every user, so a rollback
+that must also erase it needs one of those explicit actions.
+
+### 7.3 Migration note for upgraders
+
+- Upgrading does not change your flags. An install that has any data, or any
+  cognitive triple, is an existing install, and the boot step writes nothing.
+- To adopt the defaults, run `/cog defaults` to see the difference and
+  `/cog defaults apply` to switch them on. To undo, see §7.2.
+- A brand-new install, or one that was reset, starts with the layer on. Expect
+  the cycle to write cycle records, episodes (including message text), skill
+  traces and reflective markers from the first message, and the prompt to
+  carry the cognitive blocks.
+- `/cog health` now also reports soak metrics (§9) to help you judge the cost
+  of the layer on your install before and after switching it on.
 
 ---
 
@@ -404,6 +493,45 @@ cost of a write grows with the dataset size.
 
 Plus Pino structured logs at level `info` for every phase boundary, level
 `warn` for every impasse, level `error` for every cycle abort.
+
+### Soak metrics
+
+The owner command `/cog health` adds a `soak` object to the payload above.
+It holds numbers only and no user text, and every read is bounded:
+
+```json
+"soak": {
+  "windowCycles": 100,
+  "persistLatencyMs": { "samples": 100, "p50": 41.2, "p95": 118.7 },
+  "graphSizes": {
+    "episodic": { "triples": 18342, "capped": false },
+    "procedural": { "triples": 1240, "capped": false },
+    "meta": { "triples": 5200, "capped": false },
+    "goalsLongterm": { "triples": 310, "capped": false },
+    "goalsSession": { "triples": 96, "graphs": 12, "capped": false },
+    "cycles": { "triples": 40211, "graphs": 12, "capped": false },
+    "working": { "triples": 9120, "graphs": 36, "capped": false }
+  },
+  "impasses": { "cyclesInWindow": 100, "flaggedInWindow": 1, "per100Cycles": 1 },
+  "dumpsPerTurn": 1.4
+}
+```
+
+- `persistLatencyMs`: p50 and p95 (nearest rank) of the time the queued persist
+  of a turn took, over the newest turns of this process (at most 500 are kept,
+  the window is 100 and never above 500). It is kept in memory, so it is empty
+  after a restart; the values are `null` until a turn has run.
+- `graphSizes`: triples per graph family, counted with `COUNT` over a `LIMIT`ed
+  subquery (at most 100000 triples and 10000 graphs per family; `capped: true`
+  means the number is a lower bound).
+- `impasses`: of the newest cycles in the window, how many carry a reflective
+  marker with an impasse, and the rate per 100 cycles (`null` with no cycles).
+- `dumpsPerTurn`: mean full-dataset dumps the embedded store wrote during a
+  turn's persist, from a read-only counter of the Oxigraph adapter; `null` when
+  the adapter keeps no counter. It counts every dump in that time, so it is a
+  little high when turns overlap or other work writes at the same time.
+
+The unauthenticated `/api/cog/health` route does not carry the `soak` object.
 
 The debug-panel routes `/api/cog/inspect/*` (everything except `/api/cog/health`)
 need the debug-panel flag **and** the gateway bearer token, and they refuse to
