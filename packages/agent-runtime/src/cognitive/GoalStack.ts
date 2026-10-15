@@ -53,6 +53,43 @@ const RESPOND_TO_USER_PRIORITY = 0.5;
 export type GoalId = string;
 
 /**
+ * Goal type taxonomy (doc 07 §2.2, registered in the TBox). `RespondToUser` is
+ * the implicit safety-net goal; `ResolveConflict` and `CompletePlan` are
+ * reserved for later steps and are never created by the goal decision tree.
+ */
+export const GOAL_TYPES = {
+  RespondToUser: `${COGT}RespondToUser`,
+  AnswerQuestion: `${COGT}AnswerQuestion`,
+  ExecuteCommand: `${COGT}ExecuteCommand`,
+  HandleRequest: `${COGT}HandleRequest`,
+  AnswerInTopic: `${COGT}AnswerInTopic`,
+  OwnerRequestedWork: `${COGT}OwnerRequestedWork`,
+  ResolveConflict: `${COGT}ResolveConflict`,
+  CompletePlan: `${COGT}CompletePlan`,
+} as const;
+
+/** A goal lifecycle transition that is recorded as an episode. */
+export type GoalTransitionKind = 'pushed' | 'resolved' | 'abandoned' | 'blocked';
+
+export interface GoalTransition {
+  kind: GoalTransitionKind;
+  goalUri: GoalId;
+  goalType: string;
+  goalLabel: string;
+  /** The goal's owner key; the owner's key for an owner-less goal. */
+  forUser: string;
+  at: Date;
+  /** The blocked reason, when the goal was blocked. */
+  reason?: string;
+}
+
+/**
+ * Receives every recorded transition of a goal. It must not throw into the
+ * caller: failures of the sink are swallowed by the stack.
+ */
+export type GoalTransitionSink = (t: GoalTransition) => void | Promise<void>;
+
+/**
  * Consecutive initiative-cycle failures after which a goal is auto-blocked so
  * it stops waking until a human or a conversation unblocks it (design §5).
  */
@@ -126,6 +163,8 @@ export interface GoalInput {
   plannedSteps?: string;
   currentStep?: string;
   tags?: string[];
+  /** Entity IRIs the goal is about (`cogt:aboutEntity`), from the perception of the turn that created it. */
+  about?: string[];
   /** Force promotion to the longterm graph at session close regardless of deadline. */
   longTerm?: boolean;
   // ── Initiative wake policy (docs/initiative-architecture.md §5) ──
@@ -163,6 +202,8 @@ export interface Goal {
   currentStep?: string;
   stepProgress?: string;
   longTerm?: boolean;
+  /** Entity IRIs the goal is about; absent when none were recorded. */
+  about?: string[];
   // ── Initiative wake policy / tracking (docs/initiative-architecture.md §5) ──
   wakeAt?: string;
   wakeEvery?: string;
@@ -248,8 +289,31 @@ export class GoalStack {
      * owner-only commands and tools and the unattended initiative runtime.
      */
     private readonly viewer?: GoalViewer,
+    /**
+     * Called after a goal is pushed and after its status changes to resolved,
+     * abandoned or blocked (never for the implicit RespondToUser goal). The
+     * owner of the stack decides where the episode is written.
+     */
+    private readonly onTransition?: GoalTransitionSink,
   ) {
     this.minWakeIntervalMs = minWakeIntervalMs;
+  }
+
+  private async emit(kind: GoalTransitionKind, goal: Goal, at: Date, reason?: string): Promise<void> {
+    if (!this.onTransition || goal.goalType === RESPOND_TO_USER) return;
+    try {
+      await this.onTransition({
+        kind,
+        goalUri: goal.uri,
+        goalType: goal.goalType,
+        goalLabel: goal.goalLabel,
+        forUser: goalOwnerKey(goal) ?? OWNER_USER_KEY,
+        at,
+        ...(reason ? { reason } : {}),
+      });
+    } catch {
+      /* the transition is already stored; a lost episode must not undo it */
+    }
   }
 
   private visible(goal: Goal): boolean {
@@ -361,8 +425,21 @@ export class GoalStack {
     if (input.servesDrive) lines.push(`<${uri}> <${COGT}servesDrive> <${input.servesDrive}> .`);
     for (const t of input.tags ?? [])
       lines.push(`<${uri}> <${COGT}tags> "${escapeLiteral(t)}" .`);
+    for (const a of new Set(input.about ?? [])) {
+      let iri: string;
+      try {
+        iri = sparqlIri(a);
+      } catch {
+        continue; // not a safe IRI: never written
+      }
+      lines.push(`<${uri}> <${COGT}aboutEntity> ${iri} .`);
+    }
 
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    if (this.onTransition) {
+      const created = await this.rawGoal(graph, uri);
+      if (created) await this.emit('pushed', created, now);
+    }
     return uri;
   }
 
@@ -371,11 +448,19 @@ export class GoalStack {
    * (doc 07 §5.1). If any goal is already active this is a no-op; otherwise the
    * implicit goal is pushed at priority 0.5. Returns the top active goal.
    */
-  async ensureImplicit(now: Date = new Date()): Promise<Goal> {
-    const active = await this.active();
+  async ensureImplicit(now: Date = new Date(), userKey?: string): Promise<Goal> {
+    const all = await this.active();
+    // With a user key only the user's own active goals count: another user's goal
+    // (visible to the owner) is not a safety net for this turn.
+    const active = userKey === undefined ? all : all.filter((g) => goalBelongsTo(g, userKey));
     if (active.length > 0) return active[0];
     const uri = await this.push(
-      { goalType: RESPOND_TO_USER, goalLabel: 'Respond to the user', priority: RESPOND_TO_USER_PRIORITY },
+      {
+        goalType: RESPOND_TO_USER,
+        goalLabel: 'Respond to the user',
+        priority: RESPOND_TO_USER_PRIORITY,
+        ...(userKey !== undefined ? { forUser: userKey } : {}),
+      },
       now,
     );
     const goal = await this.get(uri);
@@ -383,11 +468,28 @@ export class GoalStack {
     return goal ?? (await this.active())[0];
   }
 
+  /**
+   * Resolve the active implicit RespondToUser goals created before `before`
+   * (visible to the viewer; with `userKey`, only that user's). They are the
+   * leftovers of cycles that never reached their end. Returns the count.
+   */
+  async resolveStaleImplicit(before: Date, now: Date = new Date(), userKey?: string): Promise<number> {
+    const stale = (await this.active()).filter(
+      (g) =>
+        g.goalType === RESPOND_TO_USER &&
+        Date.parse(g.createdAt) < before.getTime() &&
+        (userKey === undefined || goalBelongsTo(g, userKey)),
+    );
+    for (const g of stale) await this.setStatus(g.uri, 'resolved', undefined, now);
+    return stale.length;
+  }
+
   /** Transition a goal's status, stamping the matching timestamp / reason. */
   async setStatus(goalId: GoalId, status: GoalStatus, reason?: string, now: Date = new Date()): Promise<void> {
     const graph = await this.graphOf(goalId);
     if (!graph) return;
     this.registry.assertWritable(graph);
+    const before = this.onTransition ? await this.rawGoal(graph, goalId) : undefined;
     const ts = now.toISOString();
     const dt = (s: string) => `"${s}"^^<${XSD}dateTime>`;
 
@@ -397,6 +499,9 @@ export class GoalStack {
     if (status === 'abandoned') await this.replaceOne(graph, goalId, `${COGT}abandonedAt`, dt(ts));
     if (status === 'blocked' && reason)
       await this.replaceOne(graph, goalId, `${COGT}blockedReason`, `"${escapeLiteral(reason)}"`);
+    if (before && before.status !== status && (status === 'resolved' || status === 'abandoned' || status === 'blocked')) {
+      await this.emit(status, before, now, status === 'blocked' ? reason : undefined);
+    }
   }
 
   /** Update the goal's current step (and optional progress marker). */
@@ -649,9 +754,10 @@ export class GoalStack {
     const all = await this.readGraph(session);
     const eligible = all.filter(
       (g) =>
-        g.status === 'resolved' ||
-        g.longTerm === true ||
-        (g.deadline !== undefined && Date.parse(g.deadline) > now.getTime()),
+        g.goalType !== RESPOND_TO_USER &&
+        (g.status === 'resolved' ||
+          g.longTerm === true ||
+          (g.deadline !== undefined && Date.parse(g.deadline) > now.getTime())),
     );
     for (const g of eligible) await this.promoteToLongterm(g.uri);
     return eligible.length;
@@ -805,6 +911,7 @@ export class GoalStack {
       }`;
     const res = await this.triplestore.query(sparql);
     const tags = await this.tagsFor(graph);
+    const abouts = await this.aboutFor(graph);
     return (res.bindings ?? []).map((r) => {
       const uri = r.goal.value;
       const goal: Goal = {
@@ -832,6 +939,8 @@ export class GoalStack {
       if (r.currentStep) goal.currentStep = r.currentStep.value;
       if (r.stepProgress) goal.stepProgress = r.stepProgress.value;
       if (r.longTerm) goal.longTerm = r.longTerm.value === 'true';
+      const about = abouts.get(uri);
+      if (about && about.length > 0) goal.about = about;
       if (r.wakeAt) goal.wakeAt = r.wakeAt.value;
       if (r.wakeEvery) goal.wakeEvery = r.wakeEvery.value;
       if (r.mandatedBy) goal.mandatedBy = r.mandatedBy.value;
@@ -841,6 +950,21 @@ export class GoalStack {
       if (r.consecutiveFailures) goal.consecutiveFailures = Number(r.consecutiveFailures.value);
       return goal;
     });
+  }
+
+  /** Multi-valued `cogt:aboutEntity`, grouped by goal IRI. */
+  private async aboutFor(graph: string): Promise<Map<string, string[]>> {
+    const res = await this.triplestore.query(`
+      SELECT ?goal ?a WHERE {
+        GRAPH <${graph}> { ?goal a <${COGT}Goal> ; <${COGT}aboutEntity> ?a }
+      }`);
+    const map = new Map<string, string[]>();
+    for (const r of res.bindings ?? []) {
+      const arr = map.get(r.goal.value) ?? [];
+      arr.push(r.a.value);
+      map.set(r.goal.value, arr);
+    }
+    return map;
   }
 
   /** Multi-valued `cogt:tags`, grouped by goal IRI. */

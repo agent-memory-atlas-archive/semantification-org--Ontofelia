@@ -9,6 +9,7 @@ import { PluginRegistry } from '@ontofelia/plugins';
 import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, GraphUriResolver } from '@ontofelia/semantic-memory';
 import type { SemanticParseResult, ConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
 import { GoalStack } from './cognitive/GoalStack.js';
+import { directGoalEpisodeSink } from './cognitive/GoalEpisodes.js';
 import { INITIATIVE_ALLOWED_TOOLS } from './initiativeTools.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -1449,11 +1450,25 @@ Users can use these commands:
    */
   private goalStackFor(sessionId: string): GoalStack | undefined {
     if (!this.knowledgeEngine) return undefined;
+    const triplestore = this.knowledgeEngine['triplestore'];
     return new GoalStack(
-      this.knowledgeEngine['triplestore'],
+      triplestore,
       this.knowledgeEngine.registry,
       this.agentId,
       sessionId,
+      undefined,
+      undefined,
+      // Tool-driven transitions (arm_goal, update_goal_step) write their episode
+      // straight away, while the goal stack and episodic memory flags are on.
+      directGoalEpisodeSink({
+        triplestore,
+        agentId: this.agentId,
+        sessionId,
+        enabled: async () =>
+          (await this.cognitiveConfig?.isGoalStackEnabled()) === true &&
+          (await this.cognitiveConfig?.isEpisodicMemoryEnabled()) === true,
+        onError: (e) => this.logger.warn({ err: e }, 'goal episode write failed'),
+      }),
     );
   }
 

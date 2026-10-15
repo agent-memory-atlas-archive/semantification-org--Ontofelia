@@ -28,6 +28,7 @@ import { OWNER_USER_KEY, createLogger, type MessageEnvelope, type TriplestoreAda
 import { EpisodicMemory, GraphRegistry, GraphUriResolver } from '@ontofelia/semantic-memory';
 import { CognitiveConfig } from './CognitiveConfig.js';
 import { GoalStack, addIso8601Duration, type Goal } from './GoalStack.js';
+import { directGoalEpisodeSink } from './GoalEpisodes.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -220,6 +221,17 @@ export class InitiativeService {
       this.agentId,
       sessionScope,
       this.guards.cooldownMinutes * 60_000,
+      undefined,
+      // A goal blocked by repeated failures is an episode while the goal stack
+      // and episodic memory flags are on.
+      directGoalEpisodeSink({
+        triplestore: this.triplestore,
+        agentId: this.agentId,
+        enabled: async () =>
+          (await this.cognitiveConfig.isGoalStackEnabled()) &&
+          (await this.cognitiveConfig.isEpisodicMemoryEnabled()),
+        onError: (e) => this.logger.warn({ err: e }, 'goal episode write failed'),
+      }),
     );
   }
 

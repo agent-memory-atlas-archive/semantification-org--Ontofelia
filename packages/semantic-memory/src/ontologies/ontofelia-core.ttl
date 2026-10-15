@@ -337,6 +337,58 @@ cogt:Goal rdf:type owl:Class ;
     rdfs:label "Goal" ;
     rdfs:comment "An explicit intention on the goal stack." .
 
+cogt:GoalType rdf:type owl:Class ;
+    rdfs:label "Goal Type" ;
+    rdfs:comment "Marker superclass of the goal types; a goal's cogt:goalType is one of its subclasses (doc 07 §2.2)." .
+
+cogt:RespondToUser rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Respond To User" ;
+    rdfs:comment "Implicit safety-net goal of a cycle; resolved when the cycle ends." .
+
+cogt:AnswerQuestion rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Answer Question" ;
+    rdfs:comment "Created from a message with intent question." .
+
+cogt:ExecuteCommand rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Execute Command" ;
+    rdfs:comment "Created from a message with intent command." .
+
+cogt:HandleRequest rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Handle Request" ;
+    rdfs:comment "Created from a message with intent request." .
+
+cogt:AnswerInTopic rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Answer In Topic" ;
+    rdfs:comment "Created from a message with intent topic-reference." .
+
+cogt:OwnerRequestedWork rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Owner Requested Work" ;
+    rdfs:comment "A goal the owner armed for initiative." .
+
+cogt:ResolveConflict rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Resolve Conflict" ;
+    rdfs:comment "Reserved: a goal raised by metacognition for a conflict. Not created yet." .
+
+cogt:CompletePlan rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Complete Plan" ;
+    rdfs:comment "Reserved: stepwise execution of an approved plan. Not created yet." .
+
+cogt:ChooseGoal rdf:type owl:Class ;
+    rdfs:label "Choose Goal" ;
+    rdfs:comment "Record of a competition between goals in one cycle: the winner (most recent intent) and the losers." .
+
+cogt:winner rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range cogt:Goal ; rdfs:label "winning goal" .
+
+cogt:loser rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range cogt:Goal ; rdfs:label "losing goal" .
+
+cogt:chosenBecause rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range xsd:string ; rdfs:label "tie-break rule" .
+
+cogt:aboutEntity rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Goal ; rdfs:label "about entity (from the perception that created the goal)" .
+
 cogt:SkillTrace rdf:type owl:Class ;
     rdfs:label "Skill Trace" ;
     rdfs:comment "A single procedural-memory record of one tool invocation." .

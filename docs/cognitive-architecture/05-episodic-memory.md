@@ -40,6 +40,7 @@ matters for future recall. Concretely:
 | `goal-pushed` | New goal added to stack | Phase 3 (goal management) |
 | `goal-resolved` | Goal status → resolved | Phase 3 or Phase 6 |
 | `goal-abandoned` | Goal status → abandoned | Phase 3 or metacog |
+| `goal-blocked` | Goal status → blocked (tool or repeated initiative failure) | Tools or the initiative service |
 | `impasse-flagged` | Any phase wrote a `cogt:Impasse` | The phase that flagged |
 | `meta-reflected` | Phase 6 writes the reflective marker | Phase 6 |
 | `consolidation-promoted` | A pattern was promoted from episodic to semantic | Background job |

@@ -49,14 +49,29 @@ import {
   type WorkspaceEntry,
 } from './PromptAssembler.js';
 import type { PromptMode, PromptSettings } from './CognitiveConfig.js';
-import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
+import {
+  GoalStack,
+  RESPOND_TO_USER,
+  goalBelongsTo,
+  type Goal,
+  type GoalTransition,
+  type GoalViewer,
+} from './GoalStack.js';
+import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from './GoalLifecycle.js';
+import { writeGoalEpisode } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
 import {
   comprehend,
   type ComprehensionResult,
   type ComprehensionDeps,
 } from './Comprehension.js';
-import { buildPerception, resolvePerception, type Perception, type PerceptionSource } from './Perception.js';
+import {
+  buildPerception,
+  classifyIntent,
+  resolvePerception,
+  type Perception,
+  type PerceptionSource,
+} from './Perception.js';
 import {
   Metacognition,
   type ImpasseInput,
@@ -248,6 +263,24 @@ export interface RunCycleOptions {
   initiativeGoalUri?: string;
 }
 
+/** Goal lifecycle records a cycle collects for its queued persist. */
+interface GoalExtras {
+  /** Transitions of goals during the turn (episodes are written from them). */
+  events: GoalTransition[];
+  /** The competition decided this turn: winner and losers (a `ChooseGoal` record). */
+  choice?: { winner: string; losers: string[] };
+  /** The implicit RespondToUser goal serving this cycle, resolved at its end. */
+  implicitUri?: string;
+}
+
+/** How many levels of parent goals reach the goalBuffer. */
+const MAX_GOAL_PARENT_DEPTH = 5;
+
+/** Most recent intent first (creation time), then higher priority. */
+function byRecentIntent(a: Goal, b: Goal): number {
+  return a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : b.priority - a.priority;
+}
+
 /**
  * Instants measured in memory while a cycle runs; they become the phase
  * boundaries (see {@link CycleManager.writeCycleAndPhases}).
@@ -334,6 +367,11 @@ export class CycleManager {
    * Different sessions run independently.
    */
   private readonly persistTails = new Map<string, Promise<void>>();
+  /**
+   * (session, user) pairs whose stale implicit goals were already cleaned up by
+   * this process (the first touch of a session; see {@link CycleManager.manageGoals}).
+   */
+  private readonly touchedGoalSessions = new Set<string>();
   /** Background work (queued persists, triggered consolidations) not yet settled. */
   private readonly inFlight = new Set<Promise<unknown>>();
 
@@ -534,6 +572,8 @@ export class CycleManager {
     // Set when Phase 3 sees more than one substantive active goal — a
     // goal-conflict impasse signal for the metacognitive subcycle (F2).
     let goalConflict = false;
+    // Goal lifecycle records of this turn, written by the queued persist.
+    const goalExtras: GoalExtras = { events: [] };
     const mode = options.mode ?? 'conversational';
     // Phase 1 (perception) in memory, plus the phase boundaries measured as the
     // hooks run. `perceivedAt` closes Phase 1; the goal hook brackets Phase 3.
@@ -629,8 +669,15 @@ export class CycleManager {
           sessionId,
           undefined,
           this.viewerOf(envelope),
+          // Episodes of this turn's transitions are written by the queued persist.
+          (t) => {
+            goalExtras.events.push(t);
+          },
         );
-        const managed = await this.manageGoals(gs, envelope, mode, options.initiativeGoalUri);
+        const managed =
+          mode === 'conversational'
+            ? await this.manageConversationalGoals(gs, envelope, sessionId, startedAt, perception, goalExtras)
+            : await this.manageInitiativeGoals(gs, options.initiativeGoalUri);
         const goal = managed.goal;
         goalConflict = managed.conflict;
         activeGoalUri = goal.uri;
@@ -639,8 +686,13 @@ export class CycleManager {
         const sections = [this.renderActiveGoal(goal)];
         if (promptMode !== 'off') {
           const body = sections[0].slice('[Active goal]\n'.length);
-          phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-active', text: body, salience: 1, forUser: userKey });
-          queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-active', payload: body, salience: 1, forGoal: goal.uri });
+          phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-active', text: body, salience: goalSalience(0), forUser: userKey });
+          queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-active', payload: body, salience: goalSalience(0), forGoal: goal.uri });
+          // Parents of the top goal, nearest first (doc 04 §4).
+          for (const p of await this.goalParents(gs, goal)) {
+            phaseView.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', text: p.text, salience: p.salience, forUser: userKey });
+            queuedWm.push({ buffer: 'goalBuffer', entryKind: 'goal-parent', payload: p.text, salience: p.salience, forGoal: p.uri });
+          }
         }
         // E4 — bias action selection with learned skills for this goal type.
         if (options.proceduralEnabled) {
@@ -776,7 +828,7 @@ export class CycleManager {
           pendingResolved ? undefined : options.resolveEntities,
           inboundAbout,
           comprehension,
-          { wm: queuedWm, shadow },
+          { wm: queuedWm, shadow, goal: goalExtras },
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
@@ -786,78 +838,244 @@ export class CycleManager {
   }
 
   /**
-   * Phase 3 — goal management decision tree (doc 07 §5). Continue an existing
-   * substantive goal if one is active; otherwise push a new goal inferred from
-   * the inbound intent; otherwise fall back to the implicit RespondToUser goal.
-   * Always returns the resulting top active goal.
+   * Phase 3 of an unattended initiative cycle (docs/initiative-architecture.md
+   * §6): the triggering goal is the active context and the implicit
+   * RESPOND_TO_USER goal is NEVER seeded — there is no user to respond to.
    */
-  private async manageGoals(
+  private async manageInitiativeGoals(
     gs: GoalStack,
-    envelope: MessageEnvelope,
-    mode: 'conversational' | 'initiative' = 'conversational',
     initiativeGoalUri?: string,
   ): Promise<{ goal: Goal; conflict: boolean }> {
     const active = await gs.active();
     const substantives = active.filter((g) => g.goalType !== RESPOND_TO_USER);
+    if (initiativeGoalUri) {
+      const triggering = await gs.get(initiativeGoalUri);
+      if (triggering) return { goal: triggering, conflict: substantives.length > 1 };
+    }
+    if (substantives.length > 0) return { goal: substantives[0], conflict: substantives.length > 1 };
+    if (active.length > 0) return { goal: active[0], conflict: false };
+    // No goal at all is not expected (the trigger came from a due wake); fall
+    // back to the implicit goal only as a last resort so the cycle can run.
+    return { goal: await gs.ensureImplicit(), conflict: false };
+  }
 
-    // Initiative mode (docs/initiative-architecture.md §6): the triggering goal
-    // is the active context and the implicit RESPOND_TO_USER goal is NEVER
-    // seeded — there is no user to respond to.
-    if (mode === 'initiative') {
-      if (initiativeGoalUri) {
-        const triggering = await gs.get(initiativeGoalUri);
-        if (triggering) return { goal: triggering, conflict: substantives.length > 1 };
+  /**
+   * Phase 3 of a conversational turn — the goal decision tree (doc 07 §5; see
+   * GoalLifecycle.ts for the rules). Only goals that belong to the sender take
+   * part: the owner's view also holds other users' goals, which a turn of the
+   * owner must neither continue, close nor compete with.
+   *
+   *  0. First touch of the session by this process: implicit goals left over
+   *     from earlier cycles are resolved (no migration needed).
+   *  1. A satisfaction cue resolves, a cancel cue abandons the top goal. Armed
+   *     goals (owner mandate / wake) are left to their tools.
+   *  2. Entities of the message overlap a goal's entities: continue that goal.
+   *     Else the intent creates a new goal (question, command, request,
+   *     topic-reference); chit-chat and feedback create none. A follow-up
+   *     without entities of the same goal type as the latest goal continues it.
+   *  Otherwise the earlier behaviour: continue an active goal, else the
+   *  implicit RespondToUser goal, which is resolved when the cycle ends.
+   *
+   * When several goals compete, the one with the most recent intent wins and a
+   * `cogt:ChooseGoal` record names the winner and the losers.
+   */
+  private async manageConversationalGoals(
+    gs: GoalStack,
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleStart: Date,
+    perception: Perception | undefined,
+    extras: GoalExtras,
+  ): Promise<{ goal: Goal; conflict: boolean }> {
+    const userKey = cogUserKey(envelope.sender);
+    const text = envelope.text || '';
+
+    // 0. Hygiene on the first touch of the session by this process.
+    const touched = `${sessionId}\u0000${userKey}`;
+    if (!this.touchedGoalSessions.has(touched)) {
+      if (this.touchedGoalSessions.size >= 5000) this.touchedGoalSessions.clear();
+      this.touchedGoalSessions.add(touched);
+      try {
+        await gs.resolveStaleImplicit(cycleStart, new Date(), userKey);
+      } catch (e) {
+        this.onError?.(e);
       }
-      if (substantives.length > 0) return { goal: substantives[0], conflict: substantives.length > 1 };
-      if (active.length > 0) return { goal: active[0], conflict: false };
-      // No goal at all is not expected (the trigger came from a due wake); fall
-      // back to the implicit goal only as a last resort so the cycle can run.
-      return { goal: await gs.ensureImplicit(), conflict: false };
     }
 
-    // More than one substantive goal contending for the turn is a goal-conflict
-    // signal; we still proceed with the highest-priority one (active() is
-    // priority-ordered) but flag it for the metacognitive subcycle.
-    const conflict = substantives.length > 1;
-    if (substantives.length > 0) return { goal: substantives[0], conflict };
+    const intent = perception?.intent ?? classifyIntent(text);
+    const about = perception?.about ?? [];
+    const mine = (await gs.active()).filter((g) => goalBelongsTo(g, userKey));
+    const isArmed = (g: Goal) => g.mandatedBy !== undefined || g.wakeAt !== undefined || g.wakeEvery !== undefined;
+    const armed = mine.filter((g) => g.goalType !== RESPOND_TO_USER && isArmed(g));
+    let candidates = mine.filter((g) => g.goalType !== RESPOND_TO_USER && !isArmed(g)).sort(byRecentIntent);
 
-    const intent = this.intentGoal(envelope);
-    if (intent) {
+    // 1. The user closes the top goal.
+    const signal = detectGoalSignal(text, intent);
+    if (signal && candidates.length === 0) {
+      // A closer with nothing to close creates no goal ("passt" is not a topic).
+      return armed[0] ? { goal: armed[0], conflict: false } : this.implicitGoal(gs, userKey, extras);
+    }
+    if (signal) {
+      const [top, ...rest] = candidates;
+      await gs.setStatus(top.uri, signal === 'satisfied' ? 'resolved' : 'abandoned');
+      candidates = rest;
+      const next = candidates[0] ?? armed[0];
+      if (next) return { goal: next, conflict: false };
+      return this.implicitGoal(gs, userKey, extras);
+    }
+
+    // 2a. Continue a goal whose entities overlap the message's entities.
+    const overlapping = candidates
+      .filter((g) => entityOverlap(g.about, about) > 0)
+      .sort((a, b) => entityOverlap(b.about, about) - entityOverlap(a.about, about) || byRecentIntent(a, b));
+    if (overlapping.length > 0) {
+      const winner = overlapping[0];
+      return this.decided(winner, overlapping.slice(1), extras);
+    }
+
+    // 2b. A new goal from the intent; it is the most recent intent, so it wins.
+    // A message without entities of its own that asks for the same kind of goal
+    // as the most recent one is a follow-up ("and how fast is it?"): it
+    // continues that goal instead of stacking a second one of the same type.
+    const wanted = goalFromIntent(intent, text);
+    const followUp = wanted !== undefined && about.length === 0 && candidates[0]?.goalType === wanted.goalType;
+    if (wanted && !followUp) {
       const actor = envelope.sender?.id
         ? `urn:entity:agent-sender:${encodeURIComponent(envelope.sender.id)}`
         : undefined;
       const uri = await gs.push({
-        goalType: intent.goalType,
-        goalLabel: intent.label,
+        goalType: wanted.goalType,
+        goalLabel: wanted.label,
         priority: 0.7,
         triggeredByUser: actor,
-        forUser: cogUserKey(envelope.sender),
+        forUser: userKey,
+        about,
       });
       const created = await gs.get(uri);
-      if (created) return { goal: created, conflict: false };
+      if (created) return this.decided(created, candidates, extras);
     }
-    return { goal: await gs.ensureImplicit(), conflict: false };
+
+    // No new goal: keep the earlier behaviour.
+    if (candidates.length > 0) return this.decided(candidates[0], candidates.slice(1), extras);
+    if (armed.length > 0) return { goal: armed[0], conflict: armed.length > 1 };
+    return this.implicitGoal(gs, userKey, extras);
+  }
+
+  /** The goal of the turn when `losers` competed with it: record the choice. */
+  private decided(winner: Goal, losers: Goal[], extras: GoalExtras): { goal: Goal; conflict: boolean } {
+    if (losers.length === 0) return { goal: winner, conflict: false };
+    extras.choice = { winner: winner.uri, losers: losers.map((g) => g.uri) };
+    return { goal: winner, conflict: true };
+  }
+
+  /** The implicit RespondToUser goal of this cycle; resolved when the cycle ends. */
+  private async implicitGoal(
+    gs: GoalStack,
+    userKey: string,
+    extras: GoalExtras,
+  ): Promise<{ goal: Goal; conflict: boolean }> {
+    const goal = await gs.ensureImplicit(new Date(), userKey);
+    if (goal.goalType === RESPOND_TO_USER) extras.implicitUri = goal.uri;
+    return { goal, conflict: false };
+  }
+
+  /**
+   * Parents of `goal` for the goalBuffer, nearest first: 0.7, minus 0.1 per
+   * further level, never below 0.3 ({@link goalSalience}). Read through the
+   * viewer-scoped stack, so a parent the sender may not see is not followed.
+   */
+  private async goalParents(
+    gs: GoalStack,
+    goal: Goal,
+  ): Promise<Array<{ uri: string; text: string; salience: number }>> {
+    const out: Array<{ uri: string; text: string; salience: number }> = [];
+    const seen = new Set<string>([goal.uri]);
+    let cur = goal;
+    for (let depth = 1; depth <= MAX_GOAL_PARENT_DEPTH && cur.parentGoal; depth++) {
+      if (seen.has(cur.parentGoal)) break;
+      const parent = await gs.get(cur.parentGoal);
+      if (!parent) break;
+      seen.add(parent.uri);
+      const shortType = parent.goalType.split('/').pop() ?? parent.goalType;
+      out.push({ uri: parent.uri, text: `${parent.goalLabel} (type: ${shortType})`, salience: goalSalience(depth) });
+      cur = parent;
+    }
+    return out;
+  }
+
+  /**
+   * Off the reply path: the goal episodes of this turn, the `ChooseGoal` record
+   * and the end of the cycle's implicit goal. Best effort, each on its own.
+   */
+  private async finishGoals(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
+    cycleUri: string,
+    episodicEnabled: boolean,
+    goal: GoalExtras,
+  ): Promise<void> {
+    const userKey = cogUserKey(envelope.sender);
+    if (episodicEnabled) {
+      const em = new EpisodicMemory(this.triplestore, this.agentId);
+      for (const t of goal.events) {
+        try {
+          await writeGoalEpisode(em, t, { sessionId, cycleId });
+        } catch (e) {
+          this.onError?.(e);
+        }
+      }
+    }
+    if (goal.choice) {
+      try {
+        await this.writeChooseGoal(sessionId, cycleUri, userKey, goal.choice);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
+    if (goal.implicitUri) {
+      try {
+        // The implicit goal serves one cycle only (doc 07 §5.1), so sessions do
+        // not keep a zombie.
+        await new GoalStack(
+          this.triplestore,
+          this.registry,
+          this.agentId,
+          sessionId,
+          undefined,
+          this.viewerOf(envelope),
+        ).setStatus(goal.implicitUri, 'resolved');
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
+  }
+
+  /** `cogt:ChooseGoal`: which goal won a competition, which lost, and why. */
+  private async writeChooseGoal(
+    sessionId: string,
+    cycleUri: string,
+    userKey: string,
+    choice: NonNullable<GoalExtras['choice']>,
+  ): Promise<void> {
+    const graph = GraphUriResolver.getCogCyclesGraph(this.agentId, sessionId);
+    this.registry.assertWritable(graph);
+    const uri = `${cycleUri}_choose`;
+    const lines = [
+      `<${uri}> <${RDF_TYPE}> <${COGT}ChooseGoal> .`,
+      `<${uri}> <${COGT}partOfCycle> <${cycleUri}> .`,
+      `<${uri}> <${COGT}forUser> "${escapeLiteral(userKey)}" .`,
+      `<${uri}> <${COGT}createdAt> "${new Date().toISOString()}"^^<${XSD}dateTime> .`,
+      `<${uri}> <${COGT}winner> ${sparqlIri(choice.winner)} .`,
+      `<${uri}> <${COGT}chosenBecause> "most-recent-intent" .`,
+    ];
+    for (const l of choice.losers) lines.push(`<${uri}> <${COGT}loser> ${sparqlIri(l)} .`);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
   }
 
   /** The goal-forest view of this turn's sender (see {@link GoalStack}). */
   private viewerOf(envelope: MessageEnvelope): GoalViewer {
     return { userId: cogUserKey(envelope.sender), isOwner: envelope.sender?.isOwner === true };
-  }
-
-  /** Map an inbound message to a goal type, or undefined for plain RespondToUser. */
-  private intentGoal(envelope: MessageEnvelope): { goalType: string; label: string } | undefined {
-    const text = (envelope.text || '').trim();
-    if (!text) return undefined;
-    const questionLike =
-      /\?\s*$/.test(text) ||
-      /^(who|what|when|where|why|how|which|is|are|do|does|did|can|could|would|should|will|wer|was|wann|wo|warum|wieso|wie|welche|welcher|ist|sind|kannst|kennst|hast|gibt)\b/i.test(
-        text,
-      );
-    if (questionLike) {
-      const brief = text.length > 80 ? `${text.slice(0, 77)}...` : text;
-      return { goalType: `${COGT}AnswerQuestion`, label: `Answer: ${brief}` };
-    }
-    return undefined;
   }
 
   /** Phase 4 — render the active goal as an `[Active goal]` prompt section. */
@@ -1070,7 +1288,7 @@ export class CycleManager {
     resolveEntities?: RunCycleOptions['resolveEntities'],
     inboundAbout: string[] = [],
     comprehension?: ComprehensionResult,
-    extras: { wm: WMEntryInput[]; shadow?: ShadowRecord } = { wm: [] },
+    extras: { wm: WMEntryInput[]; shadow?: ShadowRecord; goal?: GoalExtras } = { wm: [] },
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     // Conversational turns write the perception record (computed before the LLM
@@ -1122,6 +1340,7 @@ export class CycleManager {
         this.onError?.(e);
       }
     }
+    if (extras.goal) await this.finishGoals(envelope, sessionId, cycleId, cycleUri, episodicEnabled, extras.goal);
     if (episodicEnabled) {
       await this.writeEpisodes(
         envelope,
