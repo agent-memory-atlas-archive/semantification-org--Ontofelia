@@ -52,9 +52,59 @@ export interface TraceInput {
   /** Unknown until cycle end; may be back-filled later. */
   sequenceLen?: number;
   previousTrace?: string;
-  /** Whether the LLM picked a suggested tool; null when no suggestion existed. */
+  /**
+   * Whether the LLM picked a suggested tool; null (or absent) when no
+   * suggestion was shown to it this turn.
+   */
   proceduralAdherence?: boolean | null;
+  /** The cognitive user key of the turn's sender. */
+  forUser?: string;
+  /**
+   * Arguments the caller masked: a (sanitised) path and the sha256 of the raw
+   * value. The value itself never reaches this class; only the hash is stored,
+   * so two calls can be compared for equality without keeping the value.
+   */
+  maskedArgs?: MaskedArgHash[];
 }
+
+/** One masked tool argument: where it was and the sha256 (hex) of its value. */
+export interface MaskedArgHash {
+  path: string;
+  sha256: string;
+}
+
+/** One cycle's summary of whether the LLM used the suggestions shown to it. */
+export interface AdherenceSummaryInput {
+  cycleId: string;
+  sessionId?: string;
+  forUser: string;
+  executedAt: Date;
+  /** Distinct tools named by the suggestions that were shown. */
+  suggestedTools: number;
+  /** Traced calls of the cycle (every one carries its own adherence flag). */
+  tracedCalls: number;
+  /** Traced calls whose tool was one of the suggested tools. */
+  adheredCalls: number;
+}
+
+/** Weight of the follow-up satisfaction signal (a weak, indirect cue). */
+export const FOLLOWUP_SATISFACTION_WEIGHT = 0.3;
+
+/**
+ * Most recent durations kept per skill; the cumulative p95 is the exact
+ * nearest-rank p95 of this bounded window (not of all history).
+ */
+export const DURATION_WINDOW = 200;
+
+/** Suggestion filter defaults used by the cycle manager (see suggestSkills). */
+export const SUGGESTION_MIN_SUCCESS_RATE = 0.7;
+export const SUGGESTION_MIN_SAMPLES = 3;
+
+/** A follow-up older than this no longer counts as a reaction to the turn. */
+export const FOLLOWUP_MAX_GAP_MS = 6 * 3_600_000;
+
+/** Procedural traces live this long. Skill aggregates are kept. */
+export const TRACE_RETENTION_DAYS = 90;
 
 export interface TraceHit {
   uri: TraceId;
@@ -72,6 +122,9 @@ export interface TraceHit {
   sessionId?: string;
   sequencePos?: number;
   userSatisfied?: boolean;
+  /** Weight of `userSatisfied`; absent on signals written before weights existed. */
+  satisfactionWeight?: number;
+  forUser?: string;
 }
 
 export interface SkillSuggestion {
@@ -81,7 +134,11 @@ export interface SkillSuggestion {
   successRate: number;
   satisfactionRate: number;
   meanDurationMs: number;
+  /** p95 over the bounded window of the latest {@link DURATION_WINDOW} calls. */
+  p95DurationMs?: number;
   successCount: number;
+  /** Successes + failures + partials seen by the aggregate. */
+  sampleCount?: number;
   typicalArgPattern?: string;
   /** satRate * successRate — the surfacing score (doc 06 §4). */
   score: number;
@@ -101,6 +158,24 @@ interface SkillRow extends SkillSuggestion {
   failureCount: number;
   partialCount: number;
   lastUsedAt?: string;
+  /** Cumulative weighted satisfied / dissatisfied counts; absent on older rows. */
+  satisfiedWeight?: number;
+  dissatisfiedWeight?: number;
+  /** Latest durations, oldest first. */
+  durationWindow?: number[];
+}
+
+export interface SuggestOptions {
+  /** Keep only skills whose successRate is at least this. */
+  minSuccessRate?: number;
+  /** Keep only skills with at least this many recorded calls. */
+  minSamples?: number;
+}
+
+export interface TraceRetentionReport {
+  cutoff: string;
+  tracesDropped: number;
+  summariesDropped: number;
 }
 
 export interface ConsolidationReport {
@@ -135,6 +210,13 @@ function generalisePattern(brief: string): string {
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '{*}')
     .replace(/\/[^\s/]+(?=\s|$)/g, '/{*}')
     .replace(/\b\d+\b/g, '{*}');
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/** A masked-arg path reduced to a safe, short identifier (no value can hide in it). */
+function safePath(path: string): string {
+  return path.replace(/[^A-Za-z0-9_.[\]-]/g, '_').slice(0, 64) || 'arg';
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -284,6 +366,13 @@ export class ProceduralMemory {
       lines.push(
         `<${uri}> <${COGT}proceduralAdherence> "${t.proceduralAdherence}"^^<${XSD}boolean> .`,
       );
+    if (t.forUser) lines.push(`<${uri}> <${COGT}forUser> "${escapeLiteral(t.forUser)}" .`);
+    for (const m of (t.maskedArgs ?? []).slice(0, 20)) {
+      if (!SHA256_HEX.test(m.sha256)) continue; // only a real digest is stored
+      lines.push(
+        `<${uri}> <${COGT}maskedArg> "${escapeLiteral(`${safePath(m.path)}=sha256:${m.sha256}`)}" .`,
+      );
+    }
 
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
     return uri;
@@ -291,18 +380,104 @@ export class ProceduralMemory {
 
   /**
    * Back-fill the weak `userSatisfied` signal on a trace (doc 06 §3). `null`
-   * clears it (ambiguous feedback); `true`/`false` set it.
+   * clears it (ambiguous feedback); `true`/`false` set it. `weight` (0..1) is
+   * how much the signal counts in the skill aggregate; without it the signal
+   * counts as before (satisfied = 1, dissatisfied = 0).
    */
-  async backfillSatisfaction(traceUri: TraceId, satisfied: boolean | null): Promise<void> {
+  async backfillSatisfaction(
+    traceUri: TraceId,
+    satisfied: boolean | null,
+    weight?: number,
+  ): Promise<void> {
     const graph = this.graphUri();
     await this.triplestore.update(`
       DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }
       WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }`);
-    if (satisfied === null) return;
     await this.triplestore.update(`
-      INSERT DATA { GRAPH <${graph}> {
-        <${traceUri}> <${COGT}userSatisfied> "${satisfied}"^^<${XSD}boolean> .
-      } }`);
+      DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }
+      WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }`);
+    if (satisfied === null) return;
+    const lines = [`<${traceUri}> <${COGT}userSatisfied> "${satisfied}"^^<${XSD}boolean> .`];
+    if (weight !== undefined && Number.isFinite(weight)) {
+      lines.push(
+        `<${traceUri}> <${COGT}satisfactionWeight> "${clampRate(weight).toFixed(4)}"^^<${XSD}decimal> .`,
+      );
+    }
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+  }
+
+  /**
+   * One record per cycle that showed suggestions: how many of its traced calls
+   * used a suggested tool. Written only when suggestions were shown.
+   */
+  async recordAdherenceSummary(a: AdherenceSummaryInput): Promise<string> {
+    const graph = this.graphUri();
+    const uri = `urn:${this.agentId}:cog:adherence:${slug(a.cycleId)}`;
+    const rate = a.tracedCalls === 0 ? 0 : clampRate(a.adheredCalls / a.tracedCalls);
+    const lines = [
+      `<${uri}> <${RDF_TYPE}> <${COGT}AdherenceSummary> .`,
+      `<${uri}> <${COGT}cycleId> "${escapeLiteral(a.cycleId)}" .`,
+      `<${uri}> <${COGT}forUser> "${escapeLiteral(a.forUser)}" .`,
+      `<${uri}> <${COGT}executedAt> "${a.executedAt.toISOString()}"^^<${XSD}dateTime> .`,
+      `<${uri}> <${COGT}suggestedTools> "${Math.trunc(a.suggestedTools)}"^^<${XSD}integer> .`,
+      `<${uri}> <${COGT}tracedCalls> "${Math.trunc(a.tracedCalls)}"^^<${XSD}integer> .`,
+      `<${uri}> <${COGT}adheredCalls> "${Math.trunc(a.adheredCalls)}"^^<${XSD}integer> .`,
+      `<${uri}> <${COGT}adherenceRate> "${rate.toFixed(4)}"^^<${XSD}decimal> .`,
+      `<${uri}> <${COGT}agentId> "${escapeLiteral(this.agentId)}" .`,
+    ];
+    if (a.sessionId) lines.push(`<${uri}> <${COGT}sessionId> "${escapeLiteral(a.sessionId)}" .`);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    return uri;
+  }
+
+  /**
+   * Delete the procedural traces (and adherence summaries) whose `executedAt`
+   * is older than `retentionDays` before `now`, at most `limit` records per
+   * call. Skill and sequence-skill aggregates are never touched, except that
+   * their ring-buffer link to a deleted trace is dropped. Safe to run daily.
+   */
+  async purgeOldTraces(
+    now: Date = new Date(),
+    retentionDays = TRACE_RETENTION_DAYS,
+    limit = 5000,
+  ): Promise<TraceRetentionReport> {
+    const graph = this.graphUri();
+    this.registry?.assertWritable(graph);
+    const cutoff = new Date(now.getTime() - retentionDays * 86_400_000);
+    const report: TraceRetentionReport = {
+      cutoff: cutoff.toISOString(),
+      tracesDropped: 0,
+      summariesDropped: 0,
+    };
+    // The typed comparison is done by the store (instants, not strings); the
+    // instant check below is a second guard before anything is deleted.
+    const res = await this.triplestore.query(`
+      SELECT ?t ?type ?when WHERE {
+        GRAPH <${graph}> {
+          ?t a ?type ; <${COGT}executedAt> ?when .
+          FILTER(?type IN (<${COGT}SkillTrace>, <${COGT}AdherenceSummary>))
+          FILTER(?when < "${cutoff.toISOString()}"^^<${XSD}dateTime>)
+        }
+      } LIMIT ${Math.max(1, Math.trunc(limit))}`);
+    const cutoffIso = cutoff.toISOString();
+    const doomed: { uri: string; trace: boolean }[] = [];
+    for (const r of res.bindings ?? []) {
+      if (compareIso(r.when.value, cutoffIso) >= 0) continue;
+      doomed.push({ uri: r.t.value, trace: r.type.value === `${COGT}SkillTrace` });
+    }
+    for (let i = 0; i < doomed.length; i += 50) {
+      const batch = doomed.slice(i, i + 50);
+      const values = batch.map((d) => `<${d.uri}>`).join(' ');
+      await this.triplestore.update(`
+        DELETE { GRAPH <${graph}> { ?s <${COGT}hasTrace> ?t } }
+        WHERE  { GRAPH <${graph}> { ?s <${COGT}hasTrace> ?t } VALUES ?t { ${values} } }`);
+      await this.triplestore.update(`
+        DELETE { GRAPH <${graph}> { ?t ?p ?o } }
+        WHERE  { GRAPH <${graph}> { ?t ?p ?o } VALUES ?t { ${values} } }`);
+    }
+    report.tracesDropped = doomed.filter((d) => d.trace).length;
+    report.summariesDropped = doomed.length - report.tracesDropped;
+    return report;
   }
 
   /**
@@ -310,39 +485,69 @@ export class ProceduralMemory {
    * `excludeCycleId` (doc 06 §3 — the cycle a fresh inbound message is reacting
    * to). Returns `[]` when there is no prior cycle. Used by Phase 1 to back-fill
    * the weak `userSatisfied` signal one cycle late.
+   *
+   * With `opts.forUser` only that user's traces are considered (a trace without
+   * a `forUser` is never matched); `onlyUnjudged` drops traces that already
+   * carry a follow-up signal, so only the *next* message judges a turn; and
+   * `maxGapMs` returns `[]` when the prior cycle is older than that.
+   * The read is bounded to the 5000 newest matching traces.
    */
-  async findPriorCycleTraceUris(sessionId: string, excludeCycleId: string): Promise<string[]> {
+  async findPriorCycleTraceUris(
+    sessionId: string,
+    excludeCycleId: string,
+    opts: { forUser?: string; onlyUnjudged?: boolean; maxGapMs?: number; now?: Date } = {},
+  ): Promise<string[]> {
     const graph = this.graphUri();
     const res = await this.triplestore.query(`
-      SELECT ?t ?cycleId ?when WHERE {
+      SELECT ?t ?cycleId ?when ?user ?weight WHERE {
         GRAPH <${graph}> {
           ?t a <${COGT}SkillTrace> ;
              <${COGT}sessionId>  "${escapeLiteral(sessionId)}" ;
              <${COGT}cycleId>    ?cycleId ;
              <${COGT}executedAt> ?when .
+          OPTIONAL { ?t <${COGT}forUser> ?user . }
+          OPTIONAL { ?t <${COGT}satisfactionWeight> ?weight . }
         }
-      }`);
+      } ORDER BY DESC(?when) LIMIT 5000`);
     let bestCycle: string | undefined;
-    let bestWhen = -Infinity;
-    const byCycle = new Map<string, string[]>();
+    let bestWhen: string | undefined;
+    const byCycle = new Map<string, { uri: string; judged: boolean }[]>();
     for (const r of res.bindings ?? []) {
       const cyc = r.cycleId.value;
       if (cyc === excludeCycleId) continue;
+      if (opts.forUser !== undefined && r.user?.value !== opts.forUser) continue;
       const arr = byCycle.get(cyc) ?? [];
-      arr.push(r.t.value);
+      arr.push({ uri: r.t.value, judged: r.weight !== undefined });
       byCycle.set(cyc, arr);
-      const ts = Date.parse(r.when.value);
-      if (ts > bestWhen) { bestWhen = ts; bestCycle = cyc; }
+      if (bestWhen === undefined || compareIso(r.when.value, bestWhen) > 0) {
+        bestWhen = r.when.value;
+        bestCycle = cyc;
+      }
     }
-    return bestCycle ? byCycle.get(bestCycle) ?? [] : [];
+    if (!bestCycle || bestWhen === undefined) return [];
+    if (opts.maxGapMs !== undefined) {
+      const now = (opts.now ?? new Date()).getTime();
+      if (now - Date.parse(bestWhen) > opts.maxGapMs) return [];
+    }
+    const rows = byCycle.get(bestCycle) ?? [];
+    return rows.filter((x) => !opts.onlyUnjudged || !x.judged).map((x) => x.uri);
   }
 
   /**
    * Top-K skills for a goal type, ranked by `satisfactionRate * successRate`
    * (doc 06 §4). Returns `[]` when none exist; never throws.
    */
-  async suggestSkills(forGoalType: string, k = 5): Promise<SkillSuggestion[]> {
-    const skills = await this.readSkills(forGoalType);
+  async suggestSkills(
+    forGoalType: string,
+    k = 5,
+    opts: SuggestOptions = {},
+  ): Promise<SkillSuggestion[]> {
+    const eps = 1e-9;
+    const skills = (await this.readSkills(forGoalType)).filter(
+      (s) =>
+        (opts.minSuccessRate === undefined || s.successRate >= opts.minSuccessRate - eps) &&
+        (opts.minSamples === undefined || (s.sampleCount ?? s.successCount) >= opts.minSamples),
+    );
     const scored = skills.map((s) => ({ ...s, score: s.satisfactionRate * s.successRate }));
     scored.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
@@ -352,8 +557,14 @@ export class ProceduralMemory {
   }
 
   /** Top-K learned sequence skills for a goal type, ranked by successRate. */
-  async suggestSequenceSkills(forGoalType: string, k = 3): Promise<SequenceSkillSuggestion[]> {
-    const seqs = await this.readSequenceSkills(forGoalType);
+  async suggestSequenceSkills(
+    forGoalType: string,
+    k = 3,
+    opts: Pick<SuggestOptions, 'minSuccessRate'> = {},
+  ): Promise<SequenceSkillSuggestion[]> {
+    const seqs = (await this.readSequenceSkills(forGoalType)).filter(
+      (q) => opts.minSuccessRate === undefined || q.successRate >= opts.minSuccessRate - 1e-9,
+    );
     seqs.sort((a, b) => {
       if (b.successRate !== a.successRate) return b.successRate - a.successRate;
       return b.successCount - a.successCount;
@@ -416,7 +627,14 @@ export class ProceduralMemory {
     const newSuccess = rows.filter((r) => r.outcome === 'success').length;
     const newFailure = rows.filter((r) => r.outcome === 'error').length;
     const newPartial = rows.filter((r) => r.outcome === 'partial').length;
-    const newSatisfied = rows.filter((r) => r.userSatisfied === true).length;
+    // Weighted follow-up signal. A trace judged before weights existed counts 1
+    // when satisfied and 0 when dissatisfied (the earlier arithmetic).
+    let newSatW = 0;
+    let newDisW = 0;
+    for (const r of rows) {
+      if (r.userSatisfied === true) newSatW += r.satisfactionWeight ?? 1;
+      else if (r.userSatisfied === false) newDisW += r.satisfactionWeight ?? 0;
+    }
 
     const successCount = (prev?.successCount ?? 0) + newSuccess;
     const failureCount = (prev?.failureCount ?? 0) + newFailure;
@@ -430,13 +648,25 @@ export class ProceduralMemory {
     const newSum = newDurations.reduce((a, b) => a + b, 0);
     const meanDurationMs =
       total === 0 ? 0 : ((prev?.meanDurationMs ?? 0) * prevTotal + newSum) / total;
-    const p95DurationMs = percentile([...newDurations].sort((a, b) => a - b), 0.95);
+    // Cumulative p95: exact nearest-rank p95 of a bounded window holding the
+    // latest DURATION_WINDOW measured durations (partials were never measured).
+    const measured = rows
+      .filter((r) => r.outcome !== 'partial')
+      .slice()
+      .sort((a, b) => compareIso(a.executedAt, b.executedAt))
+      .map((r) => Math.max(0, Math.trunc(r.durationMs ?? 0)));
+    const durationWindow = [...(prev?.durationWindow ?? []), ...measured].slice(-DURATION_WINDOW);
+    const p95DurationMs = percentile([...durationWindow].sort((a, b) => a - b), 0.95);
 
     const successRate = total === 0 ? 0 : successCount / total;
-    // Reconstruct cumulative satisfied count from the prior rate, add the new.
-    const prevSatisfied = Math.round((prev?.satisfactionRate ?? 0) * (prev?.successCount ?? 0));
-    const satisfiedCount = prevSatisfied + newSatisfied;
-    const satisfactionRate = successCount === 0 ? 0 : clampRate(satisfiedCount / successCount);
+    // Cumulative weighted counts; rows from before the weights are rebuilt
+    // from their rate. Dissatisfaction offsets satisfaction, never below zero.
+    const prevSatW =
+      prev?.satisfiedWeight ?? Math.round((prev?.satisfactionRate ?? 0) * (prev?.successCount ?? 0));
+    const satisfiedWeight = prevSatW + newSatW;
+    const dissatisfiedWeight = (prev?.dissatisfiedWeight ?? 0) + newDisW;
+    const satisfactionRate =
+      successCount === 0 ? 0 : clampRate((satisfiedWeight - dissatisfiedWeight) / successCount);
 
     const lastTrace = rows.reduce((a, b) => (compareIso(a.executedAt, b.executedAt) > 0 ? a : b));
     const lastUsedAt =
@@ -477,6 +707,9 @@ export class ProceduralMemory {
       `<${uri}> <${COGT}satisfactionRate> "${satisfactionRate.toFixed(4)}"^^<${XSD}decimal> .`,
       `<${uri}> <${COGT}lastUsedAt> "${lastUsedAt}"^^<${XSD}dateTime> .`,
       `<${uri}> <${COGT}agentId> "${escapeLiteral(this.agentId)}" .`,
+      `<${uri}> <${COGT}satisfiedWeight> "${satisfiedWeight.toFixed(4)}"^^<${XSD}decimal> .`,
+      `<${uri}> <${COGT}dissatisfiedWeight> "${dissatisfiedWeight.toFixed(4)}"^^<${XSD}decimal> .`,
+      `<${uri}> <${COGT}durationWindow> "${durationWindow.join(',')}" .`,
     ];
     if (forGoalType) lines.push(`<${uri}> <${COGT}forGoalType> "${escapeLiteral(forGoalType)}" .`);
     if (typicalArgPattern)
@@ -621,7 +854,7 @@ export class ProceduralMemory {
     const graph = this.graphUri();
     const res = await this.triplestore.query(`
       SELECT ?t ?traceId ?toolName ?hash ?brief ?when ?dur ?outcome ?errorClass
-             ?forGoal ?forGoalType ?cycleId ?sessionId ?seqPos ?sat
+             ?forGoal ?forGoalType ?cycleId ?sessionId ?seqPos ?sat ?satW ?user
       WHERE {
         GRAPH <${graph}> {
           ?t a <${COGT}SkillTrace> ;
@@ -639,6 +872,8 @@ export class ProceduralMemory {
           OPTIONAL { ?t <${COGT}sessionId>     ?sessionId . }
           OPTIONAL { ?t <${COGT}sequencePos>   ?seqPos . }
           OPTIONAL { ?t <${COGT}userSatisfied> ?sat . }
+          OPTIONAL { ?t <${COGT}satisfactionWeight> ?satW . }
+          OPTIONAL { ?t <${COGT}forUser>       ?user . }
         }
       }`);
     const since = window.since.getTime();
@@ -665,6 +900,8 @@ export class ProceduralMemory {
       if (r.sessionId) hit.sessionId = r.sessionId.value;
       if (r.seqPos) hit.sequencePos = Number(r.seqPos.value);
       if (r.sat) hit.userSatisfied = r.sat.value === 'true';
+      if (r.satW && Number.isFinite(Number(r.satW.value))) hit.satisfactionWeight = Number(r.satW.value);
+      if (r.user) hit.forUser = r.user.value;
       out.push(hit);
     }
     return out;
@@ -676,7 +913,7 @@ export class ProceduralMemory {
       ? `?s <${COGT}forGoalType> "${escapeLiteral(forGoalType)}" .`
       : '';
     const res = await this.triplestore.query(`
-      SELECT ?s ?toolName ?gt ?succ ?fail ?part ?mean ?sr ?sat ?pattern
+      SELECT ?s ?toolName ?gt ?succ ?fail ?part ?mean ?p95 ?sr ?sat ?pattern
       WHERE {
         GRAPH <${graph}> {
           ?s a <${COGT}Skill> ;
@@ -689,6 +926,7 @@ export class ProceduralMemory {
           ${filter}
           OPTIONAL { ?s <${COGT}forGoalType>      ?gt . }
           OPTIONAL { ?s <${COGT}meanDurationMs>   ?mean . }
+          OPTIONAL { ?s <${COGT}p95DurationMs>    ?p95 . }
           OPTIONAL { ?s <${COGT}typicalArgPattern> ?pattern . }
         }
       }`);
@@ -700,6 +938,8 @@ export class ProceduralMemory {
       successRate: Number(r.sr.value),
       satisfactionRate: Number(r.sat.value),
       meanDurationMs: r.mean ? Number(r.mean.value) : 0,
+      ...(r.p95 ? { p95DurationMs: Number(r.p95.value) } : {}),
+      sampleCount: Number(r.succ.value) + Number(r.fail.value) + Number(r.part.value),
       typicalArgPattern: r.pattern?.value,
       score: 0,
     }));
@@ -708,7 +948,7 @@ export class ProceduralMemory {
   private async readOneSkill(uri: string): Promise<SkillRow | undefined> {
     const graph = this.graphUri();
     const res = await this.triplestore.query(`
-      SELECT ?toolName ?gt ?succ ?fail ?part ?mean ?sr ?sat ?last
+      SELECT ?toolName ?gt ?succ ?fail ?part ?mean ?sr ?sat ?last ?satW ?disW ?win
       WHERE {
         GRAPH <${graph}> {
           <${uri}> a <${COGT}Skill> ;
@@ -721,6 +961,9 @@ export class ProceduralMemory {
           OPTIONAL { <${uri}> <${COGT}forGoalType>    ?gt . }
           OPTIONAL { <${uri}> <${COGT}meanDurationMs> ?mean . }
           OPTIONAL { <${uri}> <${COGT}lastUsedAt>     ?last . }
+          OPTIONAL { <${uri}> <${COGT}satisfiedWeight>    ?satW . }
+          OPTIONAL { <${uri}> <${COGT}dissatisfiedWeight> ?disW . }
+          OPTIONAL { <${uri}> <${COGT}durationWindow>     ?win . }
         }
       } LIMIT 1`);
     const r = res.bindings?.[0];
@@ -738,6 +981,14 @@ export class ProceduralMemory {
       score: 0,
     };
     if (r.last) hit.lastUsedAt = r.last.value;
+    if (r.satW) hit.satisfiedWeight = Number(r.satW.value);
+    if (r.disW) hit.dissatisfiedWeight = Number(r.disW.value);
+    if (r.win && r.win.value !== '') {
+      hit.durationWindow = r.win.value
+        .split(',')
+        .map(Number)
+        .filter((n) => Number.isFinite(n));
+    }
     return hit;
   }
 
