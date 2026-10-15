@@ -17,7 +17,7 @@ import { GuardianPolicy } from './GuardianPolicy.js';
 import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder } from './cognitive/CycleManager.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
-import { CognitiveConfig } from './cognitive/CognitiveConfig.js';
+import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag } from './cognitive/CognitiveConfig.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
 import { CogHealth, type CogHealthReport } from './cognitive/CogHealth.js';
 import {
@@ -1112,6 +1112,7 @@ Users can use these commands:
         const proceduralEnabled = await this.cognitiveConfig.isProceduralMemoryEnabled();
         const metacognitionEnabled = await this.cognitiveConfig.isMetacognitionEnabled();
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
+        const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         return await this.cycleManager.runCycle(
           envelope,
           (recordTool, prepareGoals) =>
@@ -1123,6 +1124,7 @@ Users can use these commands:
             proceduralEnabled,
             metacognitionEnabled,
             selfModelEnabled,
+            episodicEnabled,
             mode: 'initiative',
             initiativeGoalUri: envelope.routingHints?.initiativeGoalId,
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
@@ -1138,13 +1140,14 @@ Users can use these commands:
         const proceduralEnabled = await this.cognitiveConfig.isProceduralMemoryEnabled();
         const metacognitionEnabled = await this.cognitiveConfig.isMetacognitionEnabled();
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
+        const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
         return await this.cycleManager.runCycle(
           envelope,
           (recordTool, prepareGoals, recordInbound) => this.runCore(envelope, recordTool, prepareGoals, recordInbound),
           (r) => r.sessionId,
           (r) => r.text,
           {
-            goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled,
+            goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
             // Surface the cognitive phases on the live debug stream so the
             // status UI can show them explicitly alongside tool usage.
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
@@ -1332,6 +1335,16 @@ Users can use these commands:
   ): Promise<ArmGoalResult | undefined> {
     const goalStack = this.goalStackFor(req.sessionId);
     if (!goalStack) return undefined;
+    // The mandate is the owner's message-received episode, which the cycle writes
+    // only while cog.flagEpisodicMemory is on.
+    if (!(await this.cognitiveConfig?.isEpisodicMemoryEnabled().catch(() => false))) {
+      return {
+        ok: false,
+        message:
+          'arm_goal needs episodic memory: the owner\'s message is recorded as the mandate only while ' +
+          'the setup flag cog.flagEpisodicMemory is on (owner: /cog flag episodicmemory on). Nothing was changed.',
+      };
+    }
     return armGoal(
       {
         goalStack,
@@ -2140,16 +2153,16 @@ Users can use these commands:
       const sub = cmd.slice(4).trim().toLowerCase();
       // debug on|off and migrate change state on the owner's behalf: they need
       // a live human owner turn, not a scheduler/cron/webhook/initiative envelope.
-      const requiresHumanTurn = sub === 'migrate' || sub === 'debug on' || sub === 'debug off';
+      const requiresHumanTurn =
+        sub === 'migrate' || sub === 'debug on' || sub === 'debug off' || sub === 'flags' || sub === 'flag' || sub.startsWith('flag ');
       if (requiresHumanTurn && !isHumanOwnerTurn(envelope)) {
         return { text: 'This command needs a live owner turn.', sessionId: session.sessionId };
       }
       if (sub === 'health' || sub === '') {
         const health = await this.cogHealth();
-        const cycleManager = (await this.cognitiveConfig?.isCycleManagerEnabled().catch(() => false)) ?? false;
         return {
           text: health
-            ? '```json\n' + JSON.stringify({ ...health, flags: { cycleManager } }, null, 2) + '\n```'
+            ? '```json\n' + JSON.stringify(health, null, 2) + '\n```'
             : 'Cognitive architecture is not active (no knowledge engine).',
           sessionId: session.sessionId,
         };
@@ -2179,6 +2192,36 @@ Users can use these commands:
         await this.cognitiveConfig.setDebugPanelEnabled(on);
         return { text: `🪟 Cognitive debug panel ${on ? 'enabled' : 'disabled'}.`, sessionId: session.sessionId };
       }
+      // Flag control surface: list every cognitive flag, or set exactly one.
+      if (sub === 'flags') {
+        if (!this.cognitiveConfig) {
+          return { text: 'Cognitive architecture is not active.', sessionId: session.sessionId };
+        }
+        const lines: string[] = [];
+        for (const f of COGNITIVE_FLAGS) {
+          const on = await this.cognitiveConfig.isEnabled(f).catch(() => false);
+          lines.push(`• ${f.name} (${f.key.toLowerCase()}): ${on ? 'on' : 'off'} — ${f.description}`);
+        }
+        return { text: `⚙️ Cognitive flags:\n${lines.join('\n')}\nSet one with /cog flag <name> on|off.`, sessionId: session.sessionId };
+      }
+      if (sub === 'flag' || sub.startsWith('flag ')) {
+        if (!this.cognitiveConfig) {
+          return { text: 'Cognitive architecture is not active.', sessionId: session.sessionId };
+        }
+        const parts = sub.slice('flag'.length).trim().split(/\s+/);
+        const info = parts.length === 2 ? resolveCognitiveFlag(parts[0]) : undefined;
+        const value = parts[1];
+        if (!info || (value !== 'on' && value !== 'off')) {
+          const names = COGNITIVE_FLAGS.map((f) => f.name).join(', ');
+          return {
+            text: `Usage: /cog flag <name> on|off. Nothing was changed. Valid names (the flag prefix may be left out): ${names}.`,
+            sessionId: session.sessionId,
+          };
+        }
+        const on = value === 'on';
+        await this.cognitiveConfig.setEnabled(info, on);
+        return { text: `⚙️ ${info.name} = ${on}.`, sessionId: session.sessionId };
+      }
       // Cycle-manager switch (setup flag cog.flagCycleManager). Owner-only AND a
       // live human owner turn: a scheduler/cron/webhook envelope claims isOwner
       // but is not the owner speaking. arm_goal needs this flag on, because the
@@ -2197,7 +2240,7 @@ Users can use these commands:
         await this.cognitiveConfig.setCycleManagerEnabled(on);
         return {
           text: `⚙️ Cycle manager ${on ? 'enabled' : 'disabled'} (flagCycleManager = ${on}).` +
-            (on ? '\nOwner messages are now recorded as episodes, so arm_goal can use them as a mandate.' : ''),
+            (on ? '\nOnly the cycle flag was set. Episodes (and so the arm_goal mandate) also need /cog flag episodicmemory on.' : ''),
           sessionId: session.sessionId,
         };
       }
@@ -2212,7 +2255,7 @@ Users can use these commands:
         if (!exp) return { text: 'Cognitive debug panel is disabled. Enable with `/cog debug on`.', sessionId: session.sessionId };
         return { text: '```json\n' + JSON.stringify(exp, null, 2) + '\n```', sessionId: session.sessionId };
       }
-      return { text: 'Usage: /cog [health|retain|consolidate|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
+      return { text: 'Usage: /cog [health|flags|flag <name> on|off|retain|consolidate|scan|migrate|debug on|debug off|cycle on|cycle off|cycles|explain <cycleId>]', sessionId: session.sessionId };
     }
     // /reseed-persona — re-apply bootstrap/self.ttl (persona/identity) to the
     // self graph at runtime, without wiping anything the agent has learned.
@@ -2390,7 +2433,7 @@ Users can use these commands:
     }
 
     if (cmd === '/help') {
-      const ownerCommands = isOwner ? ', /goals, /initiative, /cog cycle on|off, /reseed-persona' : '';
+      const ownerCommands = isOwner ? ', /goals, /initiative, /cog cycle on|off, /cog flags, /cog flag <name> on|off, /reseed-persona' : '';
       return { text: `Available commands: /new, /reset, /status, /tools, /model, /skills, /plugins, /help, /stop${ownerCommands}`, sessionId: session.sessionId };
     }
     if (cmd === '/stop') {

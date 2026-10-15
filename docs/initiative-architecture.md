@@ -536,7 +536,8 @@ What the code in this repository does not do, stated plainly:
 - **No goal receives a mandate or a wake automatically.** The only way from
   normal use is the owner-only `arm_goal` tool (§9), which the agent may call
   only when the owner asks for it in the current message and which needs
-  `flagCycleManager` (`/cog cycle on`). The cycle manager itself still creates goals only for a
+  `flagCycleManager` (`/cog cycle on`) and `flagEpisodicMemory`
+  (`/cog flag episodicmemory on`). The cycle manager itself still creates goals only for a
   message intent (without wake policy) or the implicit "Respond to the user"
   goal. A wake needs a further `/initiative on` before it fires.
 - **An unattended cycle can change only its own goal's progress.** The sole
@@ -572,8 +573,10 @@ What the code in this repository does not do, stated plainly:
   shorter or longer on a daylight-saving transition day.
 - **The `cogt:servesDrive` link is informational.** It affects only the `/goals`
   display.
-- **No way to start the cycle manager or goal stack from chat.** Their flags
-  can only be set through the setup graph (§3).
+- **The cycle manager alone is not enough for `arm_goal`.** `/cog cycle on`
+  sets only `flagCycleManager`; episodes (and so the `arm_goal` mandate) also
+  need `flagEpisodicMemory`. The owner lists and sets every cognitive flag from
+  chat with `/cog flags` and `/cog flag <name> on|off`.
 
 ## 11. Source map
 

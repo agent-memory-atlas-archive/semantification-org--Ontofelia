@@ -11,6 +11,7 @@
 
 import type { TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '@ontofelia/semantic-memory';
+import { CognitiveConfig } from './CognitiveConfig.js';
 
 const COGT = 'urn:shared:ontology#cog/';
 const XSD_DATETIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
@@ -53,6 +54,8 @@ export interface CogHealthReport {
     'cog:meta': MetaHealth;
   };
   cycle: CycleHealth;
+  /** Every cognitive flag (short key -> on/off). */
+  flags: Record<string, boolean>;
 }
 
 export class CogHealth {
@@ -67,7 +70,7 @@ export class CogHealth {
     const goalsLong = GraphUriResolver.getCogGoalsLongtermGraph(this.agentId);
     const meta = GraphUriResolver.getCogMetaGraph(this.agentId);
 
-    const [epi, proc, skillCount, seqCount, goals, metaH, cycle] = await Promise.all([
+    const [epi, proc, skillCount, seqCount, goals, metaH, cycle, flags] = await Promise.all([
       this.graphHealth(episodic),
       this.graphHealth(procedural),
       this.countOfType(procedural, `${COGT}Skill`),
@@ -75,6 +78,7 @@ export class CogHealth {
       this.goalsHealth(goalsLong),
       this.metaHealth(meta, now),
       this.cycleHealth(meta),
+      new CognitiveConfig(this.triplestore, this.agentId).allFlags(),
     ]);
 
     return {
@@ -86,6 +90,7 @@ export class CogHealth {
         'cog:meta': metaH,
       },
       cycle,
+      flags,
     };
   }
 

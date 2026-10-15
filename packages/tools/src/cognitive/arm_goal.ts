@@ -125,8 +125,9 @@ export class ArmGoalTool implements ToolDefinition {
       return refuse(
         'arm_goal needs the record of the owner\'s current message as its mandate, but this turn ' +
           'has none. That record is written only when the cognitive cycle manager is on ' +
-          '(setup flag cog.flagCycleManager) and the reply is not streamed. Nothing was changed; ' +
-          'the flag is not switched on by this tool.',
+          '(setup flag cog.flagCycleManager), episodic memory is on (setup flag cog.flagEpisodicMemory) ' +
+          'and the reply is not streamed. Nothing was changed; ' +
+          'the flags are not switched on by this tool.',
         'arm_goal: no mandate episode for this turn',
       );
     }

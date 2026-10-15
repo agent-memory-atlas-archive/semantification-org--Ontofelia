@@ -21,6 +21,38 @@ function configSubject(agentId: string): string {
   return `urn:${agentId}:setup:cognitive`;
 }
 
+/** One cognitive feature flag: its setup-graph name, short key and a one-line description. */
+export interface CognitiveFlagInfo {
+  /** Triple local name in the setup graph, e.g. `flagGoalStack`. */
+  readonly name: string;
+  /** Short camelCase key without the `flag` prefix, e.g. `goalStack`. */
+  readonly key: string;
+  readonly description: string;
+}
+
+/** Every cognitive flag, in display order. This is the allowlist for `/cog flag`. */
+export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
+  { name: 'flagCycleManager', key: 'cycleManager', description: 'Route messages through the six-phase cognitive cycle.' },
+  { name: 'flagEpisodicMemory', key: 'episodicMemory', description: 'Let the cycle write episodes (messages, tools, replies); arm_goal needs this.' },
+  { name: 'flagGoalStack', key: 'goalStack', description: 'Manage an explicit goal stack in the cycle.' },
+  { name: 'flagProceduralMemory', key: 'proceduralMemory', description: 'Record skill traces per tool call and suggest skills.' },
+  { name: 'flagMetacognition', key: 'metacognition', description: 'Raise impasses and write the full reflective marker.' },
+  { name: 'flagSelfModelQuery', key: 'selfModelQuery', description: 'Add a self-model block to the prompt.' },
+  { name: 'flagRetention', key: 'retention', description: 'Let the retention sweep tier old episodes.' },
+  { name: 'flagDebugPanel', key: 'debugPanel', description: 'Expose the read-only cognitive inspection routes.' },
+  { name: 'flagInitiative', key: 'initiative', description: 'Allow self-started goal wakes (kill switch for unattended work).' },
+];
+
+/**
+ * Resolve a user-supplied flag name to its descriptor. Accepts the exact name
+ * (`flagGoalStack`) or the short form without the `flag` prefix (`goalstack`),
+ * case-insensitive. Returns `undefined` for anything not on the allowlist.
+ */
+export function resolveCognitiveFlag(input: string): CognitiveFlagInfo | undefined {
+  const norm = input.trim().toLowerCase().replace(/^flag/, '');
+  return COGNITIVE_FLAGS.find((f) => f.key.toLowerCase() === norm);
+}
+
 export class CognitiveConfig {
   constructor(
     private readonly triplestore: TriplestoreAdapter,
@@ -139,6 +171,37 @@ export class CognitiveConfig {
   /** Set (or clear) the initiative flag in the setup graph. */
   async setInitiativeEnabled(enabled: boolean): Promise<void> {
     return this.setFlag('flagInitiative', enabled);
+  }
+
+  /**
+   * Whether the cycle writes episodes (message-received, tool, response). Defaults
+   * to `false`: with the cycle on and this flag off, cycle resources, working
+   * memory and the reflective marker are still written, but no episodes.
+   */
+  async isEpisodicMemoryEnabled(): Promise<boolean> {
+    return this.isFlagEnabled('flagEpisodicMemory');
+  }
+
+  /** Set (or clear) the episodic-memory flag in the setup graph. */
+  async setEpisodicMemoryEnabled(enabled: boolean): Promise<void> {
+    return this.setFlag('flagEpisodicMemory', enabled);
+  }
+
+  /** Read any flag on the {@link COGNITIVE_FLAGS} allowlist by its exact name. */
+  async isEnabled(info: CognitiveFlagInfo): Promise<boolean> {
+    return this.isFlagEnabled(info.name);
+  }
+
+  /** Set any flag on the {@link COGNITIVE_FLAGS} allowlist. */
+  async setEnabled(info: CognitiveFlagInfo, enabled: boolean): Promise<void> {
+    return this.setFlag(info.name, enabled);
+  }
+
+  /** Current value of every flag, keyed by short key. */
+  async allFlags(): Promise<Record<string, boolean>> {
+    const out: Record<string, boolean> = {};
+    for (const f of COGNITIVE_FLAGS) out[f.key] = await this.isFlagEnabled(f.name).catch(() => false);
+    return out;
   }
 
   /** Read one boolean `cog.<flag>` triple; `false` when absent or unparseable. */

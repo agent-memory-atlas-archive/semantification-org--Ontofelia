@@ -134,6 +134,12 @@ export interface RunCycleOptions {
    */
   selfModelEnabled?: boolean;
   /**
+   * When explicitly `false` (cog.flagEpisodicMemory off), the cycle writes no
+   * episodes; cycle resources, working memory and the reflective marker are
+   * still written. Absent or `true` keeps the prior behaviour.
+   */
+  episodicEnabled?: boolean;
+  /**
    * Optional real-time sink for the cognitive phases so a live status UI (e.g.
    * the Telegram progress checklist) can show them explicitly. Best-effort and
    * off the persistence path; failures are swallowed.
@@ -277,6 +283,7 @@ export class CycleManager {
     let inboundEpisodeUri: string | undefined;
     const recordInbound: InboundEpisodeRecorder = async (sessionId) => {
       if (mode !== 'conversational') return undefined;
+      if (options.episodicEnabled === false) return undefined;
       if (inboundEpisodeUri) return inboundEpisodeUri;
       try {
         inboundEpisodeUri = await this.appendInboundEpisode(
@@ -337,6 +344,7 @@ export class CycleManager {
         mode,
         options.initiativeGoalUri,
         inboundEpisodeUri,
+        options.episodicEnabled !== false,
       );
     } catch (persistErr) {
       this.onError?.(persistErr);
@@ -537,10 +545,12 @@ export class CycleManager {
     mode: 'conversational' | 'initiative' = 'conversational',
     initiativeGoalUri?: string,
     inboundEpisodeUri?: string,
+    episodicEnabled = true,
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri);
-    const { retrievalHits } = await this.writeEpisodicAndRetrieval(
+    const { retrievalHits } = episodicEnabled
+      ? await this.writeEpisodicAndRetrieval(
       envelope,
       sessionId,
       cycleId,
@@ -551,11 +561,12 @@ export class CycleManager {
       toolEvents,
       activeGoalUri,
       inboundEpisodeUri,
-    );
+    )
+      : { retrievalHits: 0 };
     // Initiative episode (docs/initiative-architecture.md §6): one auditable
     // record per unattended cycle — trigger, outcome and reason. Written only in
     // initiative mode, so conversational persistence is byte-identical.
-    if (mode === 'initiative') {
+    if (mode === 'initiative' && episodicEnabled) {
       await this.writeInitiativeEpisode(
         envelope,
         sessionId,

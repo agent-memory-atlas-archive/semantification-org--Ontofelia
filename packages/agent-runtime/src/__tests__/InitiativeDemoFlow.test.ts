@@ -146,6 +146,7 @@ describe('initiative demo flow (docs/demo-initiative.md)', () => {
   it('arms a goal from a chat message, wakes it, and the unattended cycle records progress', async () => {
     // Steps 1-2 of the demo: the two owner switches.
     expect((await runtime.handleMessage(ownerEnv('/cog cycle on'))).text).toContain('flagCycleManager = true');
+    await cfg.setEpisodicMemoryEnabled(true); // the mandate is an episode
     expect((await runtime.handleMessage(ownerEnv('/initiative on'))).text).toContain('flagInitiative = true');
     expect(await cfg.isCycleManagerEnabled()).toBe(true);
     expect(await cfg.isInitiativeEnabled()).toBe(true);
