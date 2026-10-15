@@ -561,6 +561,15 @@ export interface CycleManagerOptions {
   argDigestKey?: ArgDigestKeySource;
 }
 
+/** How many persist timings the manager keeps (a bounded ring). */
+export const PERSIST_SAMPLE_CAP = 500;
+
+/** Timing of one turn's queued persist: milliseconds, and full dumps the adapter wrote meanwhile (when it counts them). */
+export interface PersistSample {
+  ms: number;
+  dumps?: number;
+}
+
 export class CycleManager {
   constructor(
     private readonly triplestore: TriplestoreAdapter,
@@ -657,6 +666,40 @@ export class CycleManager {
   async flushPending(): Promise<void> {
     while (this.inFlight.size > 0) {
       await Promise.allSettled([...this.inFlight]);
+    }
+  }
+
+  /** Newest persist timings, oldest first; bounded by {@link PERSIST_SAMPLE_CAP}. */
+  private readonly persistLog: PersistSample[] = [];
+
+  /**
+   * The persist timings of the newest turns of this process (read-only copy,
+   * oldest first, at most `limit`, never more than {@link PERSIST_SAMPLE_CAP}).
+   * Numbers only: no text of any turn is kept here. In memory, so a restart
+   * starts with an empty window.
+   */
+  recentPersists(limit: number = PERSIST_SAMPLE_CAP): PersistSample[] {
+    const n = Number.isInteger(limit) ? Math.max(0, Math.min(limit, PERSIST_SAMPLE_CAP)) : PERSIST_SAMPLE_CAP;
+    return n === 0 ? [] : this.persistLog.slice(-n).map((x) => ({ ...x }));
+  }
+
+  /** Run one turn's persist and record how long it took and how many dumps the adapter wrote meanwhile. */
+  private async timePersist(job: () => Promise<void>): Promise<void> {
+    const dumps = (): number | undefined => {
+      const c = (this.triplestore as { dumpCount?: unknown }).dumpCount;
+      return typeof c === 'number' ? c : undefined;
+    };
+    const t0 = performance.now();
+    const d0 = dumps();
+    try {
+      await job();
+    } finally {
+      const d1 = dumps();
+      this.persistLog.push({
+        ms: Math.round((performance.now() - t0) * 100) / 100,
+        ...(d0 !== undefined && d1 !== undefined ? { dumps: d1 - d0 } : {}),
+      });
+      if (this.persistLog.length > PERSIST_SAMPLE_CAP) this.persistLog.splice(0, this.persistLog.length - PERSIST_SAMPLE_CAP);
     }
   }
 
@@ -1204,7 +1247,7 @@ export class CycleManager {
         }
       }
       const queued = this.enqueuePersist(sessionId, () =>
-        this.persist(
+        this.timePersist(() => this.persist(
           envelope,
           sessionId,
           cycleId,
@@ -1241,7 +1284,7 @@ export class CycleManager {
               ? { attention: options.attention, goalsEnabled: options.goalsEnabled === true }
               : {}),
           },
-        ),
+        )),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
     };

@@ -115,8 +115,21 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     return run;
   }
 
+  /** Number of full-dataset dumps written to disk since this adapter started. */
+  private dumpsWritten = 0;
+
+  /**
+   * Read-only counter of full-dataset dumps (one per completed flush attempt,
+   * after coalescing) since this adapter started. Numbers only; used by the
+   * soak metrics to estimate dumps per turn. It is never reset.
+   */
+  get dumpCount(): number {
+    return this.dumpsWritten;
+  }
+
   private async flushNow(): Promise<void> {
     try {
+      this.dumpsWritten++;
       const nquads = this.store.dump({ format: OxigraphAdapter.NQUADS_MIME });
       // Atomic write: write to a temp file then rename
       const tmp = `${this.dataFile}.tmp`;
