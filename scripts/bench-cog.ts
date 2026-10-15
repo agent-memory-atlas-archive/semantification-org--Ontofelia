@@ -2,8 +2,9 @@
  * Micro-benchmark for the cognitive layer's hot paths.
  *
  *   LOG_LEVEL=silent npx tsx scripts/bench-cog.ts [--traces N] [--episodes M] [--appends K] [--cycles C]
+ *                                                 [--recalls R] [--hot 1]
  *
- * Defaults are small (200 traces, 1000 episodes, 200 appends, 30 cycles). Needs
+ * Defaults are small (200 traces, 1000 episodes, 200 appends, 30 cycles, 60 recalls). Needs
  * the packages built (`pnpm turbo run build`). Always run it under a memory cap:
  *
  *   systemd-run --user --scope -p MemoryMax=4G env LOG_LEVEL=silent npx tsx scripts/bench-cog.ts
@@ -15,7 +16,13 @@
  *    made on every append;
  *  - the reply-path latency of one cycle with a mock core: cycle manager off,
  *    on with persistence queued, and on with persistence awaited;
- *  - procedural consolidation over N traces, and a second run that finds nothing.
+ *  - procedural consolidation over N traces, and a second run that finds nothing;
+ *  - Phase 2 (comprehension: scoped episodic recall plus one-hop facts) over the
+ *    M seeded episodes, with the target of 500 ms at p95. Rows: one resolved
+ *    entity; one pending entity resolved by the read-only lookup; no entity (only
+ *    the session). `--hot 1` makes every seeded episode about one shared entity
+ *    (the worst case for entity-anchored recall: each user then has M/5 episodes
+ *    about it).
  *
  * Budgets are printed as information; nothing here fails the build or the tests.
  * Seeding goes through one bulk load per graph (an `update` re-writes the whole
@@ -31,7 +38,10 @@ import {
   GraphRegistry,
   EpisodicMemory,
   ProceduralMemory,
+  KnowledgeEngine,
 } from '../packages/semantic-memory/dist/index.js';
+import { comprehend, PHASE2_BUDGET_MS } from '../packages/agent-runtime/dist/cognitive/Comprehension.js';
+import { buildPerception } from '../packages/agent-runtime/dist/cognitive/Perception.js';
 import { CycleManager } from '../packages/agent-runtime/dist/cognitive/CycleManager.js';
 
 const AGENT = 'ontofelia';
@@ -50,6 +60,8 @@ const N_TRACES = arg('traces', 200);
 const M_EPISODES = arg('episodes', 1000);
 const K_APPENDS = arg('appends', 200);
 const C_CYCLES = arg('cycles', 30);
+const R_RECALLS = arg('recalls', 60);
+const HOT = arg('hot', 0) > 0;
 
 function pct(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -77,7 +89,7 @@ async function main() {
   const em = new EpisodicMemory(store, AGENT);
   const pm = new ProceduralMemory(store, AGENT, registry);
 
-  console.log(`bench-cog  traces=${N_TRACES} episodes=${M_EPISODES} appends=${K_APPENDS} cycles=${C_CYCLES}`);
+  console.log(`bench-cog  traces=${N_TRACES} episodes=${M_EPISODES} appends=${K_APPENDS} cycles=${C_CYCLES} recalls=${R_RECALLS} hot=${HOT ? 1 : 0}`);
   console.log(`machine    ${os.cpus()[0]?.model ?? 'cpu'} x${os.cpus().length}, ${(os.totalmem() / 2 ** 30).toFixed(1)} GiB RAM, node ${process.version}`);
 
   // --- Seed -------------------------------------------------------------
@@ -91,7 +103,7 @@ async function main() {
       `${u} a <${COGT}Episode> ; <${COGT}episodeId> "ep_seed_${String(i).padStart(7, '0')}" ; <${COGT}episodeType> "message-received" ;`,
       `  <${COGT}occurredAt> "${when}"^^<${XSD}dateTime> ; <${COGT}salience> "0.6"^^<${XSD}decimal> ; <${COGT}sessionId> "seed-s${i % SESSIONS}" ;`,
       `  <${COGT}forUser> "urn:${AGENT}:user:u${i % 5}" ; <${COGT}payload> "seed message ${i} about topic ${i % 40}" ;`,
-      `  <${COGT}about> <urn:entity:E${i % 50}> , <urn:entity:E${(i + 7) % 50}> ; <${COGT}tags> "t${i % 9}" .`,
+      `  <${COGT}about> <urn:entity:E${i % 50}> , <urn:entity:E${(i + 7) % 50}>${HOT ? ' , <urn:entity:HOT>' : ''} ; <${COGT}tags> "t${i % 9}" .`,
     );
   }
   const trLines: string[] = [];
@@ -203,6 +215,74 @@ async function main() {
   console.log(`  first run:  ${ms(c1)}, scanned ${rep1?.tracesScanned}, skills ${rep1?.skillsUpserted}`);
   console.log(`  second run: ${ms(c2)}, scanned ${rep2?.tracesScanned}`);
 
+  // --- Phase 2: comprehension --------------------------------------------
+  // Facts for the entities: 6 in the worldview and 6 in each user's graph, plus a
+  // label per entity so the pending-entity lookup has something to find.
+  const ke = new KnowledgeEngine(store);
+  const CORE = 'urn:ontofelia:core#';
+  const world: string[] = [];
+  for (let e = 0; e < 50; e++) {
+    world.push(`<urn:entity:E${e}> <http://www.w3.org/2000/01/rdf-schema#label> "Entity ${e}" .`);
+    for (let k = 0; k < 6; k++) world.push(`<urn:entity:E${e}> <${CORE}rel${k}> "world value ${k} of ${e}" .`);
+  }
+  await store.putGraph(`urn:${AGENT}:worldview`, world.join('\n'));
+  for (let u = 0; u < 5; u++) {
+    const lines: string[] = [];
+    for (let e = 0; e < 50; e++) for (let k = 0; k < 6; k++) lines.push(`<urn:entity:E${e}> <${CORE}own${k}> "user ${u} value ${k} of ${e}" .`);
+    await store.putGraph(`urn:${AGENT}:user:u${u}`, lines.join('\n'));
+  }
+
+  console.log(`\nphase 2 comprehension (${M_EPISODES} episodes in the graph, 5 users, 50 entities${HOT ? ', every episode also about HOT' : ''})`);
+  const recallInput = (i: number, about: string[], pending: string[]) => {
+    const u = i % 5;
+    const base = buildPerception({ text: 'What about it?', senderIsOwner: false });
+    return {
+      userKey: `urn:${AGENT}:user:u${u}`,
+      userId: `u${u}`,
+      sessionId: `seed-s${(i * 3) % SESSIONS}`,
+      perception: { ...base, about, pending, entities: pending.map((name) => ({ name, iris: [] as string[] })), tags: ['question'] },
+    };
+  };
+  const run = async (i: number, about: string[], pending: string[]) => {
+    const inp = recallInput(i, about, pending);
+    const t = performance.now();
+    const r = await comprehend(
+      {
+        episodic: em,
+        entityFacts: (iris: string[]) => ke.getEntityFacts(iris, { agentId: AGENT, userId: inp.userId }),
+        resolveEntities: async (names: string[]) => {
+          const out = new Map<string, string[]>();
+          for (const n of names) out.set(n.toLowerCase(), await ke.lookupExistingEntityUris(n, { agentId: AGENT, userId: inp.userId }));
+          return out;
+        },
+      },
+      { userKey: inp.userKey, sessionId: inp.sessionId, perception: inp.perception, episodicEnabled: true },
+    );
+    return { ms: performance.now() - t, r };
+  };
+  const rows: Array<[string, (i: number) => Promise<{ ms: number; r: { entries: unknown[]; status: string; pendingResolved: boolean } }>]> = [
+    ['one resolved entity', (i) => run(i, [`urn:entity:${HOT ? 'HOT' : `E${i % 50}`}`], [])],
+    ['one pending entity (lookup first)', (i) => run(i, [], [`Entity ${i % 50}`])],
+    ['no entity (session only)', (i) => run(i, [], [])],
+  ];
+  let worstP95 = 0;
+  for (const [label, fn] of rows) {
+    await fn(0); // warm-up, not counted
+    const times: number[] = [];
+    let entries = 0;
+    let notOk = 0;
+    for (let i = 0; i < R_RECALLS; i++) {
+      const { ms: t, r } = await fn(i);
+      times.push(t);
+      entries += r.entries.length;
+      if (r.status !== 'ok') notOk++;
+    }
+    const st = stats(times);
+    worstP95 = Math.max(worstP95, st.p95);
+    line(label, st);
+    console.log(`  ${''.padEnd(44)} mean entries=${(entries / R_RECALLS).toFixed(1)}  not-ok=${notOk}`);
+  }
+
   // --- Budgets (information only) ----------------------------------------
   const rssMiB = process.resourceUsage().maxRSS / 1024;
   console.log('\nbudgets (informational, not enforced)');
@@ -210,6 +290,7 @@ async function main() {
   const q = stats(queued);
   const o = stats(off);
   console.log(`  queued cycle adds < 5 ms at p95 over core:  ${q.p95 - o.p95 < 5 ? 'within' : 'over'} (+${ms(q.p95 - o.p95)})`);
+  console.log(`  phase 2 p95 < ${PHASE2_BUDGET_MS} ms (worst row):            ${worstP95 < PHASE2_BUDGET_MS ? 'within' : 'over'} (${ms(worstP95)}) at ${M_EPISODES} episodes`);
   console.log(`peak RSS    ${rssMiB.toFixed(0)} MiB`);
 
   await store.stop().catch(() => undefined);
