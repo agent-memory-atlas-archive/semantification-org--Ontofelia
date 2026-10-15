@@ -74,6 +74,19 @@ export interface WMEntryInput {
   /** Lifetime in cycles; decremented on each carry-over. */
   expiresAfter?: number;
   forGoal?: string;
+  /**
+   * Action fields (`actionBuffer` only). Kept as plain literals: the doc's
+   * `actionType` is the entry kind here, and `toolArgs` is a keys-only brief.
+   */
+  toolName?: string;
+  /** Correlation id of the tool call; pairs an `action-result` to its proposal. */
+  callId?: string;
+  /** Keys-only, masked summary of the arguments. Never a value. */
+  toolArgs?: string;
+  /** Result of a tool call (`action-result`). */
+  outcome?: 'success' | 'error';
+  denialClass?: string;
+  durationMs?: number;
 }
 
 export interface WMEntry extends WMEntryInput {
@@ -277,6 +290,15 @@ export class WorkingMemory {
         `<${id}> <${COGT}expiresAfter> "${Math.trunc(entry.expiresAfter)}"^^<${XSD}integer> .`,
       );
     if (entry.forGoal) lines.push(`<${id}> <${COGT}forGoal> <${entry.forGoal}> .`);
+    if (entry.toolName) lines.push(`<${id}> <${COGT}toolName> "${escapeLiteral(entry.toolName)}" .`);
+    if (entry.callId) lines.push(`<${id}> <${COGT}callId> "${escapeLiteral(entry.callId)}" .`);
+    if (entry.toolArgs !== undefined)
+      lines.push(`<${id}> <${COGT}toolArgs> "${escapeLiteral(entry.toolArgs)}" .`);
+    if (entry.outcome) lines.push(`<${id}> <${COGT}outcome> "${escapeLiteral(entry.outcome)}" .`);
+    if (entry.denialClass)
+      lines.push(`<${id}> <${COGT}denialClass> "${escapeLiteral(entry.denialClass)}" .`);
+    if (entry.durationMs !== undefined)
+      lines.push(`<${id}> <${COGT}durationMs> "${Math.max(0, Math.trunc(entry.durationMs))}"^^<${XSD}integer> .`);
     if (this.forUser) lines.push(`<${id}> <${COGT}forUser> "${escapeLiteral(this.forUser)}" .`);
 
     await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
@@ -297,6 +319,7 @@ export class WorkingMemory {
       SELECT ?entry ?buffer ?writtenBy ?writtenAt ?kind ?payload ?salience
              ?refersTo ?sourceGraph ?retrievalScore ?carryForward ?expiresAfter
              ?forGoal ?carriedFrom ?forUser
+             ?toolName ?callId ?toolArgs ?outcome ?denialClass ?durationMs
       WHERE {
         GRAPH <${graph}> {
           ?entry a <${COGT}WorkingMemoryEntry> ;
@@ -314,6 +337,12 @@ export class WorkingMemory {
           OPTIONAL { ?entry <${COGT}forGoal>        ?forGoal . }
           OPTIONAL { ?entry <${COGT}carriedFrom>    ?carriedFrom . }
           OPTIONAL { ?entry <${COGT}forUser>        ?forUser . }
+          OPTIONAL { ?entry <${COGT}toolName>       ?toolName . }
+          OPTIONAL { ?entry <${COGT}callId>         ?callId . }
+          OPTIONAL { ?entry <${COGT}toolArgs>       ?toolArgs . }
+          OPTIONAL { ?entry <${COGT}outcome>        ?outcome . }
+          OPTIONAL { ?entry <${COGT}denialClass>    ?denialClass . }
+          OPTIONAL { ?entry <${COGT}durationMs>     ?durationMs . }
           ${filters.join('\n          ')}
         }
       }`;
@@ -340,6 +369,12 @@ export class WorkingMemory {
       if (r.forGoal) entry.forGoal = r.forGoal.value;
       if (r.carriedFrom) entry.carriedFrom = r.carriedFrom.value;
       if (r.forUser) entry.forUser = r.forUser.value;
+      if (r.toolName) entry.toolName = r.toolName.value;
+      if (r.callId) entry.callId = r.callId.value;
+      if (r.toolArgs) entry.toolArgs = r.toolArgs.value;
+      if (r.outcome && (r.outcome.value === 'success' || r.outcome.value === 'error')) entry.outcome = r.outcome.value;
+      if (r.denialClass) entry.denialClass = r.denialClass.value;
+      if (r.durationMs) entry.durationMs = num('durationMs');
       return entry;
     });
   }

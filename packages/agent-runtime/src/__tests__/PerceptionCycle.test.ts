@@ -304,7 +304,7 @@ describe('Phase 1 perceives before answering', () => {
     const e = await setup({ cycle: true, delayMs: 25 });
     await send(e);
     const phases = await rows(e.store, `
-      SELECT ?ord ?s ?e WHERE { GRAPH ?g { ?c <${COGT}hasPhase> ?p . ?p <${COGT}ordinal> ?ord ; <${COGT}startedAt> ?s ; <${COGT}endedAt> ?e } }`);
+      SELECT ?ord ?s ?e WHERE { GRAPH ?g { ?c <${COGT}hasPhase> ?p . ?p <${COGT}phaseIndex> ?ord ; <${COGT}startedAt> ?s ; <${COGT}endedAt> ?e } }`);
     expect(phases).toHaveLength(6);
     const ph = phases
       .map((r) => ({ ord: Number(r.ord.value), s: Date.parse(r.s.value), e: Date.parse(r.e.value) }))

@@ -65,7 +65,7 @@ describe('CycleManager', () => {
     expect(cycles.bindings![0].s.value).toBe('completed');
 
     const phases = await store.query(
-      `SELECT ?p ?o WHERE { GRAPH <${cyclesGraph}> { ?p a <${COGT}Phase> ; <${COGT}ordinal> ?o } }`,
+      `SELECT ?p ?o WHERE { GRAPH <${cyclesGraph}> { ?p a <${COGT}Phase> ; <${COGT}phaseIndex> ?o } }`,
     );
     expect(phases.bindings).toHaveLength(6);
     const ordinals = phases.bindings!.map((b) => Number(b.o.value)).sort((a, b) => a - b);

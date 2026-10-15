@@ -74,7 +74,7 @@ import { detectGoalSignal, entityOverlap, goalFromIntent, goalSalience } from '.
 import { writeGoalEpisode } from './GoalEpisodes.js';
 import { looksLikeSecret } from './privacyClass.js';
 import { classifySatisfaction } from './Satisfaction.js';
-import { redactToolArgs } from './ArgRedaction.js';
+import { defaultArgRedactionRules, redactToolArgs } from './ArgRedaction.js';
 import { CognitiveConfig } from './CognitiveConfig.js';
 import { neutraliseQuoted } from './untrustedText.js';
 import {
@@ -117,7 +117,7 @@ const COGT = 'urn:shared:ontology#cog/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 
-/** The six phase kinds, in cycle order; the array index + 1 is the ordinal. */
+/** The six phase kinds, in cycle order; the array index + 1 is the `phaseIndex`. */
 const PHASE_KINDS = [
   'perception',
   'comprehension',
@@ -126,6 +126,49 @@ const PHASE_KINDS = [
   'response',
   'reflection',
 ] as const;
+
+/**
+ * The phases that cover the delegated core (action, response). If the core
+ * threw, these two are marked `aborted`; the others ran to their end.
+ */
+const CORE_PHASE_INDEXES: ReadonlySet<number> = new Set([4, 5]);
+
+/** Most tool calls of one cycle that become action entries (bounds the WM writes). */
+const MAX_ACTION_CALLS = 25;
+/** Salience of an action entry: an audit trail, below the default θ, never prompt material. */
+const ACTION_SALIENCE = 0.4;
+/** Longest tool name kept in an action entry. */
+const ACTION_NAME_MAX = 120;
+
+/** One tool call as the action buffer sees it (masked; never an argument value). */
+interface ActionCall {
+  callId: string;
+  toolName: string;
+  /** Keys-only brief of the arguments. */
+  brief: string;
+  /** Paths of the arguments the redaction rules masked (no values, no hashes). */
+  maskedPaths: string[];
+  forGoal?: string;
+  result?: { outcome: 'success' | 'error'; denialClass?: string; durationMs?: number };
+}
+
+/** A tool name as stored in an action entry: inert characters only, bounded. */
+function safeToolName(name: string): string {
+  return String(name ?? '').replace(/[^A-Za-z0-9_.:\/-]/g, '_').slice(0, ACTION_NAME_MAX) || '_';
+}
+
+/** Fixed-format payload of an `action-proposal`. */
+function proposalPayload(c: ActionCall): string {
+  const masked = c.maskedPaths.length > 0 ? `; masked: ${c.maskedPaths.join(', ')}` : '';
+  return `tool-call ${safeToolName(c.toolName)}; args: ${c.brief || '(none)'}${masked}`;
+}
+
+/** Fixed-format payload of an `action-result`. */
+function resultPayload(c: ActionCall, r: NonNullable<ActionCall['result']>): string {
+  const denial = r.denialClass ? ` (${safeToolName(r.denialClass)})` : '';
+  const ms = r.durationMs !== undefined ? `, ${Math.max(0, Math.trunc(r.durationMs))} ms` : '';
+  return `tool-result ${safeToolName(c.toolName)}: ${r.outcome === 'success' ? 'ok' : 'error'}${denial}${ms}`;
+}
 
 export interface CycleResult<T> {
   cycleId: string;
@@ -677,7 +720,44 @@ export class CycleManager {
     // after the core completes (see writeEpisodicAndRetrieval). The closure is
     // per-cycle, so concurrent cycles never share state.
     const toolEvents: ToolEpisodeEvent[] = [];
+    // Action buffer (docs/cognitive-architecture/04): one masked proposal and one
+    // result per tool call, kept in memory here and written by the queued persist.
+    // Both cores (runCore, streamCore) report every call through `recordTool`, so
+    // this one observer covers the blocking and the streamed turn alike.
+    const actionCalls = new Map<string, ActionCall>();
+    const noteAction = (ev: ToolEpisodeEvent): void => {
+      try {
+        if (ev.phase === 'called') {
+          if (actionCalls.has(ev.callId) || actionCalls.size >= MAX_ACTION_CALLS) return;
+          const redacted =
+            ev.args !== undefined
+              ? redactToolArgs(ev.args, defaultArgRedactionRules())
+              : {
+                  brief: looksLikeSecret(ev.argsBrief) ? '' : String(ev.argsBrief ?? '').replace(/[^A-Za-z0-9_, -]/g, '_').slice(0, 400),
+                  masked: [] as Array<{ path: string }>,
+                };
+          actionCalls.set(ev.callId, {
+            callId: ev.callId,
+            toolName: ev.toolName,
+            brief: redacted.brief,
+            maskedPaths: redacted.masked.map((m) => m.path),
+            ...(activeGoalUri ? { forGoal: activeGoalUri } : {}),
+          });
+          return;
+        }
+        const call = actionCalls.get(ev.callId);
+        if (!call) return;
+        call.result = {
+          outcome: ev.outcome === 'success' ? 'success' : 'error',
+          ...(ev.denialClass ? { denialClass: ev.denialClass } : {}),
+          ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
+        };
+      } catch (e) {
+        this.onError?.(e);
+      }
+    };
     const recordTool: ToolEpisodeRecorder = (ev) => {
+      noteAction(ev);
       if (ev.args !== undefined && options.proceduralEnabled !== true) {
         const { args: _dropped, ...rest } = ev;
         toolEvents.push(rest);
@@ -989,6 +1069,40 @@ export class CycleManager {
         }
         metaEntries.push(...metaWm);
       }
+      // The action buffer of the turn: proposal (phase 4) then result (phase 5) per call.
+      const actions: Array<{ phase: 4 | 5; entry: WMEntryInput }> = [];
+      for (const c of actionCalls.values()) {
+        actions.push({
+          phase: 4,
+          entry: {
+            buffer: 'actionBuffer',
+            entryKind: 'action-proposal',
+            payload: proposalPayload(c),
+            salience: ACTION_SALIENCE,
+            toolName: safeToolName(c.toolName),
+            callId: c.callId,
+            toolArgs: c.brief,
+            ...(c.forGoal ? { forGoal: c.forGoal } : {}),
+          },
+        });
+        if (c.result) {
+          actions.push({
+            phase: 5,
+            entry: {
+              buffer: 'actionBuffer',
+              entryKind: 'action-result',
+              payload: resultPayload(c, c.result),
+              salience: ACTION_SALIENCE,
+              toolName: safeToolName(c.toolName),
+              callId: c.callId,
+              outcome: c.result.outcome,
+              ...(c.result.denialClass ? { denialClass: safeToolName(c.result.denialClass) } : {}),
+              ...(c.result.durationMs !== undefined ? { durationMs: c.result.durationMs } : {}),
+              ...(c.forGoal ? { forGoal: c.forGoal } : {}),
+            },
+          });
+        }
+      }
       const queued = this.enqueuePersist(sessionId, () =>
         this.persist(
           envelope,
@@ -1017,6 +1131,7 @@ export class CycleManager {
           comprehension,
           {
             wm: queuedWm,
+            actions,
             ...(shownTools ? { suggestedTools: shownTools } : {}),
             meta: metaEntries,
             ...(mcOn ? { signals, conflictGoals: options.goalsEnabled === true } : {}),
@@ -1589,6 +1704,8 @@ export class CycleManager {
     comprehension?: ComprehensionResult,
     extras: {
       wm: WMEntryInput[];
+      /** Action-buffer entries of the turn's tool calls, with the phase that wrote each. */
+      actions?: Array<{ phase: 4 | 5; entry: WMEntryInput }>;
       /** Tools named by the suggestions the prompt showed this turn; absent when none. */
       suggestedTools?: string[];
       /** Metacognition entries for the `metaBuffer` (the nudge, the churn warning). */
@@ -1661,6 +1778,23 @@ export class CycleManager {
     if (extras.wm.length > 0) {
       try {
         await this.writeQueuedWm(envelope, sessionId, cycleId, `${cycleUri}_3`, extras.wm, wmOpts);
+      } catch (e) {
+        this.onError?.(e);
+      }
+    }
+    // Action buffer: a masked proposal and a result per tool call (no entry on a turn without tools).
+    if (extras.actions && extras.actions.length > 0) {
+      try {
+        const wm = new WorkingMemory(
+          this.triplestore,
+          this.registry,
+          this.agentId,
+          sessionId,
+          cycleId,
+          cogUserKey(envelope.sender),
+          wmOpts,
+        );
+        for (const a of extras.actions) await wm.write(a.entry, `${cycleUri}_${a.phase}`);
       } catch (e) {
         this.onError?.(e);
       }
@@ -1765,6 +1899,9 @@ export class CycleManager {
         retrievalHits,
         goalConflict,
         selfModelEnabled,
+        sessionId,
+        activeGoalUri,
+        episodicEnabled,
         wmOverflow: overflow.dropped > 0 && extras.attention ? { dropped: overflow.dropped, capacity: extras.attention.capacity } : undefined,
         userKey: mode === 'initiative' ? OWNER_USER_KEY : cogUserKey(envelope.sender),
         ...(extras.signals
@@ -1800,6 +1937,10 @@ export class CycleManager {
     selfModelEnabled: boolean;
     wmOverflow?: { dropped: number; capacity: number };
     userKey?: string;
+    sessionId?: string;
+    activeGoalUri?: string;
+    /** Episodes (`impasse-flagged`, `meta-reflected`) are written only when true. */
+    episodicEnabled?: boolean;
     /** Conversational turn with the new signals; absent for an initiative cycle. */
     signals?: TurnSignals;
     intent?: string;
@@ -1826,6 +1967,14 @@ export class CycleManager {
           { agent: this.agentId, kind: flagged.kind, chronic: flagged.chronic, phase: input.flaggedInPhase },
           `impasse flagged: ${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}`,
         );
+        // The episode of the impasse: the kind and the detector's context (tool
+        // name and error class, never user text). Episodic flag only.
+        await this.appendMetaEpisode(ctx, {
+          episodeType: 'impasse-flagged',
+          payload: `${flagged.kind}${flagged.chronic ? ' (chronic)' : ''}: ${input.context}`,
+          tags: [flagged.kind],
+          forUser: input.forUser ?? ctx.userKey,
+        });
         const resolution = meta.pickResolution(flagged.kind, {
           attempt: 0,
           recentDensity: 0,
@@ -1894,6 +2043,45 @@ export class CycleManager {
           }
         : {}),
     });
+    // The episode of the reflection: a fixed-format line of the marker's counts.
+    await this.appendMetaEpisode(ctx, {
+      episodeType: 'meta-reflected',
+      payload:
+        `cycle ${cycleStatus}; tools ${toolsUsed}, tool errors ${toolErrors}, ` +
+        `impasses ${flaggedImpasse.length} flagged / ${resolvedImpasse.length} resolved` +
+        (sig ? `, uncertainty ${uncertaintyOf({ emptyRetrieval, intent: ctx.intent, toolErrors })}` : ''),
+      tags: [cycleStatus],
+      forUser: ctx.userKey,
+    });
+  }
+
+  /**
+   * Append a metacognition episode of the cycle (`impasse-flagged`,
+   * `meta-reflected`): gated by the episodic flag, carries the cycle id, the
+   * user key and the turn's goal where known. Best-effort; never throws.
+   */
+  private async appendMetaEpisode(
+    ctx: { cycleId: string; sessionId?: string; activeGoalUri?: string; episodicEnabled?: boolean },
+    ep: { episodeType: 'impasse-flagged' | 'meta-reflected'; payload: string; tags: string[]; forUser?: string },
+  ): Promise<void> {
+    if (ctx.episodicEnabled === false) return;
+    try {
+      await new EpisodicMemory(this.triplestore, this.agentId).append({
+        episodeType: ep.episodeType,
+        occurredAt: new Date(),
+        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+        cycleId: ctx.cycleId,
+        actor: `urn:${this.agentId}:self#${this.agentId}`,
+        ...(ep.forUser ? { forUser: ep.forUser } : {}),
+        ...(ctx.activeGoalUri ? { partOfGoal: ctx.activeGoalUri } : {}),
+        ...this.privacyOf(ep.payload),
+        payload: ep.payload,
+        tags: ep.tags,
+        salience: 0.3,
+      });
+    } catch (e) {
+      this.onError?.(e);
+    }
   }
 
   /**
@@ -2622,6 +2810,10 @@ export class CycleManager {
     const lines: string[] = [
       `<${cycleUri}> <${RDF_TYPE}> <${COGT}Cycle> .`,
       `<${cycleUri}> <${COGT}cycleStatus> "${status}" .`,
+      // Doc 03 §1 names: the cycle's id and session as plain literals, so a cycle
+      // joins the episodes (which carry `cogt:cycleId`) in one query.
+      `<${cycleUri}> <${COGT}cycleId> "${escapeLiteral(cycleUri.slice(cycleUri.lastIndexOf(':') + 1))}" .`,
+      `<${cycleUri}> <${COGT}sessionId> "${escapeLiteral(sessionId)}" .`,
       `<${cycleUri}> <${COGT}startedAt> ${dt(tStart)} .`,
       `<${cycleUri}> <${COGT}endedAt> ${dt(tEnd)} .`,
       `<${cycleUri}> <${COGT}forUser> "${escapeLiteral(userKey)}" .`,
@@ -2664,14 +2856,19 @@ export class CycleManager {
     ];
 
     PHASE_KINDS.forEach((kind, i) => {
-      const ordinal = i + 1;
-      const phaseUri = `${cycleUri}_${ordinal}`;
-      const [s, e] = span(ordinal);
+      const phaseIndex = i + 1;
+      const phaseUri = `${cycleUri}_${phaseIndex}`;
+      const [s, e] = span(phaseIndex);
+      // Doc names (03 §1, §10): hasPhase, phaseIndex, phaseStatus. `partOfCycle`
+      // (the inverse link) and `phaseKind` are kept; the old `ordinal` is no
+      // longer written (the inspector still reads it on stored cycles).
+      const phaseStatus = status === 'aborted' && CORE_PHASE_INDEXES.has(phaseIndex) ? 'aborted' : 'completed';
       lines.push(`<${cycleUri}> <${COGT}hasPhase> <${phaseUri}> .`);
       lines.push(`<${phaseUri}> <${RDF_TYPE}> <${COGT}Phase> .`);
       lines.push(`<${phaseUri}> <${COGT}partOfCycle> <${cycleUri}> .`);
       lines.push(`<${phaseUri}> <${COGT}phaseKind> "${escapeLiteral(kind)}" .`);
-      lines.push(`<${phaseUri}> <${COGT}ordinal> "${ordinal}"^^<${XSD}integer> .`);
+      lines.push(`<${phaseUri}> <${COGT}phaseIndex> "${phaseIndex}"^^<${XSD}integer> .`);
+      lines.push(`<${phaseUri}> <${COGT}phaseStatus> "${phaseStatus}" .`);
       lines.push(`<${phaseUri}> <${COGT}startedAt> ${dt(s)} .`);
       lines.push(`<${phaseUri}> <${COGT}endedAt> ${dt(e)} .`);
     });
