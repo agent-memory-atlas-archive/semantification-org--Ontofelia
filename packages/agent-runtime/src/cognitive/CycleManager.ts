@@ -8,7 +8,8 @@
  * reifies the cognitive record around it:
  *
  *   1 Perception      — message text / sender onto the perception buffer (B5)
- *   2 Comprehension   — (reserved; no work in Phase B)
+ *   2 Comprehension   — episodic and semantic recall for the turn, read-only,
+ *                       before the LLM call (Comprehension.ts)
  *   3 Goal management ┐
  *   4 Action          ├ delegated to `core()` (the legacy LLM + tool loop)
  *   5 Response        ┘
@@ -33,6 +34,7 @@ import {
   GraphRegistry,
   GraphUriResolver,
   EpisodicMemory,
+  sparqlIri,
   ProceduralMemory,
   SelfModel,
   type TraceInput,
@@ -41,6 +43,11 @@ import {
 import { WorkingMemory } from './WorkingMemory.js';
 import { GoalStack, RESPOND_TO_USER, type Goal, type GoalViewer } from './GoalStack.js';
 import { looksLikeSecret } from './privacyClass.js';
+import {
+  comprehend,
+  type ComprehensionResult,
+  type ComprehensionDeps,
+} from './Comprehension.js';
 import { buildPerception, resolvePerception, type Perception, type PerceptionSource } from './Perception.js';
 import {
   Metacognition,
@@ -48,9 +55,6 @@ import {
   type ImpasseKind,
   type ReflectiveMarkerInput,
 } from './Metacognition.js';
-
-/** How many past episodes Phase 2 may pull into the retrieval buffer (C4). */
-const RETRIEVAL_K = 5;
 
 /** How many learned skills Phase 3 may surface for the active goal type (E4). */
 const SKILL_SUGGESTION_K = 5;
@@ -124,12 +128,23 @@ export type InboundEpisodeRecorder = (sessionId: string) => Promise<string | und
  */
 export type PerceptionRecorder = (source: PerceptionSource) => Perception;
 
-/** The delegated core; receives the tool sink and the goal-context hook. */
+/**
+ * Phase 2 hook. The core calls it once per turn after perception and before the
+ * goal hook and the LLM call. It only reads (episodes of the sender, one-hop
+ * facts of the perceived entities); the result stays in memory for the later
+ * phases and reaches the retrieval buffer only through the queued persist.
+ * Resolves to `undefined` on an unattended cycle and when the read itself
+ * failed; it never throws.
+ */
+export type ComprehensionRecorder = (sessionId: string) => Promise<ComprehensionResult | undefined>;
+
+/** The delegated core; receives the tool sink and the phase hooks. */
 export type CoreFn<T> = (
   recordTool: ToolEpisodeRecorder,
   prepareGoals: GoalContextProvider,
   recordInbound: InboundEpisodeRecorder,
   perceive: PerceptionRecorder,
+  comprehendHook: ComprehensionRecorder,
 ) => Promise<T>;
 
 /** The delegated streaming core: yields the consumer's chunks as they happen. */
@@ -138,6 +153,7 @@ export type StreamCoreFn<C> = (
   prepareGoals: GoalContextProvider,
   recordInbound: InboundEpisodeRecorder,
   perceive: PerceptionRecorder,
+  comprehendHook: ComprehensionRecorder,
 ) => AsyncIterable<C>;
 
 export interface RunCycleOptions {
@@ -185,6 +201,18 @@ export interface RunCycleOptions {
    * `onError` and leaves the names unresolved.
    */
   resolveEntities?: (names: string[]) => Promise<Map<string, string[]>>;
+  /**
+   * Read-only one-hop facts of entity IRIs for this turn's sender (their own
+   * graph and the worldview). Called from Phase 2, before the LLM call; absent
+   * means no semantic recall.
+   */
+  entityFacts?: ComprehensionDeps['entityFacts'];
+  /**
+   * `cog.flagEpisodicRecall`. In this version it only records whether a later
+   * step may put the recalled entries into the prompt; the recall itself, the
+   * working-memory entries and the marker bit follow the cycle flag alone.
+   */
+  episodicRecallEnabled?: boolean;
   /**
    * Cycle mode (docs/initiative-architecture.md §6). `'conversational'` (the
    * default) is byte-for-byte the prior behaviour. `'initiative'` runs an
@@ -362,7 +390,7 @@ export class CycleManager {
     let coreError: unknown;
     let status: 'completed' | 'aborted' = 'completed';
     try {
-      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive);
+      result = await core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive, cycle.comprehend);
     } catch (e) {
       status = 'aborted';
       coreError = e;
@@ -412,7 +440,7 @@ export class CycleManager {
     let coreDone = false;
     let coreFailed = false;
     let status: 'completed' | 'aborted';
-    const inner = core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive);
+    const inner = core(cycle.recordTool, cycle.prepareGoals, cycle.recordInbound, cycle.perceive, cycle.comprehend);
     try {
       for await (const chunk of inner) {
         try {
@@ -490,6 +518,63 @@ export class CycleManager {
       marks.perceivedAt = new Date();
       return perception;
     };
+    let inboundEpisodeUri: string | undefined;
+    // Phase 2 in memory. Read-only: the result is kept for the later phases and
+    // written to the retrieval buffer by the queued persist.
+    let comprehension: ComprehensionResult | undefined;
+    // Set when Phase 2 already looked up the pending entities to the end, so the
+    // queued persist does not repeat the lookup.
+    let pendingResolved = false;
+    const comprehendHook: ComprehensionRecorder = async (sessionId) => {
+      if (mode !== 'conversational') return undefined;
+      try {
+        const userKey = cogUserKey(envelope.sender);
+        // The active goal for this sender (read-only); the implicit
+        // RespondToUser goal is filtered out by comprehend().
+        let goal: Goal | undefined;
+        if (options.goalsEnabled) {
+          try {
+            const active = await new GoalStack(
+              this.triplestore,
+              this.registry,
+              this.agentId,
+              sessionId,
+              undefined,
+              this.viewerOf(envelope),
+            ).active();
+            goal = active.find((g) => g.goalType !== RESPOND_TO_USER);
+          } catch (e) {
+            this.onError?.(e);
+          }
+        }
+        const result = await comprehend(
+          {
+            episodic: new EpisodicMemory(this.triplestore, this.agentId),
+            entityFacts: options.entityFacts,
+            resolveEntities: options.resolveEntities,
+            onError: (e) => this.onError?.(e),
+          },
+          {
+            userKey,
+            sessionId,
+            perception,
+            activeGoalUri: goal?.uri,
+            activeGoalType: goal?.goalType,
+            inboundEpisodeUri,
+            episodicEnabled: options.episodicEnabled !== false,
+          },
+        );
+        comprehension = result;
+        if (result.pendingResolved && result.perception) {
+          perception = result.perception;
+          pendingResolved = true;
+        }
+        return result;
+      } catch (e) {
+        this.onError?.(e);
+        return undefined;
+      }
+    };
     const prepareGoalsInner: GoalContextProvider = async (sessionId) => {
       if (!options.goalsEnabled) return undefined;
       try {
@@ -542,7 +627,7 @@ export class CycleManager {
     // The inbound episode is written ahead of the core (conversational turns
     // only) so tools can reference it as a goal mandate. persist() reuses it
     // instead of writing a second one.
-    let inboundEpisodeUri: string | undefined;
+    // (declared above, before the Phase 2 hook that must exclude it)
     // The `about` the inbound episode was written with (before resolution).
     let inboundAbout: string[] = [];
     const recordInbound: InboundEpisodeRecorder = async (sessionId) => {
@@ -601,14 +686,15 @@ export class CycleManager {
           options.episodicEnabled !== false,
           perception,
           { ...marks, coreEnd: endedAt },
-          options.resolveEntities,
+          pendingResolved ? undefined : options.resolveEntities,
           inboundAbout,
+          comprehension,
         ),
       );
       if (options.awaitPersist ?? this.defaults.awaitPersist ?? false) await queued;
     };
 
-    return { recordTool, prepareGoals, recordInbound, perceive, finish };
+    return { recordTool, prepareGoals, recordInbound, perceive, comprehend: comprehendHook, finish };
   }
 
   /**
@@ -814,6 +900,7 @@ export class CycleManager {
     marks: PhaseMarks = { cycleStart: startedAt, coreEnd: endedAt },
     resolveEntities?: RunCycleOptions['resolveEntities'],
     inboundAbout: string[] = [],
+    comprehension?: ComprehensionResult,
   ): Promise<void> {
     const perceptionPhaseUri = `${cycleUri}_1`;
     // Conversational turns write the perception record (computed before the LLM
@@ -851,21 +938,26 @@ export class CycleManager {
       }
     }
     await this.writePerception(envelope, sessionId, cycleId, perceptionPhaseUri, record);
-    const { retrievalHits } = episodicEnabled
-      ? await this.writeEpisodicAndRetrieval(
-      envelope,
-      sessionId,
-      cycleId,
-      cycleUri,
-      startedAt,
-      endedAt,
-      responseText,
-      toolEvents,
-      activeGoalUri,
-      inboundEpisodeUri,
-      record,
-    )
-      : { retrievalHits: 0 };
+    // Phase 2 result (computed before the LLM call) onto the retrieval buffer.
+    // An empty recall writes nothing; the marker bit reads the entry count.
+    const retrievalHits = comprehension?.entries.length ?? 0;
+    if (comprehension && retrievalHits > 0) {
+      await this.writeRecall(envelope, sessionId, cycleId, `${cycleUri}_2`, comprehension);
+    }
+    if (episodicEnabled) {
+      await this.writeEpisodes(
+        envelope,
+        sessionId,
+        cycleId,
+        startedAt,
+        endedAt,
+        responseText,
+        toolEvents,
+        activeGoalUri,
+        inboundEpisodeUri,
+        record,
+      );
+    }
     // Initiative episode (docs/initiative-architecture.md §6): one auditable
     // record per unattended cycle — trigger, outcome and reason. Written only in
     // initiative mode, so conversational persistence is byte-identical.
@@ -1271,23 +1363,66 @@ export class CycleManager {
   }
 
   /**
-   * Episodic memory + retrieval (Phase C, C2 + C4 + the response half of C3).
-   *
-   *  - Phase 1 records a `message-received` episode (actor = sender, payload =
-   *    text, transcriptRef = session) chained to the session's prior episode.
-   *  - Phase 2 retrieves up to K relevant *past* episodes and writes them onto
-   *    the retrieval buffer with `retrievalScore` and `sourceGraph` provenance.
-   *  - Phase 5 records a `response-sent` episode for the textual reply.
-   *
-   *  - Phase 5 also records `tool-called` / `tool-completed` episodes for each
-   *    tool the core invoked (C3), replayed here in arrival order so the
-   *    narrative chain stays temporally correct.
+   * Write this turn's recall (Phase 2) onto the retrieval buffer, best first.
+   * Each entry carries its score as `retrievalScore` (and as salience) and the
+   * graph it was read from; the working memory stamps the sender's user key on
+   * every entry.
    */
-  private async writeEpisodicAndRetrieval(
+  private async writeRecall(
     envelope: MessageEnvelope,
     sessionId: string,
     cycleId: string,
-    cycleUri: string,
+    phaseUri: string,
+    comprehension: ComprehensionResult,
+  ): Promise<void> {
+    const wm = new WorkingMemory(
+      this.triplestore,
+      this.registry,
+      this.agentId,
+      sessionId,
+      cycleId,
+      cogUserKey(envelope.sender),
+    );
+    for (const e of comprehension.entries) {
+      // The working memory writes the reference as a bare IRI: only a safe one is kept.
+      let refersTo: string | undefined = e.refersTo;
+      try {
+        sparqlIri(e.refersTo);
+      } catch {
+        refersTo = undefined;
+      }
+      await wm.write(
+        {
+          buffer: 'retrievalBuffer',
+          entryKind: e.kind,
+          payload: e.payload,
+          salience: e.score,
+          retrievalScore: e.score,
+          sourceGraph: e.sourceGraph,
+          ...(refersTo ? { refersTo } : {}),
+        },
+        phaseUri,
+      );
+    }
+  }
+
+  /**
+   * Episodic memory writes (Phase C, C2 + the response half of C3).
+   *
+   *  - Phase 1 records a `message-received` episode (actor = sender, payload =
+   *    text, transcriptRef = session) chained to the session's prior episode.
+   *  - Phase 5 records a `response-sent` episode for the textual reply.
+   *  - Phase 5 also records `tool-called` / `tool-completed` episodes for each
+   *    tool the core invoked (C3), replayed here in arrival order so the
+   *    narrative chain stays temporally correct.
+   *
+   * Recall is not done here: it happens once, before the answer (Phase 2,
+   * Comprehension.ts).
+   */
+  private async writeEpisodes(
+    envelope: MessageEnvelope,
+    sessionId: string,
+    cycleId: string,
     startedAt: Date,
     endedAt: Date,
     responseText?: string,
@@ -1295,53 +1430,15 @@ export class CycleManager {
     activeGoalUri?: string,
     inboundEpisodeUri?: string,
     perception?: Perception,
-  ): Promise<{ retrievalHits: number }> {
-    let retrievalHits = 0;
+  ): Promise<void> {
     const em = new EpisodicMemory(this.triplestore, this.agentId);
-    const text = envelope.text || '';
     const channel = envelope.channel ? String(envelope.channel) : undefined;
     const userKey = cogUserKey(envelope.sender);
 
     // C2 — perception episode (already written ahead of the core on a
     // conversational turn; see runCycle).
-    const perceptionEpUri =
-      inboundEpisodeUri ??
-      (await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri, perception));
-
-    // C4 — pull relevant *past* episodes into the retrieval buffer (excluding
-    // the one we just wrote for this turn).
-    if (text) {
-      // Scoped to this sender: never another user's episodes (legacy episodes
-      // without a user key are owner-only, see EpisodicMemory).
-      const hits = (await em.retrieve(text, RETRIEVAL_K, userKey, { sessionId })).filter(
-        (h) => h.uri !== perceptionEpUri,
-      );
-      retrievalHits = hits.length;
-      if (hits.length > 0) {
-        const wm = new WorkingMemory(
-          this.triplestore,
-          this.registry,
-          this.agentId,
-          sessionId,
-          cycleId,
-          userKey,
-        );
-        const comprehensionPhaseUri = `${cycleUri}_2`;
-        for (const h of hits) {
-          await wm.write(
-            {
-              buffer: 'retrievalBuffer',
-              entryKind: 'episode-ref',
-              payload: h.payload ?? h.episodeType,
-              salience: h.relevanceScore,
-              retrievalScore: h.relevanceScore,
-              sourceGraph: em.graphUri(),
-              refersTo: h.uri,
-            },
-            comprehensionPhaseUri,
-          );
-        }
-      }
+    if (!inboundEpisodeUri) {
+      await this.appendInboundEpisode(envelope, sessionId, cycleId, startedAt, activeGoalUri, perception);
     }
 
     // C3 — tool-called / tool-completed episodes, in arrival order.
@@ -1390,7 +1487,6 @@ export class CycleManager {
         partOfGoal: activeGoalUri,
       });
     }
-    return { retrievalHits };
   }
 
   /**

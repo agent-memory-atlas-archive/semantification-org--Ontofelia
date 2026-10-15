@@ -356,7 +356,7 @@ describe('Phase 1 perceives before answering', () => {
     expect(resp.map((r) => r.a.value).sort()).toEqual(nodes);
   });
 
-  it('a label-matched entity whose URI differs from the slug: about holds that node and the inbound episode is only added to', async () => {
+  it('a label-matched entity whose URI differs from the slug: Phase 2 resolves it before the answer, so the inbound episode carries it from the start', async () => {
     const custom = 'urn:ontofelia:entity:custom-zoe-7';
     const e = await setup({
       cycle: true, parsed: NO_FACTS,
@@ -370,16 +370,16 @@ describe('Phase 1 perceives before answering', () => {
     expect(ep.abouts).toEqual([custom]);
     expect(await nerRefs(e)).toEqual([custom]);
     expect(JSON.stringify(e.updates)).not.toContain('entity:Zoe>'); // no slug guess stored anywhere
-    // The episode was written once, before the tool loop, and extended in the persist.
+    // The episode was written once, with the node, before the tool loop; nothing was added later.
     const eps = await rows(e.store, `SELECT ?ep WHERE { GRAPH ?g { ?ep <${COGT}episodeType> "message-received" } }`);
     expect(eps).toHaveLength(1);
     const writes = e.updates.filter((q) => q.includes('"message-received"'));
     expect(writes).toHaveLength(1);
-    expect(writes[0]).not.toContain(`${COGT}about`);
-    expect(e.updates.some((q) => q.startsWith('INSERT DATA') && q.includes(`${COGT}about> <${custom}>`) && !q.includes('"message-received"'))).toBe(true);
+    expect(writes[0]).toContain(`${COGT}about> <${custom}>`);
+    expect(e.updates.some((q) => q.startsWith('INSERT DATA') && q.includes(`${COGT}about> <${custom}>`) && !q.includes('"message-received"') && !q.includes('"response-sent"'))).toBe(false);
     // The write before the answer call is still just the inbound episode.
     expect(e.probe.answerCalls[0].writesBefore).toBeGreaterThan(0);
-    expect(e.updates.slice(0, e.probe.answerCalls[0].writesBefore).some((q) => q.includes(`${COGT}about> <${custom}>`))).toBe(false);
+    expect(e.updates.slice(0, e.probe.answerCalls[0].writesBefore).filter((q) => q.includes(`${COGT}Episode>`))).toHaveLength(1);
   });
 
   it('a name no node carries produces no about and no ner-result', async () => {

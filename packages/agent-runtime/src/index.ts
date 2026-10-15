@@ -15,7 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { GuardianPolicy } from './GuardianPolicy.js';
 import { CogCleanup, type CleanupReport } from './cognitive/CogCleanup.js';
-import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder, type PerceptionRecorder } from './cognitive/CycleManager.js';
+import { CycleManager, type ToolEpisodeRecorder, type GoalContextProvider, type InboundEpisodeRecorder, type PerceptionRecorder, type ComprehensionRecorder } from './cognitive/CycleManager.js';
 import type { PerceptionSource } from './cognitive/Perception.js';
 import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult } from './cognitive/updateGoalStep.js';
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
@@ -31,7 +31,8 @@ import {
 import type { Goal, GoalViewer } from './cognitive/GoalStack.js';
 import { summarizeGoal, orderGoals, isOpenGoal } from './cognitive/goalSummary.js';
 import type { GoalSummary } from './cognitive/goalSummary.js';
-import type { EpisodeHit } from '@ontofelia/semantic-memory';
+import type { EpisodeHit, EntityFact } from '@ontofelia/semantic-memory';
+import { FACTS_PER_ENTITY } from './cognitive/Comprehension.js';
 
 // Initiative runtime (docs/initiative-architecture.md §5–§7). Re-exported so the
 // gateway composition root can construct and wire the service.
@@ -1145,6 +1146,20 @@ Users can use these commands:
     };
   }
 
+  /**
+   * Read-only one-hop facts of entity IRIs for this turn's sender, for Phase 2.
+   * Same scope as {@link entityResolverFor}: the worldview and the sender's own
+   * graph, never another user's.
+   */
+  private entityFactsFor(
+    envelope: MessageEnvelope,
+  ): ((entityIris: string[]) => Promise<EntityFact[]>) | undefined {
+    const ke = this.knowledgeEngine;
+    if (!ke) return undefined;
+    const scope = { agentId: this.agentId, userId: envelope.sender.id };
+    return (iris) => ke.getEntityFacts(iris, scope, { limitPerEntity: FACTS_PER_ENTITY });
+  }
+
   async handleMessage(envelope: MessageEnvelope): Promise<AgentResponse> {
     this.activeRuns++;
     this.totalRuns++;
@@ -1209,14 +1224,17 @@ Users can use these commands:
         const metacognitionEnabled = await this.cognitiveConfig.isMetacognitionEnabled();
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
+        const episodicRecallEnabled = await this.cognitiveConfig.isEpisodicRecallEnabled();
         return await this.cycleManager.runCycle(
           envelope,
-          (recordTool, prepareGoals, recordInbound, perceive) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive),
+          (recordTool, prepareGoals, recordInbound, perceive, comprehend) => this.runCore(envelope, recordTool, prepareGoals, recordInbound, undefined, perceive, comprehend),
           (r) => r.sessionId,
           (r) => r.text,
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
+            episodicRecallEnabled,
             resolveEntities: this.entityResolverFor(envelope),
+            entityFacts: this.entityFactsFor(envelope),
             // Surface the cognitive phases on the live debug stream so the
             // status UI can show them explicitly alongside tool usage.
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
@@ -1806,12 +1824,18 @@ Users can use these commands:
     recordInbound?: InboundEpisodeRecorder,
     maxRounds: number = MAX_TOOL_ROUNDS,
     perceive?: PerceptionRecorder,
+    comprehend?: ComprehensionRecorder,
   ): Promise<AgentResponse> {
       const ctx = await this.buildContext(envelope);
       const { session, origin, messages, resolvedWorkspace, currentModel } = ctx;
 
       // Phase 1 — perceive before answering: in memory only, no store access.
       perceive?.(ctx.perceptionSource);
+
+      // Phase 2 — comprehension, read-only and before the LLM call: the recall
+      // stays in the cycle's memory (nothing goes into the prompt yet) and is
+      // written to working memory by the queued persist.
+      await comprehend?.(session.sessionId);
 
       // Phase 4 (Phase D) — splice the `[Active goal]` section into the system
       // prompt once the session is known. Gated: on the legacy path prepareGoals
@@ -2074,9 +2098,10 @@ Users can use these commands:
         const metacognitionEnabled = await this.cognitiveConfig.isMetacognitionEnabled();
         const selfModelEnabled = await this.cognitiveConfig.isSelfModelQueryEnabled();
         const episodicEnabled = await this.cognitiveConfig.isEpisodicMemoryEnabled();
+        const episodicRecallEnabled = await this.cognitiveConfig.isEpisodicRecallEnabled();
         yield* this.cycleManager.runCycleStream<StreamChunk>(
           envelope,
-          (recordTool, prepareGoals, recordInbound, perceive) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound, perceive),
+          (recordTool, prepareGoals, recordInbound, perceive, comprehend) => this.streamCore(envelope, recordTool, prepareGoals, recordInbound, perceive, comprehend),
           (chunk) =>
             chunk.type === 'stream_start'
               ? { sessionId: chunk.sessionId }
@@ -2085,7 +2110,9 @@ Users can use these commands:
                 : undefined,
           {
             goalsEnabled, proceduralEnabled, metacognitionEnabled, selfModelEnabled, episodicEnabled,
+            episodicRecallEnabled,
             resolveEntities: this.entityResolverFor(envelope),
+            entityFacts: this.entityFactsFor(envelope),
             onPhase: (phase, label, data) => this.emitDebug(phase, label, data),
           },
         );
@@ -2108,6 +2135,7 @@ Users can use these commands:
     prepareGoals?: GoalContextProvider,
     recordInbound?: InboundEpisodeRecorder,
     perceive?: PerceptionRecorder,
+    comprehend?: ComprehensionRecorder,
   ): AsyncGenerator<StreamChunk> {
     {
       const ctx = await this.buildContext(envelope);
@@ -2115,6 +2143,9 @@ Users can use these commands:
 
       // Phase 1 — same as runCore.
       perceive?.(ctx.perceptionSource);
+
+      // Phase 2 — same as runCore.
+      await comprehend?.(session.sessionId);
 
       // Same goal / skill / self prompt splice as runCore.
       if (prepareGoals) {

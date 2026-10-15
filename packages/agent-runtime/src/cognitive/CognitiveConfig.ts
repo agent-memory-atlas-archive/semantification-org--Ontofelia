@@ -34,6 +34,7 @@ export interface CognitiveFlagInfo {
 export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
   { name: 'flagCycleManager', key: 'cycleManager', description: 'Route messages through the six-phase cognitive cycle.' },
   { name: 'flagEpisodicMemory', key: 'episodicMemory', description: 'Let the cycle write episodes (messages, tools, replies); arm_goal needs this.' },
+  { name: 'flagEpisodicRecall', key: 'episodicRecall', description: 'Allow the recalled episodes and facts to be injected into the prompt (recall itself follows the cycle flag; nothing is injected yet).' },
   { name: 'flagGoalStack', key: 'goalStack', description: 'Manage an explicit goal stack in the cycle.' },
   { name: 'flagProceduralMemory', key: 'proceduralMemory', description: 'Record skill traces per tool call and suggest skills.' },
   { name: 'flagMetacognition', key: 'metacognition', description: 'Raise impasses and write the full reflective marker.' },
@@ -185,6 +186,22 @@ export class CognitiveConfig {
   /** Set (or clear) the episodic-memory flag in the setup graph. */
   async setEpisodicMemoryEnabled(enabled: boolean): Promise<void> {
     return this.setFlag('flagEpisodicMemory', enabled);
+  }
+
+  /**
+   * Whether the recall computed in Phase 2 may be injected into the prompt.
+   * Defaults to `false`. The recall itself (reads, retrieval-buffer entries,
+   * the marker bit) runs with the cycle flag alone; this flag only marks that a
+   * later step may put the recalled entries into the prompt. In this version
+   * nothing is injected either way.
+   */
+  async isEpisodicRecallEnabled(): Promise<boolean> {
+    return this.isFlagEnabled('flagEpisodicRecall');
+  }
+
+  /** Set (or clear) the episodic-recall flag in the setup graph. */
+  async setEpisodicRecallEnabled(enabled: boolean): Promise<void> {
+    return this.setFlag('flagEpisodicRecall', enabled);
   }
 
   /** Read any flag on the {@link COGNITIVE_FLAGS} allowlist by its exact name. */

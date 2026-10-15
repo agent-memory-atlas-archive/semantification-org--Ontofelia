@@ -89,8 +89,8 @@ describe('/cog flags and /cog flag <name> on|off', () => {
     await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('knows exactly nine flags and all of them default to off', async () => {
-    expect(COGNITIVE_FLAGS).toHaveLength(9);
+  it('knows exactly ten flags and all of them default to off', async () => {
+    expect(COGNITIVE_FLAGS).toHaveLength(10);
     expect(Object.values(await allValues()).every((v) => v === false)).toBe(true);
   });
 
@@ -157,17 +157,21 @@ describe('/cog flags and /cog flag <name> on|off', () => {
     expect(await allValues()).toEqual(before);
   });
 
-  it('/cog health shows all nine flags and follows the commands', async () => {
+  it('/cog health shows all ten flags and follows the commands', async () => {
     const read = async () => {
       const text = (await runtime.handleMessage(env('/cog health'))).text;
       return JSON.parse(text.replace(/^```json\n/, '').replace(/\n```$/, '')) as { flags: Record<string, boolean> };
     };
     const first = await read();
-    expect(Object.keys(first.flags)).toHaveLength(9);
+    expect(Object.keys(first.flags)).toHaveLength(10);
     expect(Object.keys(first.flags).sort()).toEqual(COGNITIVE_FLAGS.map((f) => f.key).sort());
     expect(Object.values(first.flags).every((v) => v === false)).toBe(true);
     await runtime.handleMessage(env('/cog flag episodicmemory on'));
     expect((await read()).flags.episodicMemory).toBe(true);
+    await runtime.handleMessage(env('/cog flag episodicrecall on'));
+    const after = await read();
+    expect(after.flags.episodicRecall).toBe(true);
+    expect(after.flags.episodicMemory).toBe(true);
   });
 
   it('/help mentions both commands for the owner', async () => {

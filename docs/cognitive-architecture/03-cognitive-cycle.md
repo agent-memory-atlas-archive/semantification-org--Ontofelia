@@ -159,6 +159,41 @@ score = recency_decay(occurredAt) * entity_overlap(entry, query) * specificity(g
 
 with `specificity(user) > specificity(worldview) > specificity(shared:world)`.
 
+**As implemented** (`Comprehension.ts`; read-only, before the LLM call, after
+perception, only with the cycle flag on):
+
+- Episodes are read with the sender's own user key as mandatory scope (the
+  owner's key for the owner, never the all-users scope): entity-anchored
+  (`cogt:about` a perceived entity IRI, across sessions), goal-anchored
+  (`cogt:partOfGoal` the sender's active goal, goal stack on; the implicit
+  RespondToUser goal anchors nothing) and session-temporal (the newest five of
+  this session). Per entity and goal the newest 30 of the sender are candidates.
+  Tool episodes, payload-less (warm) episodes and credential-shaped payloads are
+  not recalled; the turn's own inbound episode never is.
+- Episode score is the doc 05 §5.4 formula, each component in [0, 1]: entity =
+  share of the perceived entity IRIs the episode is about, goal = 1 if part of
+  the active goal, recency = exp(-hours/168), tag = share of the perceived tags
+  (the intent label) the episode carries.
+- One-hop facts of each perceived entity come from the sender's own graph and the
+  worldview only (`KnowledgeEngine.getEntityFacts`). A fact is scored
+  `0.4 + 0.3 * specificity` with user 1.0, worldview 0.6, shared world 0.3 (the
+  shared world graph is not read: nothing writes it). An `out` fact whose value
+  was replaced by belief revision in a graph the sender may read carries a
+  `changed` note with the previous value (conflicts graph joined to the claims
+  graph).
+- The best eight entries (episodes and facts together) are kept, each with its
+  `forUser`. They are written to the retrieval buffer by the queued persist, off
+  the reply path; the in-memory result is handed to later phases. No entry means
+  nothing is written and the reflective marker's `emptyRetrieval` is true.
+- Entities perception left pending are resolved here with the sender-scoped,
+  read-only lookup if there are at most three and the lookup finishes within
+  150 ms; otherwise they are skipped for recall and resolved in the persist as
+  before. The phase targets 500 ms (p95, 10 000 episodes) and ends hard at
+  1.5 s, after which the answer goes ahead without recall.
+- `cog.flagEpisodicRecall` (default off) only marks that a later step may inject
+  the recalled entries into the prompt. The recall itself follows the cycle flag;
+  the prompt is unchanged by this phase.
+
 **Example retrieval-buffer entry:**
 
 ```turtle

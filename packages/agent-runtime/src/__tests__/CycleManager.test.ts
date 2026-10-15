@@ -182,41 +182,64 @@ describe('CycleManager', () => {
     expect(byType['response-sent']).toBe('general kenobi');
   });
 
-  it('Phase 2 pulls a matching prior episode into the retrieval buffer (C4)', async () => {
+  it('Phase 2 recalls a prior episode of the session into the retrieval buffer, before the answer (C4)', async () => {
     const SESS = 'sessC6';
     // Turn 1 establishes a topic.
     await cm.runCycle(
       makeEnvelope('oxigraph is the embedded triplestore'),
-      async () => ({ text: 'noted', sessionId: SESS }),
+      async (_t, _g, recordInbound, _p, comprehend) => {
+        await recordInbound(SESS);
+        await comprehend(SESS);
+        return { text: 'noted', sessionId: SESS };
+      },
       (r) => r.sessionId,
       (r) => r.text,
     );
-    // Turn 2 references it; its retrieval buffer should surface turn 1.
-    const secondCycleId = '';
+    // Turn 2: the recall happens in the core, before it answers, and is written by the persist.
+    let recalled: string[] = [];
     await cm.runCycle(
       makeEnvelope('remind me about oxigraph'),
-      async () => ({ text: 'it is the triplestore', sessionId: SESS }),
+      async (_t, _g, recordInbound, _p, comprehend) => {
+        await recordInbound(SESS);
+        const c = await comprehend(SESS);
+        recalled = (c?.entries ?? []).map((e) => e.payload);
+        return { text: 'it is the triplestore', sessionId: SESS };
+      },
       (r) => r.sessionId,
       (r) => r.text,
     );
+    expect(recalled.some((p) => p.includes('oxigraph'))).toBe(true);
+    // Never this turn's own message.
+    expect(recalled).not.toContain('remind me about oxigraph');
 
-    // Find the second cycle's working graph and inspect its retrieval buffer.
-    const graphs = await store.query(
-      `SELECT DISTINCT ?g WHERE { GRAPH ?g {
-         ?e <${COGT}writtenTo> "retrievalBuffer" } }`,
-    );
-    expect(graphs.bindings!.length).toBeGreaterThan(0);
     const retr = await store.query(
-      `SELECT ?payload ?score ?src WHERE { GRAPH ?g {
+      `SELECT ?payload ?score ?src ?u WHERE { GRAPH ?g {
          ?e <${COGT}writtenTo> "retrievalBuffer" ;
             <${COGT}payload> ?payload ;
             <${COGT}retrievalScore> ?score ;
+            <${COGT}forUser> ?u ;
             <${COGT}sourceGraph> ?src } }`,
     );
     expect(retr.bindings!.length).toBeGreaterThan(0);
     expect(retr.bindings!.some((b) => b.payload.value.includes('oxigraph'))).toBe(true);
     expect(retr.bindings!.every((b) => b.src.value === 'urn:ontofelia:cog:episodic')).toBe(true);
-    void secondCycleId;
+    expect(retr.bindings!.every((b) => b.u.value === 'owner')).toBe(true);
+  });
+
+  it('a core that never calls the Phase 2 hook gets no recall and no retrieval entries', async () => {
+    const SESS = 'sessC6b';
+    for (const text of ['oxigraph is the embedded triplestore', 'remind me about oxigraph']) {
+      await cm.runCycle(
+        makeEnvelope(text),
+        async () => ({ text: 'ok', sessionId: SESS }),
+        (r) => r.sessionId,
+        (r) => r.text,
+      );
+    }
+    const retr = await store.query(
+      `SELECT ?e WHERE { GRAPH ?g { ?e <${COGT}writtenTo> "retrievalBuffer" } }`,
+    );
+    expect(retr.bindings ?? []).toHaveLength(0);
   });
 
   it('records tool-called/tool-completed episodes when core emits tool events (C3)', async () => {
