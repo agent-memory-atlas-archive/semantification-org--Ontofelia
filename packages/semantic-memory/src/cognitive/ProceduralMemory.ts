@@ -352,6 +352,35 @@ export class ProceduralMemory {
   /** Append one skill trace. Returns the trace IRI. */
   async recordTrace(t: TraceInput): Promise<TraceId> {
     const graph = this.graphUri();
+    const { uri, lines } = this.traceLines(t);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    return uri;
+  }
+
+  /**
+   * Append the skill traces of one cycle (and, when given, its adherence summary)
+   * in ONE update. The traces are chained exactly as writing them one by one
+   * with `previousTrace` set to the IRI the earlier call returned: each trace
+   * after the first links to its predecessor in the batch (an explicit
+   * `previousTrace` on the input wins). Returns the trace IRIs in order.
+   */
+  async recordTraces(traces: TraceInput[], summary?: AdherenceSummaryInput): Promise<TraceId[]> {
+    const graph = this.graphUri();
+    const uris: TraceId[] = [];
+    const lines: string[] = [];
+    for (const t of traces) {
+      const prev = uris[uris.length - 1];
+      const built = this.traceLines(t.previousTrace === undefined && prev ? { ...t, previousTrace: prev } : t);
+      uris.push(built.uri);
+      lines.push(...built.lines);
+    }
+    if (summary) lines.push(...this.adherenceLines(summary).lines);
+    if (lines.length === 0) return uris;
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    return uris;
+  }
+
+  private traceLines(t: TraceInput): { uri: TraceId; lines: string[] } {
     const { uri, traceId } = this.newTraceUri(t.executedAt);
     const lines: string[] = [
       `<${uri}> <${RDF_TYPE}> <${COGT}SkillTrace> .`,
@@ -386,9 +415,7 @@ export class ProceduralMemory {
         `<${uri}> <${COGT}maskedArg> "${escapeLiteral(`${safePath(m.path)}=${scheme}:${m.digest}`)}" .`,
       );
     }
-
-    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
-    return uri;
+    return { uri, lines };
   }
 
   /**
@@ -403,20 +430,23 @@ export class ProceduralMemory {
     weight?: number,
   ): Promise<void> {
     const graph = this.graphUri();
-    await this.triplestore.update(`
-      DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }
-      WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }`);
-    await this.triplestore.update(`
-      DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }
-      WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }`);
-    if (satisfied === null) return;
-    const lines = [`<${traceUri}> <${COGT}userSatisfied> "${satisfied}"^^<${XSD}boolean> .`];
-    if (weight !== undefined && Number.isFinite(weight)) {
-      lines.push(
-        `<${traceUri}> <${COGT}satisfactionWeight> "${clampRate(weight).toFixed(4)}"^^<${XSD}decimal> .`,
-      );
+    // One update, three operations in the order the three separate updates ran.
+    const ops = [
+      `DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }
+      WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}userSatisfied> ?old } }`,
+      `DELETE { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }
+      WHERE  { GRAPH <${graph}> { <${traceUri}> <${COGT}satisfactionWeight> ?old } }`,
+    ];
+    if (satisfied !== null) {
+      const lines = [`<${traceUri}> <${COGT}userSatisfied> "${satisfied}"^^<${XSD}boolean> .`];
+      if (weight !== undefined && Number.isFinite(weight)) {
+        lines.push(
+          `<${traceUri}> <${COGT}satisfactionWeight> "${clampRate(weight).toFixed(4)}"^^<${XSD}decimal> .`,
+        );
+      }
+      ops.push(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
     }
-    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    await this.triplestore.update(ops.join(' ;\n'));
   }
 
   /**
@@ -425,6 +455,12 @@ export class ProceduralMemory {
    */
   async recordAdherenceSummary(a: AdherenceSummaryInput): Promise<string> {
     const graph = this.graphUri();
+    const { uri, lines } = this.adherenceLines(a);
+    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
+    return uri;
+  }
+
+  private adherenceLines(a: AdherenceSummaryInput): { uri: string; lines: string[] } {
     const uri = `urn:${this.agentId}:cog:adherence:${slug(a.cycleId)}`;
     const rate = a.tracedCalls === 0 ? 0 : clampRate(a.adheredCalls / a.tracedCalls);
     const lines = [
@@ -439,8 +475,7 @@ export class ProceduralMemory {
       `<${uri}> <${COGT}agentId> "${escapeLiteral(this.agentId)}" .`,
     ];
     if (a.sessionId) lines.push(`<${uri}> <${COGT}sessionId> "${escapeLiteral(a.sessionId)}" .`);
-    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
-    return uri;
+    return { uri, lines };
   }
 
   /**

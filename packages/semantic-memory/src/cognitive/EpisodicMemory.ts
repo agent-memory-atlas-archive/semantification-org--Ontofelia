@@ -296,16 +296,30 @@ export class EpisodicMemory {
    * new episode's IRI.
    */
   async append(ep: EpisodeInput): Promise<EpisodeId> {
+    const tail = ep.sessionId ? await this.sessionTail(ep.sessionId) : undefined;
+    const built = this.build(ep, tail);
+    await this.triplestore.update(built.update);
+    return built.uri;
+  }
+
+  /**
+   * Build the INSERT for one episode. `tail` is the session's chain state read
+   * just before (absent without a session id); it is the only input besides the
+   * episode itself, so a batch can thread it through in memory.
+   */
+  private build(
+    ep: EpisodeInput,
+    tail?: { count: number; latestUri?: string; latestId?: string },
+  ): { uri: EpisodeId; episodeId: string; update: string; lines: string[] } {
     const graph = this.graphUri();
     const uri = this.newUri();
     const occurredAt = (ep.occurredAt ?? new Date()).toISOString();
 
     let seq = 1;
     let precededBy = ep.precededBy;
-    if (ep.sessionId) {
+    if (ep.sessionId && tail) {
       // Internal: the chain and the sequence number span the whole session,
       // whoever spoke (a group session has several senders).
-      const tail = await this.sessionTail(ep.sessionId);
       seq = tail.count + 1;
       if (!precededBy && tail.latestUri) {
         // Chain to the most recent episode of the session.
@@ -348,8 +362,86 @@ export class EpisodicMemory {
       lines.push(`<${uri}> <${COGT}durationMs> "${Math.trunc(ep.durationMs)}"^^<${XSD}integer> .`);
     for (const t of ep.tags ?? []) lines.push(`<${uri}> <${COGT}tags> "${escapeLiteral(t)}" .`);
 
-    await this.triplestore.update(`INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }`);
-    return uri;
+    return { uri, episodeId, lines, update: `INSERT DATA { GRAPH <${graph}> {\n${lines.join('\n')}\n} }` };
+  }
+
+  /**
+   * Prepare a batch of episodes for ONE update. The session chain is read once
+   * (per session id) and threaded through in memory, so the stored episodes are
+   * exactly those that appending them one by one in this order would store:
+   * the same sequence numbers, the same `precededBy` links (each episode chains
+   * to the greatest episode id so far, including the batch's own earlier
+   * episodes). The read happens here; nothing is written until `commit()`, so
+   * several writers can read first and then issue their writes together.
+   *
+   * An input that cannot be built (an unsafe IRI) is skipped; the others are
+   * kept. If the combined update fails, `commit`
+   * falls back to one update per episode (the inserts are idempotent, the
+   * episodes already carry their final IRIs) so a failure is reported for the
+   * episode that caused it and the others are still stored.
+   *
+   * With `onError` every failure (a skipped input, a failed insert) is reported
+   * through it, one call per failed episode, and `commit` does not throw; without
+   * it `commit` throws the first failure.
+   */
+  async prepareAppendMany(
+    inputs: EpisodeInput[],
+    onError?: (e: unknown) => void,
+  ): Promise<{ uris: EpisodeId[]; commit: () => Promise<void> }> {
+    const tails = new Map<string, { count: number; latestUri?: string; latestId: string }>();
+    const built: Array<{ uri: EpisodeId; update: string; lines: string[] }> = [];
+    for (const ep of inputs) {
+      try {
+        let tail: { count: number; latestUri?: string; latestId: string } | undefined;
+        if (ep.sessionId) {
+          tail = tails.get(ep.sessionId);
+          if (!tail) {
+            const t = await this.sessionTail(ep.sessionId);
+            tail = { count: t.count, latestUri: t.latestUri, latestId: t.latestId ?? '' };
+            tails.set(ep.sessionId, tail);
+          }
+        }
+        const b = this.build(ep, tail);
+        built.push(b);
+        if (tail) {
+          // The same state a re-read after this append would give.
+          tail.count += 1;
+          if (tail.latestUri === undefined || b.episodeId > tail.latestId) {
+            tail.latestId = b.episodeId;
+            tail.latestUri = b.uri;
+          }
+        }
+      } catch (e) {
+        if (onError) onError(e);
+        else throw e;
+      }
+    }
+    const graph = this.graphUri();
+    const commit = async (): Promise<void> => {
+      if (built.length === 0) return;
+      try {
+        await this.triplestore.update(
+          `INSERT DATA { GRAPH <${graph}> {\n${built.map((b) => b.lines.join('\n')).join('\n')}\n} }`,
+        );
+      } catch (batchError) {
+        if (built.length === 1) {
+          if (onError) onError(batchError);
+          else throw batchError;
+          return;
+        }
+        const failures: unknown[] = [];
+        await Promise.all(
+          built.map((b) =>
+            this.triplestore.update(b.update).catch((e) => {
+              failures.push(e);
+            }),
+          ),
+        );
+        if (!onError && failures.length > 0) throw failures[0];
+        for (const f of failures) onError?.(f);
+      }
+    };
+    return { uris: built.map((b) => b.uri), commit };
   }
 
   /**
@@ -368,7 +460,7 @@ export class EpisodicMemory {
    * that selects only the two columns needed (no payloads, no `about`/`tags`).
    * "Newest" follows {@link findInSession}: the greatest `episodeId`.
    */
-  private async sessionTail(sessionId: string): Promise<{ count: number; latestUri?: string }> {
+  private async sessionTail(sessionId: string): Promise<{ count: number; latestUri?: string; latestId?: string }> {
     const graph = this.graphUri();
     const res = await this.triplestore.query(`
       SELECT ?ep ?episodeId WHERE {
@@ -392,7 +484,7 @@ export class EpisodicMemory {
         latestUri = r.ep.value;
       }
     }
-    return { count, latestUri };
+    return { count, latestUri, latestId };
   }
 
   /**
