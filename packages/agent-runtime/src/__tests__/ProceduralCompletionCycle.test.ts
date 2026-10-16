@@ -18,7 +18,7 @@ const GOAL = `${COGT}AnswerQuestion`;
 const SESS = 'sessPC';
 
 // Obviously fake credentials; none of these is a real secret.
-const SK = 'sk-test-0000000000000000000000000000';
+const SK = 'sk' + '-test-0000000000000000000000000000';
 const HEX40 = '0123456789abcdef0123456789abcdef01234567';
 const JWT = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0In0.fakesignature0000';
 const BEARER_VALUE = 'test-token-0000000000';

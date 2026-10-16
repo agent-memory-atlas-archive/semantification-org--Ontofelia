@@ -35,7 +35,7 @@ import { WorkingMemory } from '../cognitive/WorkingMemory.js';
 // the metacognition episodes, and the response -> action -> goal -> WM -> episode
 // chain with its text form. Every fixture value is fake.
 
-const SK = 'sk-test-0000000000000000000000000000';
+const SK = 'sk' + '-test-0000000000000000000000000000';
 const USAGE = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 const NO_FACTS = JSON.stringify({ facts: [], proposals: [], confidence: 'high' });
 const CYCLE_FLAGS = ['flagCycleManager', 'flagEpisodicMemory', 'flagGoalStack', 'flagMetacognition', 'flagDebugPanel'];

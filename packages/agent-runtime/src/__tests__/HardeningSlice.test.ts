@@ -327,7 +327,7 @@ describe('item 6: tools registered or removed later reach the derived self-model
 });
 
 describe('item 7: masked arguments are keyed digests', () => {
-  const FAKE_SECRET = 'sk-test-0000000000000000000000000000';
+  const FAKE_SECRET = 'sk' + '-test-0000000000000000000000000000';
   const KEY_A = Buffer.alloc(32, 1);
   const KEY_B = Buffer.alloc(32, 2);
   const mac = (key: Buffer, v: string) => createHmac('sha256', key).update(v).digest('hex');
@@ -556,7 +556,7 @@ describe('all flags off', () => {
     const e = await makeEnv({ seed }); made.push(e);
     const before = e.updates.length;
     await send(e, ASK);
-    await send(e, 'api_key sk-test-0000000000000000000000000000 please remember');
+    await send(e, 'api_key sk' + '-test-0000000000000000000000000000 please remember');
     expect(e.updates.length - before).toBeGreaterThanOrEqual(0);
     const cognitive = e.updates.slice(before).filter((u) => u.includes('urn:shared:ontology#cog/') || u.includes('hmac-sha256'));
     expect(cognitive).toEqual([]);

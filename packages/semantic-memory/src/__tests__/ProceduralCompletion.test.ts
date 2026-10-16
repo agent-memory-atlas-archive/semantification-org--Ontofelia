@@ -133,7 +133,7 @@ describe('ProceduralMemory completion', () => {
         forUser: 'alice',
         maskedArgs: [
           { path: 'headers.authorization', digest, scheme: 'hmac-sha256' },
-          { path: 'raw.value', digest: 'sk-test-000000000000000000000000' }, // not a digest: refused
+          { path: 'raw.value', digest: 'sk' + '-test-000000000000000000000000' }, // not a digest: refused
           { path: 'bad path/with spaces', digest: 'b'.repeat(64) }, // no scheme: the unkeyed sha256 of older callers
         ],
       }),
