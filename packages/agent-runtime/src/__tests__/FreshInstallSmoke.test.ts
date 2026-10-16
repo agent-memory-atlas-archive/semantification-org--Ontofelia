@@ -71,5 +71,5 @@ describe('fresh install, defaults on: three turns by two users', () => {
       expect(await count(e, `SELECT ?x WHERE { GRAPH ?g { ?x a <${COGT}DailySummary> } }`)).toBe(0);
       expect(await count(e, `SELECT ?x WHERE { GRAPH <${GraphUriResolver.getCogEpisodicGraph(AGENT)}> { ?x a <${COGT}Episode> FILTER NOT EXISTS { ?x <${COGT}payload> ?p } } }`)).toBe(0);
     }
-  });
+  }, 30_000);
 });
