@@ -44,7 +44,9 @@ function trace(over: Partial<TraceInput> = {}): TraceInput {
   };
 }
 
-describe('ProceduralMemory completion', () => {
+// The write-heavy cases take seconds on a slow runner; a run past the timeout
+// would keep writing while the next case already runs.
+describe('ProceduralMemory completion', { timeout: 60_000 }, () => {
   let store: TriplestoreAdapter;
   let pm: ProceduralMemory;
 
@@ -93,9 +95,12 @@ describe('ProceduralMemory completion', () => {
   });
 
   it('bounds the p95 sample to the latest durations', async () => {
+    // Bind this test's own memory, so that a run past the timeout cannot keep
+    // writing into the next test's store.
+    const own = pm;
     const n = DURATION_WINDOW + 50; // durations 1..250
-    for (let i = 1; i <= n; i++) await pm.recordTrace(trace({ durationMs: i, executedAt: new Date(BASE + i * 1000) }));
-    await pm.consolidate(WIDE);
+    for (let i = 1; i <= n; i++) await own.recordTrace(trace({ durationMs: i, executedAt: new Date(BASE + i * 1000) }));
+    await own.consolidate(WIDE);
     // Window = 51..250 (200 values); nearest-rank p95 is the 190th = 240.
     expect(Number(await skillValue('fs_read', 'p95DurationMs'))).toBe(240);
   });

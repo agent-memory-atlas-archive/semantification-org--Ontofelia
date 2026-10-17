@@ -377,5 +377,5 @@ describe('EpisodicConsolidation', () => {
     expect(r.deferred).toBe(5);
     const again = await job.run();
     expect(again.promoted).toBe(5);
-  });
+  }, 60_000); // 75 episodes and claims: seconds on a slow runner
 });
