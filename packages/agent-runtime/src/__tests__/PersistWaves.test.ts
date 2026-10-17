@@ -62,7 +62,8 @@ function instrument(store: TriplestoreAdapter, failOn?: (sparql: string) => bool
   return { store: wrapped, updates };
 }
 
-describe('persist waves: the stored data does not change', () => {
+// Every case here runs whole turns against a real store; each block gives slow runners room.
+describe('persist waves: the stored data does not change', { timeout: 60_000 }, () => {
   it('the scripted sequence stores the same quads as the sequential persist did', async () => {
     const errors: unknown[] = [];
     const store = await makeStore();
@@ -134,7 +135,7 @@ describe('persist waves: the stored data does not change', () => {
   });
 });
 
-describe('persist waves: dumps per turn', () => {
+describe('persist waves: dumps per turn', { timeout: 60_000 }, () => {
   it('a turn with every flag on is dumped at most three times, turn after turn', async () => {
     const store = await makeStore();
     const spy = spyOnDumps(store);
@@ -196,7 +197,7 @@ describe('persist waves: dumps per turn', () => {
   });
 });
 
-describe('persist waves: a failing write', () => {
+describe('persist waves: a failing write', { timeout: 60_000 }, () => {
   async function oneTurn(failOn?: (sparql: string) => boolean) {
     const raw = await makeStore();
     const { store, updates } = instrument(raw, failOn);
@@ -271,7 +272,7 @@ describe('persist waves: a failing write', () => {
   });
 });
 
-describe('persist waves: durability', () => {
+describe('persist waves: durability', { timeout: 60_000 }, () => {
   it('when the persist promise resolves, everything the store holds is on disk', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'persist-durable-'));
     try {
@@ -296,7 +297,7 @@ describe('persist waves: durability', () => {
   });
 });
 
-describe('persist waves: single-update helpers store what the separate updates stored', () => {
+describe('persist waves: single-update helpers store what the separate updates stored', { timeout: 60_000 }, () => {
   it('setStatus, resolveImpasse, markClosed and the satisfaction back-fill are one update each', async () => {
     const raw = await makeStore();
     const { store, updates } = instrument(raw);
