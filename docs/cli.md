@@ -125,11 +125,22 @@ Manage channel pairing requests (Telegram/Discord user approval).
 ```bash
 ontofelia pairing list                     # Show pending requests
 ontofelia pairing list telegram            # Filter by channel
-ontofelia pairing approve <code>           # Approve a user
+ontofelia pairing approve <code> [--yes]   # Approve a user (asks for confirmation unless --yes)
 ontofelia pairing reject <code>            # Reject a user
 ```
 
 When a new Telegram/Discord user messages the bot, they get a pairing code. The admin must approve it via this command before the user can chat.
+
+What approval grants depends on `channels.telegram.ownerId` in `ontofelia.json5`:
+
+- **`ownerId` set** (your Telegram user id): only that account is the owner. Every other approved Telegram user gets their own identity (`telegram:<id>`) and a private memory, without owner rights: no owner commands (`/goals`, `/initiative`, `/reseed-persona`), no host tools (`exec`, `fs_read`, `fs_write`, `fs_list`, `cron_manage` and the other host-only tools are neither offered nor run, even if they are on `tools.allow`), no owner-only tools such as `notify_owner`, no access to the owner's memory, and they cannot press the Guardian approval buttons.
+- **`ownerId` not set** (legacy mode, and a warning is logged when the gateway starts): every approved Telegram account is treated as the owner. That person gets the same rights as you: shell access on the host through the agent (the `exec` tool), owner commands, and access to the owner's private memory. Only approve accounts that belong to you.
+
+Discord users are never treated as the owner.
+
+To find your Telegram user id, message the bot with `/pair` from your own account and run `ontofelia pairing list telegram`: the number in parentheses is the sender id. A bot such as @userinfobot also shows it. Then set `channels.telegram.ownerId` to that value (a string of digits; a bare number is accepted too) and restart the gateway. Your own account must still be approved.
+
+`pairing approve` prints the warning that matches the current configuration and asks for confirmation. Use `--yes` to skip the prompt; without a terminal (for example in scripts) the command refuses unless `--yes` is given.
 
 ---
 

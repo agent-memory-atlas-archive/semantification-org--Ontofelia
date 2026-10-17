@@ -54,6 +54,24 @@ channels: {
 }
 ```
 
+### Owner identity
+
+New users send `/pair` to the bot, get a code, and an admin approves it with `ontofelia pairing approve <code>`. Set your own Telegram user id as the owner:
+
+```json5
+channels: {
+  telegram: {
+    enabled: true,
+    token: "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ",
+    ownerId: "123456789"   // your Telegram user id (digits)
+  }
+}
+```
+
+- With `ownerId` set, only that account is the owner (identity `owner`, so existing sessions and memory stay yours). Other approved users get their own identity (`telegram:<id>`) and a private memory without owner rights: no host tools such as `exec` or the `fs_*` tools, no owner commands, and they cannot approve Guardian prompts.
+- Without `ownerId`, every approved Telegram user is the owner, and the gateway logs a warning at start.
+- To find your id: send `/pair` from your own account and run `ontofelia pairing list telegram` (the sender id is shown in parentheses), or ask a bot such as @userinfobot.
+
 ### Telegram-Specific Features
 
 #### Context Line

@@ -35,6 +35,22 @@ describe('Config Schema', () => {
     expect(parsed.channels.telegram?.token).toBe('123');
   });
 
+  it('telegram ownerId: string kept, number normalised, unset stays unset', () => {
+    const tg = (v: Record<string, unknown>) => configSchema.parse({ channels: { telegram: v } }).channels.telegram;
+    expect(tg({ enabled: true, ownerId: '123456789' })?.ownerId).toBe('123456789');
+    expect(tg({ enabled: true, ownerId: 123456789 })?.ownerId).toBe('123456789');
+    expect(tg({ enabled: true })?.ownerId).toBeUndefined();
+  });
+
+  it('telegram ownerId: rejects non-digit values', () => {
+    const tg = (v: unknown) => configSchema.safeParse({ channels: { telegram: { enabled: true, ownerId: v } } }).success;
+    expect(tg('@someone')).toBe(false);
+    expect(tg('12 34')).toBe(false);
+    expect(tg('')).toBe(false);
+    expect(tg(-5)).toBe(false);
+    expect(tg(1.5)).toBe(false);
+  });
+
   it('strips unknown channel types', () => {
     const parsed = configSchema.parse({
       channels: {

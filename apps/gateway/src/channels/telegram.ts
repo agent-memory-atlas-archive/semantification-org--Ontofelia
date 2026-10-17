@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { createLogger, MessageEnvelope, PRIMARY_AGENT_ID, resolveAgentId } from '@ontofelia/core';
 import type { AgentRuntime } from '@ontofelia/agent-runtime';
+import { resolveTelegramSender } from '@ontofelia/channels';
 import type { TelegramAdapter } from '@ontofelia/channels';
 import type { AllowlistStore } from '@ontofelia/channels';
 import type { OntofeliaConfig } from '@ontofelia/config';
@@ -122,6 +123,18 @@ function formatTablesForTelegram(text: string): string {
   });
 }
 
+/**
+ * Startup warning for legacy owner mode. Returns the message to log when no
+ * `channels.telegram.ownerId` is configured (every approved account is then the
+ * owner), or undefined when an owner id is set.
+ */
+export function telegramOwnerWarning(config: OntofeliaConfig): string | undefined {
+  if (config.channels?.telegram?.ownerId !== undefined) return undefined;
+  return 'channels.telegram.ownerId is not set: every approved Telegram user is treated as the owner ' +
+    '(exec tool, owner commands, the owner\'s private memory). Set channels.telegram.ownerId to your ' +
+    'Telegram user id so that other approved users get their own identity without owner rights.';
+}
+
 // --- Liveness / progress UX (TG-1 typing, TG-2/TG-3 live status checklist) ---
 export const TELEGRAM_STATUS_HEADER = '🧠 Ontofelia is working…';
 export const TELEGRAM_INITIAL_STATUS = TELEGRAM_STATUS_HEADER;
@@ -199,6 +212,10 @@ export async function setupTelegramChannel(
   allowlistStore: AllowlistStore,
   agents: Map<string, AgentRuntime>,
 ): Promise<void> {
+  const ownerWarning = telegramOwnerWarning(config);
+  if (ownerWarning) logger.warn(ownerWarning);
+  const ownerId = config.channels?.telegram?.ownerId;
+
   const sendTelegramResponse = async (
     replyTarget: string,
     response: import('@ontofelia/agent-runtime').AgentResponse,
@@ -473,6 +490,24 @@ export async function setupTelegramChannel(
         const isAllowed = await allowlistStore.isAllowed('telegram', senderId);
         if (!isAllowed) return;
 
+        // Same resolver as for messages: owner vs. other approved user.
+        const sender = resolveTelegramSender(
+          senderId,
+          query.from.username || query.from.first_name,
+          ownerId,
+        );
+        if (!sender) return;
+
+        // Guardian approvals release the owner's pending tool calls; only the
+        // owner may press them.
+        if (query.data.startsWith('g:') && !sender.isOwner) {
+          await bot.answerCallbackQuery(query.id, {
+            text: 'Only the owner can approve or deny this.',
+            show_alert: true,
+          }).catch(() => {});
+          return;
+        }
+
         await bot.answerCallbackQuery(query.id, { text: '⏳ Processing...' }).catch(() => {});
 
         if (query.data.startsWith('g:')) {
@@ -508,7 +543,7 @@ export async function setupTelegramChannel(
             channel: 'telegram',
             accountId: 'default',
             chatType: 'dm',
-            sender: { id: 'owner', channelPrefix: 'telegram', displayName: query.from.username || query.from.first_name, isOwner: true },
+            sender,
             target: chatId,
             timestamp: new Date().toISOString(),
             text: query.data,
