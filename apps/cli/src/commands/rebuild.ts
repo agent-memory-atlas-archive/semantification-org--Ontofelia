@@ -37,12 +37,29 @@ export function registerRebuildCommand(program: Command) {
       }
 
       // ── 1. Stop the gateway so it is not running stale code mid-build ──
-      console.log(chalk.cyan('  [1/3] Stopping gateway...'));
+      console.log(chalk.cyan('  [1/4] Stopping gateway...'));
       const wasRunning = await stopGateway();
       console.log(chalk.green(wasRunning ? '  ✔ Gateway stopped' : '  ✔ Gateway was not running'));
 
-      // ── 2. Build all packages ──
-      console.log(chalk.cyan('  [2/3] Building all packages...'));
+      // ── 2. Install dependencies when the lockfile changed ──
+      if (dependenciesStale(repoRoot)) {
+        console.log(chalk.cyan('  [2/4] Installing dependencies (lockfile changed)...'));
+        console.log('');
+        const installed = await tryRun('pnpm', ['install', '--frozen-lockfile'], repoRoot);
+        console.log('');
+        if (!installed) {
+          console.log(chalk.red('  ✖ Dependency install failed (or pnpm is not available) — nothing was built.'));
+          console.log(chalk.red('    The gateway is still stopped and was not restarted.'));
+          console.log(chalk.gray('    Run `pnpm install` in the repository, then `ontofelia rebuild`.'));
+          process.exit(1);
+        }
+        console.log(chalk.green('  ✔ Dependencies installed'));
+      } else {
+        console.log(chalk.gray('  [2/4] Dependencies are up to date.'));
+      }
+
+      // ── 3. Build all packages ──
+      console.log(chalk.cyan('  [3/4] Building all packages...'));
       console.log('');
       const built = await runBuild(repoRoot);
       console.log('');
@@ -52,16 +69,16 @@ export function registerRebuildCommand(program: Command) {
       }
       console.log(chalk.green('  ✔ All packages built'));
 
-      // ── 3. Restart the gateway with the freshly built code ──
+      // ── 4. Restart the gateway with the freshly built code ──
       if (options.restart === false) {
-        console.log(chalk.gray('  [3/3] Skipping restart (--no-restart).'));
+        console.log(chalk.gray('  [4/4] Skipping restart (--no-restart).'));
         console.log('');
         console.log(chalk.green.bold('  🦉 Rebuild complete.'));
         console.log(chalk.gray('  Start the gateway with: ontofelia gateway start'));
         process.exit(0);
       }
 
-      console.log(chalk.cyan('  [3/3] Restarting gateway...'));
+      console.log(chalk.cyan('  [4/4] Restarting gateway...'));
       try {
         const child = spawn(process.execPath, [process.argv[1], 'gateway', 'start'], {
           detached: true,
@@ -80,6 +97,24 @@ export function registerRebuildCommand(program: Command) {
       console.log('');
       process.exit(0);
     });
+}
+
+/**
+ * True when installed dependencies may be out of date: pnpm's install marker
+ * (node_modules/.modules.yaml) is missing, or pnpm-lock.yaml is newer than it.
+ */
+export function dependenciesStale(repoRoot: string): boolean {
+  let marker: number;
+  try {
+    marker = fs.statSync(path.join(repoRoot, 'node_modules', '.modules.yaml')).mtimeMs;
+  } catch {
+    return true;
+  }
+  try {
+    return fs.statSync(path.join(repoRoot, 'pnpm-lock.yaml')).mtimeMs > marker;
+  } catch {
+    return false;
+  }
 }
 
 /**

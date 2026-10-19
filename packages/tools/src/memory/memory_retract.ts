@@ -20,7 +20,9 @@ export class MemoryRetractTool implements ToolDefinition {
   name = 'memory_retract';
   description =
     'Hard-delete a fact and its provenance (claim + evidence) from the knowledge graph. ' +
-    'Traceless removal for privacy/retention — not normal belief revision.';
+    'Traceless removal for privacy/retention — not normal belief revision. ' +
+    'Do not use for corrections or updates — new facts supersede old ones automatically; ' +
+    'use only when the user explicitly asks to forget or delete.';
   category: ToolCategory = 'memory';
   permissions: ToolPermission[] = ['memory:delete'];
   hostOnly = true;

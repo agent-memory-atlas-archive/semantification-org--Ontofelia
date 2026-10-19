@@ -55,4 +55,38 @@ describe('config package', () => {
     expect(loaded.gateway.token).toBe('env-token');
     expect(loaded.gateway.port).toBe(8888);
   });
+
+  describe('keys that never had an effect', () => {
+    it('are absent from the default config', () => {
+      const config = getDefaultConfig() as Record<string, unknown>;
+      expect(config).not.toHaveProperty('messages');
+      expect(config).not.toHaveProperty('routing');
+      expect(config).not.toHaveProperty('commands');
+      expect(config.session).not.toHaveProperty('scope');
+      expect(config.security).not.toHaveProperty('requireGuardian');
+      // Neighbouring live keys are untouched.
+      expect(config.session).toHaveProperty('maxHistory');
+      expect(config.security).toHaveProperty('guardianTimeoutMs');
+    });
+
+    it('in an existing config file still load and are dropped', async () => {
+      await fs.writeFile(tempConfigFile, `{
+        messages: { maxContext: 5, truncateAt: 100 },
+        routing: { agents: { a: {} } },
+        commands: { prefix: '!', allowAdminOnly: true },
+        session: { scope: 'main', maxHistory: 7 },
+        security: { requireGuardian: false, guardianTimeoutMs: 1234 },
+      }`, 'utf-8');
+
+      const loaded = (await loadConfig(tempConfigFile)) as Record<string, unknown>;
+      expect(loaded).not.toHaveProperty('messages');
+      expect(loaded).not.toHaveProperty('routing');
+      expect(loaded).not.toHaveProperty('commands');
+      expect(loaded.session).not.toHaveProperty('scope');
+      expect(loaded.security).not.toHaveProperty('requireGuardian');
+      // Live keys in the same sections are kept.
+      expect((loaded.session as { maxHistory: number }).maxHistory).toBe(7);
+      expect((loaded.security as { guardianTimeoutMs: number }).guardianTimeoutMs).toBe(1234);
+    });
+  });
 });

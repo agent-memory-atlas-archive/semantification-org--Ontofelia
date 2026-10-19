@@ -161,3 +161,11 @@ describe('MemoryRetractTool — graph whitelist + hard delete', () => {
     expect(updates.join('\n')).toContain('urn:ontofelia:worldview');
   });
 });
+
+describe('MemoryRetractTool description', () => {
+  it('states it is not for corrections or updates', () => {
+    const tool = new MemoryRetractTool({} as unknown as TriplestoreAdapter);
+    expect(tool.description).toMatch(/not use for corrections/i);
+    expect(tool.description).toMatch(/explicitly asks to forget or delete/i);
+  });
+});

@@ -67,12 +67,6 @@ describe('Config Schema', () => {
     expect('approvalMaxPerDay' in configSchema.parse({}).notifications).toBe(false);
   });
 
-  it('rejects invalid session scope', () => {
-    expect(() => {
-      configSchema.parse({ session: { scope: 'invalid' } });
-    }).toThrow(/Invalid option/);
-  });
-
   // H1/L3 — notification policy validation at config load.
   it('accepts a valid IANA notifications.timezone', () => {
     const parsed = configSchema.parse({ notifications: { timezone: 'Europe/Berlin' } });

@@ -2,6 +2,7 @@
 import { ChildProcess, spawn } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { HealthResult } from '@ontofelia/core';
 import * as fs from 'fs/promises';
 import { execFile } from 'child_process';
@@ -19,13 +20,38 @@ export interface FusekiConfig {
   reasoning?: boolean;     // Whether OWL-DL reasoning should be active
 }
 
+/** A Fuseki distribution and the SHA-512 of its tarball. Change both together. */
+export interface FusekiDownload {
+  url: string;
+  sha512: string;
+}
+
+/** Pinned against the `.sha512` published by Apache for exactly this URL. */
+export const FUSEKI_DOWNLOAD: FusekiDownload = {
+  url: 'https://archive.apache.org/dist/jena/binaries/apache-jena-fuseki-5.0.0.tar.gz',
+  sha512:
+    'c7b9fa452cdec19c50ee08ee191012b26c7b51f1ee5c5143db3047e0545c007599fbc08481fa61df5aef766a796e43262c209fc42578f2e532c0ab0c19dcbc51',
+};
+
+export interface FusekiManagerOptions {
+  /** HTTP client used for the download; defaults to the global `fetch`. */
+  fetch?: typeof fetch;
+  /** Distribution to download; defaults to the pinned one. Intended for tests. */
+  download?: FusekiDownload;
+}
+
 export class FusekiManager {
   private process: ChildProcess | null = null;
   private status: 'stopped' | 'starting' | 'running' | 'error' = 'stopped';
   private config: FusekiConfig;
 
-  constructor(config: FusekiConfig) {
+  private fetchImpl: typeof fetch;
+  private download: FusekiDownload;
+
+  constructor(config: FusekiConfig, options: FusekiManagerOptions = {}) {
     this.config = config;
+    this.fetchImpl = options.fetch ?? ((...args) => fetch(...args));
+    this.download = options.download ?? FUSEKI_DOWNLOAD;
   }
 
   /** Download Fuseki distribution if missing. */
@@ -41,20 +67,36 @@ export class FusekiManager {
     // we'll download just the server jar if possible, or the full tar.gz and extract.
     // For simplicity, we assume we fetch the tar.gz, extract the jar and libs.
     // However, downloading in Node without external deps:
-    const url = 'https://archive.apache.org/dist/jena/binaries/apache-jena-fuseki-5.0.0.tar.gz';
+    const { url, sha512 } = this.download;
     const tarPath = path.join(this.config.fusekiHome, 'fuseki.tar.gz');
-    
+
     console.log(`Downloading Fuseki from ${url}...`);
-    const res = await fetch(url);
+    const res = await this.fetchImpl(url);
     if (!res.ok) throw new Error(`Failed to download Fuseki: ${res.statusText}`);
-    
-    const buffer = await res.arrayBuffer();
-    await fs.writeFile(tarPath, Buffer.from(buffer));
-    
-    console.log('Extracting Fuseki...');
-    // Use system tar
-    await execFileAsync('tar', ['-xzf', tarPath, '-C', this.config.fusekiHome, '--strip-components=1']);
-    await fs.unlink(tarPath);
+
+    const bytes = Buffer.from(await res.arrayBuffer());
+    // Verify before anything touches the disk or the unpacker.
+    const actual = createHash('sha512').update(bytes).digest('hex');
+    if (actual !== sha512.toLowerCase()) {
+      throw new Error(
+        `Fuseki download failed integrity check (SHA-512 mismatch): expected ${sha512.slice(0, 16)}..., got ${actual.slice(0, 16)}...`,
+      );
+    }
+
+    try {
+      await fs.writeFile(tarPath, bytes);
+      console.log('Extracting Fuseki...');
+      // Use system tar; never adopt archive ownership or permission bits.
+      await execFileAsync('tar', [
+        '-xzf', tarPath,
+        '-C', this.config.fusekiHome,
+        '--strip-components=1',
+        '--no-same-owner',
+        '--no-same-permissions',
+      ]);
+    } finally {
+      await fs.rm(tarPath, { force: true });
+    }
     console.log('Fuseki ready.');
   }
 

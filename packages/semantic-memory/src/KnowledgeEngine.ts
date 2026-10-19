@@ -1784,6 +1784,17 @@ export class KnowledgeEngine {
     // A hostile sourceUri is rejected before any write (it becomes an IRI in the evidence).
     if (fact.sourceUri) assertValidEvidenceSourceUri(fact.sourceUri);
 
+    // Coalesce every write this call performs (worldview/claim/evidence/
+    // inferred …) into a single durable flush on backends that support
+    // batching (Oxigraph). Adapters without `batch()` (Fuseki, in-memory)
+    // run the body directly — their writes don't pay a per-write full-dataset
+    // serialisation cost, so there is nothing to coalesce.
+    return this.triplestore.batch
+      ? this.triplestore.batch(() => this.storeFactUnbatched(fact, context))
+      : this.storeFactUnbatched(fact, context);
+  }
+
+  private async storeFactUnbatched(fact: FactInput, context: FactContext): Promise<StoreResult> {
     // Duplicate check — skip if triple already exists
     if (await this.isDuplicate(fact, context.agentId, context)) {
       // Only when the caller asks for it (episodic memory on): a re-assertion

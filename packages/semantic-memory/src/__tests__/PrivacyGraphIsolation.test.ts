@@ -15,11 +15,30 @@
  *   4. Cross-graph queries via `GRAPH ?g` work (data is present), proving
  *      the test setup is valid (data was actually stored).
  *
- * If this test ever fails, it means the Oxigraph store configuration has
+ * If this test ever fails, it means the store configuration has
  * changed to union named graphs into the default graph — a privacy breach.
+ *
+ * The same assertions run against two backends:
+ *   - OxigraphAdapter (always), and
+ *   - FusekiAdapter against a real Apache Jena Fuseki started through
+ *     FusekiManager with its generated product config. This variant runs only
+ *     when ONTOFELIA_TEST_FUSEKI_HOME points to a directory holding
+ *     `fuseki-server.jar`; otherwise it is skipped with a visible reason.
+ *     Fuseki is a JVM: its heap is capped via JAVA_TOOL_OPTIONS (FusekiManager
+ *     passes no JVM arguments of its own but the child inherits the environment).
+ *
+ * A Fuseki-only positive control starts a second Fuseki whose config differs
+ * from the product config in exactly one line (`unionDefaultGraph true`) and
+ * proves that the leak assertion can actually fire.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { createServer } from 'net';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { OxigraphAdapter } from '../adapters/OxigraphAdapter.js';
+import { FusekiAdapter } from '../adapters/FusekiAdapter.js';
+import { FusekiManager } from '../fuseki/FusekiManager.js';
 import type { TriplestoreAdapter } from '@ontofelia/core';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -50,7 +69,7 @@ const ABOX_TRIPLE = `
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-async function makeStore(): Promise<TriplestoreAdapter> {
+async function makeOxigraphStore(): Promise<TriplestoreAdapter> {
   const store = new OxigraphAdapter();
   await store.initialize({
     backend: 'oxigraph',
@@ -60,6 +79,103 @@ async function makeStore(): Promise<TriplestoreAdapter> {
     endpoint: '',
   });
   return store;
+}
+
+// ── Fuseki harness ────────────────────────────────────────────────────
+
+const FUSEKI_HOME = process.env.ONTOFELIA_TEST_FUSEKI_HOME ?? '';
+const FUSEKI_AVAILABLE = FUSEKI_HOME !== '' && existsSync(join(FUSEKI_HOME, 'fuseki-server.jar'));
+const FUSEKI_SKIP_REASON =
+  'SKIPPED: set ONTOFELIA_TEST_FUSEKI_HOME to a directory containing fuseki-server.jar to run this variant';
+const FUSEKI_JVM_OPTS = '-Xmx512m';
+const FUSEKI_TIMEOUT_MS = 90_000;
+
+/** Same as the product manager, but the dataset unions named graphs into the default graph. */
+class UnionDefaultGraphFusekiManager extends FusekiManager {
+  override generateConfig(): string {
+    const product = super.generateConfig();
+    const leaky = product.replace('tdb2:unionDefaultGraph false', 'tdb2:unionDefaultGraph true');
+    if (leaky === product) throw new Error('product config no longer contains unionDefaultGraph false');
+    writeFileSync(this.leakyConfigPath, leaky, 'utf-8');
+    return leaky;
+  }
+  constructor(cfg: ConstructorParameters<typeof FusekiManager>[0], private readonly leakyConfigPath: string) {
+    super(cfg);
+  }
+}
+
+interface RunningFuseki {
+  adapter: TriplestoreAdapter;
+  stop: () => Promise<void>;
+}
+
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address() as { port: number };
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** Start a real Fuseki (temp data dir, free port, capped heap) and return a FusekiAdapter. */
+async function startFuseki(unionDefaultGraph: boolean): Promise<RunningFuseki> {
+  const dir = mkdtempSync(join(tmpdir(), 'fuseki-privacy-'));
+  // Fuseki writes run state (FUSEKI_BASE) into its cwd and needs `webapp/` there, so give it a
+  // private home that only links the jar and the webapp; the shared distribution stays untouched.
+  const home = join(dir, 'home');
+  mkdirSync(home);
+  symlinkSync(join(FUSEKI_HOME, 'fuseki-server.jar'), join(home, 'fuseki-server.jar'));
+  symlinkSync(join(FUSEKI_HOME, 'webapp'), join(home, 'webapp'));
+  const port = await freePort();
+  const cfg = {
+    dataDir: join(dir, 'tdb2'),
+    port,
+    configPath: join(dir, 'fuseki-config.ttl'),
+    fusekiHome: home,
+    javaPath: 'java',
+    dataset: 'ontofelia',
+  };
+  const manager = unionDefaultGraph
+    ? new UnionDefaultGraphFusekiManager(cfg, cfg.configPath)
+    : new FusekiManager(cfg);
+
+  const previousOpts = process.env.JAVA_TOOL_OPTIONS;
+  process.env.JAVA_TOOL_OPTIONS = FUSEKI_JVM_OPTS;
+  const stop = async () => {
+    try {
+      await manager.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  try {
+    await manager.start();
+    const adapter = new FusekiAdapter();
+    await adapter.initialize({
+      backend: 'fuseki',
+      type: 'external',
+      dataDir: cfg.dataDir,
+      port,
+      endpoint: `http://127.0.0.1:${port}/ontofelia`,
+    } as never);
+    return { adapter, stop };
+  } catch (err) {
+    await stop();
+    throw err;
+  } finally {
+    if (previousOpts === undefined) delete process.env.JAVA_TOOL_OPTIONS;
+    else process.env.JAVA_TOOL_OPTIONS = previousOpts;
+  }
+}
+
+async function populate(store: TriplestoreAdapter): Promise<void> {
+  await store.putGraph(ALICE_USER_GRAPH, ALICE_TRIPLE, 'turtle');
+  await store.putGraph(BOB_USER_GRAPH, BOB_TRIPLE, 'turtle');
+  await store.putGraph(SESSION_GRAPH, SESSION_TRIPLE, 'turtle');
+  await store.putGraph(AGENT_ABOX, ABOX_TRIPLE, 'turtle');
 }
 
 /**
@@ -77,17 +193,11 @@ async function graphlessSelect(
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
-describe('Privacy: Graph Isolation (REL-2 / TODO-001)', () => {
+/** Register the isolation assertions against the store that `getStore` returns. */
+function isolationAssertions(getStore: () => TriplestoreAdapter): void {
   let store: TriplestoreAdapter;
-
-  beforeEach(async () => {
-    store = await makeStore();
-
-    // Populate FOUR named graphs with private data
-    await store.putGraph(ALICE_USER_GRAPH, ALICE_TRIPLE, 'turtle');
-    await store.putGraph(BOB_USER_GRAPH, BOB_TRIPLE, 'turtle');
-    await store.putGraph(SESSION_GRAPH, SESSION_TRIPLE, 'turtle');
-    await store.putGraph(AGENT_ABOX, ABOX_TRIPLE, 'turtle');
+  beforeEach(() => {
+    store = getStore();
   });
 
   // ── Core isolation: graph-less queries must see NOTHING ───────────
@@ -205,4 +315,59 @@ describe('Privacy: Graph Isolation (REL-2 / TODO-001)', () => {
       expect(count).toBeGreaterThan(0);
     }
   });
+}
+
+describe('Privacy: Graph Isolation (REL-2 / TODO-001) [oxigraph]', () => {
+  let current: TriplestoreAdapter;
+  beforeEach(async () => {
+    current = await makeOxigraphStore();
+    await populate(current);
+  });
+  isolationAssertions(() => current);
 });
+
+describe.skipIf(!FUSEKI_AVAILABLE)(
+  `Privacy: Graph Isolation (REL-2 / TODO-001) [fuseki, real Jena Fuseki]${FUSEKI_AVAILABLE ? '' : ` -- ${FUSEKI_SKIP_REASON}`}`,
+  () => {
+    let fuseki: RunningFuseki;
+    beforeAll(async () => {
+      fuseki = await startFuseki(false);
+    }, FUSEKI_TIMEOUT_MS);
+    afterAll(async () => {
+      await fuseki?.stop();
+    }, FUSEKI_TIMEOUT_MS);
+    beforeEach(async () => {
+      await fuseki.adapter.update('DROP ALL');
+      await populate(fuseki.adapter);
+    }, FUSEKI_TIMEOUT_MS);
+    isolationAssertions(() => fuseki.adapter);
+  },
+);
+
+describe.skipIf(!FUSEKI_AVAILABLE)(
+  `Privacy: positive control, unionDefaultGraph true leaks [fuseki]${FUSEKI_AVAILABLE ? '' : ` -- ${FUSEKI_SKIP_REASON}`}`,
+  () => {
+    let fuseki: RunningFuseki;
+    beforeAll(async () => {
+      fuseki = await startFuseki(true);
+      await populate(fuseki.adapter);
+    }, FUSEKI_TIMEOUT_MS);
+    afterAll(async () => {
+      await fuseki?.stop();
+    }, FUSEKI_TIMEOUT_MS);
+
+    it('graph-less SELECT sees user-graph data when the default graph is unioned', async () => {
+      const rows = await graphlessSelect(fuseki.adapter, 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }');
+      expect(rows.length).toBeGreaterThan(0);
+      const names = (
+        await graphlessSelect(
+          fuseki.adapter,
+          'PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?name WHERE { ?s foaf:name ?name }',
+        )
+      ).map((r) => r.name.value);
+      expect(names).toContain('Alice Nakamura');
+      expect(names).toContain('Bob Chen');
+      expect(await fuseki.adapter.ask('ASK { ?s ?p ?o }')).toBe(true);
+    });
+  },
+);
