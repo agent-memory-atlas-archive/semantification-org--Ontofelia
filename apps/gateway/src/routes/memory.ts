@@ -1,7 +1,7 @@
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { GatewayContext } from '../context.js';
 import { createLogger, resolveAgentId } from '@ontofelia/core';
-import { GraphUriResolver, SHARED_GRAPHS, importVault } from '@ontofelia/semantic-memory';
+import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -286,6 +286,29 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
       }
       logger.error('Vault import failed: ' + message);
       return reply.code(500).send({ error: 'Vault import failed' });
+    }
+  });
+
+  // --- Vault-LD export (read-only) ---
+  // Writes nothing on the server and takes no folder: the notes are returned as
+  // JSON and the client decides where (and whether) to write them. Serialised
+  // with imports of the same agent so it never reads a half-applied import.
+  fastify.get('/api/knowledge/vault-export', async (
+    request: FastifyRequest<{ Querystring: { agentId?: string } }>,
+    reply,
+  ) => {
+    const agentId = resolveAgentId(request.query?.agentId);
+    if (!agents.get(agentId)) return reply.code(404).send({ error: 'Agent not found' });
+    try {
+      const report = await serialiseVaultImport(agentId, () =>
+        buildVaultExport(knowledgeEngine, { agentId }));
+      return {
+        notes: report.notes.map(n => ({ path: n.path, content: n.content })),
+        totals: report.totals,
+      };
+    } catch (e) {
+      logger.error('Vault export failed: ' + ((e as Error).message ?? ''));
+      return reply.code(500).send({ error: 'Vault export failed' });
     }
   });
 

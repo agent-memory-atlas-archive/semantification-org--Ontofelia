@@ -7,6 +7,7 @@
  */
 import type { FactInput } from '../types.js';
 import { isUserAliasSubject } from '../KnowledgeEngine.js';
+import { sparqlIri } from '../utils/SparqlSyntax.js';
 
 export interface VaultNote {
   /** Vault-relative path, e.g. 'Recipes/hummus.md'. */
@@ -51,9 +52,72 @@ function wikiTarget(inner: string): string {
   return last.replace(/\.md$/i, '').trim();
 }
 
-type Mapped = { object: string; objectType: 'literal' | 'Concept' } | { skip: string };
+/**
+ * True when a plain YAML string would be read back as a reference (wiki link
+ * or CURIE) rather than as a literal. The exporter uses this to decide which
+ * string literals must be written in the explicit `{"@value": ...}` form.
+ */
+export function isReferenceString(value: string): boolean {
+  if (WIKI_LINK.test(value)) return true;
+  const text = value.trim();
+  return CURIE.test(text) && !text.includes('//');
+}
+
+/**
+ * True when `[[name]]` is read back as exactly `name`. A name that fails this
+ * (it contains `]`, `|`, `#` or `/`, has outer whitespace or ends in `.md`)
+ * can only be written as an explicit `{"@id": name}` reference.
+ */
+export function isWikiLinkSafe(name: string): boolean {
+  const m = WIKI_LINK.exec(`[[${name}]]`);
+  return m !== null && name !== '' && wikiTarget(m[1]) === name;
+}
+
+const LANG_TAG = /^[a-zA-Z]+(-[a-zA-Z0-9]+)*$/;
+
+type Mapped =
+  | { object: string; objectType: 'literal' | 'Concept'; note?: string }
+  | { skip: string };
+
+/**
+ * Explicit forms (YAML-LD value objects), the only way to say what a plain
+ * string cannot:
+ *   `{"@value": "text"}`                      a literal, never a reference
+ *   `{"@value": "text", "@language": "de"}`   the same; the tag is validated
+ *                                             but NOT stored (the store keeps
+ *                                             plain literals), reported as unmapped
+ *   `{"@id": "name or absolute IRI"}`         a reference to exactly that name
+ * Any other object stays unmapped.
+ */
+function mapValueObject(value: Record<string, unknown>): Mapped {
+  const keys = Object.keys(value);
+  const unsupported: Mapped = { skip: 'nested object or list (not mapped)' };
+  if (keys.length === 1 && keys[0] === '@id') {
+    const id = value['@id'];
+    if (typeof id !== 'string' || !id.trim()) return { skip: 'empty reference' };
+    const name = id.trim();
+    if (/^(urn:|https?:\/\/)/.test(name)) {
+      try { sparqlIri(name); } catch { return { skip: 'invalid IRI reference' }; }
+    }
+    return { object: name, objectType: 'Concept' };
+  }
+  if (keys.includes('@value') && keys.every(k => k === '@value' || k === '@language')) {
+    const v = value['@value'];
+    if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return unsupported;
+    const text = String(v);
+    if (!text.trim()) return { skip: 'empty value' };
+    const lang = value['@language'];
+    if (lang === undefined) return { object: text, objectType: 'literal' };
+    if (typeof lang !== 'string' || !LANG_TAG.test(lang)) return { skip: 'invalid language tag' };
+    return { object: text, objectType: 'literal', note: 'language tag not stored (literal kept without it)' };
+  }
+  return unsupported;
+}
 
 function mapScalar(value: unknown): Mapped {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date)) {
+    return mapValueObject(value as Record<string, unknown>);
+  }
   if (value instanceof Date) return { object: value.toISOString(), objectType: 'literal' };
   if (typeof value === 'number' || typeof value === 'boolean') {
     return { object: String(value), objectType: 'literal' };
@@ -120,10 +184,13 @@ export function mapVaultNote(note: VaultNote): VaultNoteMapping {
     for (const v of values) {
       const m = mapScalar(v);
       if ('skip' in m) {
-        const reason = typeof v === 'object' && v !== null && !(v instanceof Date)
+        const reason = m.skip === 'unsupported value type' && typeof v === 'object' && v !== null
           ? 'nested object or list (not mapped)' : m.skip;
         if (!unmapped.some(u => u.key === key && u.reason === reason)) unmapped.push({ key, reason });
         continue;
+      }
+      if (m.note && !unmapped.some(u => u.key === key && u.reason === m.note)) {
+        unmapped.push({ key, reason: m.note });
       }
       facts.push({
         // subjectType 'Concept' (the generic type the parser uses) makes

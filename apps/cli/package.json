@@ -22,6 +22,7 @@
     "@ontofelia/gateway": "workspace:^",
     "@ontofelia/providers": "workspace:*",
     "@ontofelia/scheduler": "workspace:^",
+    "@ontofelia/semantic-memory": "workspace:*",
     "chalk": "^5.6.2",
     "commander": "^14.0.3",
     "defu": "^6.1.7",
@@ -30,7 +31,7 @@
   "devDependencies": {
     "ts-morph": "^28.0.0",
     "typescript": "~5.7.0",
-    "vitest": "^2.0.5"
+    "vitest": "^3.2.6"
   },
   "license": "Apache-2.0"
 }
