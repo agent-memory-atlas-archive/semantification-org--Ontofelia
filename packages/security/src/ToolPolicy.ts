@@ -86,10 +86,21 @@ export class ToolPolicyEngine {
 
     // A non-owner person in a chat gets no host tool, not even with approval and
     // not through the allow-list: approving pairing grants a conversation, not
-    // the owner's machine. Machine senders (webhook, node) are not covered here.
+    // the owner's machine.
     if (context.isOwner === false && ToolPolicyEngine.PERSON_CHANNELS.has(String(context.channelType))
         && ToolPolicyEngine.isHostTool(tool)) {
       return { allowed: false, reason: 'Host tools are reserved for the owner' };
+    }
+
+    // A webhook gets no host tool either, on the same terms: its text often
+    // comes from third parties and the answer goes back to the caller. Only a
+    // webhook whose stored configuration sets `allowHostTools: true` falls
+    // through to the rules below. Fail closed: anything but a literal `true` is
+    // off. Nodes (paired devices) are the other machine sender and stay
+    // ungated: the owner pairs them.
+    if (context.channelType === 'webhook' && context.allowHostTools !== true
+        && ToolPolicyEngine.isHostTool(tool)) {
+      return { allowed: false, reason: 'Host tools are reserved for the owner; this webhook does not have allowHostTools set' };
     }
 
     if (ToolPolicyEngine.DEFAULT_DENY.has(tool.name) && !this.config.allow.includes(tool.name)) {
