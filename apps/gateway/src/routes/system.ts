@@ -5,7 +5,7 @@ import { safeCompareSecret } from '@ontofelia/security';
 
 export default async function systemRoutes(fastify: FastifyInstance, ctx: GatewayContext) {
   const { agents, config, fusekiManager, triplestore, channelRegistry,
-    conflictDetector, reflectionRunner, mediaStore, signedUrlService,
+    conflictDetector, reflectionRunner, knowledgeEngine, mediaStore, signedUrlService,
     mimeDetector, nodeRegistry, webhookRegistry } = ctx;
 
   // Bearer guard for routes that live OUTSIDE the global /api/* auth hook
@@ -70,6 +70,16 @@ export default async function systemRoutes(fastify: FastifyInstance, ctx: Gatewa
 
   fastify.post('/api/reasoning/reflect', async () => {
     return reflectionRunner.reflect(PRIMARY_AGENT_ID);
+  });
+
+  // Run the reasoning catch-up now (same call as the background job): rebuilds
+  // the inferred graphs when the reasoning gate left them stale. `?force=true`
+  // rebuilds even when nothing is marked stale.
+  fastify.post('/api/reasoning/catchup', async (request: FastifyRequest<{ Querystring: { force?: string } }>) => {
+    const force = request.query.force === 'true' || request.query.force === '1';
+    const result = await knowledgeEngine.catchUpInferredGraphs(PRIMARY_AGENT_ID, { force });
+    const staleSince = await knowledgeEngine.inferredStaleSince(PRIMARY_AGENT_ID).catch(() => undefined);
+    return { ...result, staleSince: staleSince ?? null };
   });
 
   fastify.post('/webhooks/:path', async (request: FastifyRequest<{ Params: { path: string }, Body: unknown }>, reply) => {
