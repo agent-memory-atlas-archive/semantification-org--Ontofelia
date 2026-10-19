@@ -204,9 +204,9 @@ cogt:payload     a owl:DatatypeProperty ;
 
 # Goals
 cogt:goalType         a owl:ObjectProperty ;
-    rdfs:domain cogt:Goal ; rdfs:range cogt:GoalType .
-# As stored by GoalStack the value is an IRI (e.g. cogt:AnswerQuestion). The TBox in
-# ontofelia-core.ttl declares the property an owl:DatatypeProperty (xsd:string).
+    rdfs:domain cogt:Goal .
+# The value is the IRI of a subclass of cogt:GoalType (e.g. cogt:AnswerQuestion), as
+# GoalStack stores it; no rdfs:range, since the value is a class, not an instance.
 cogt:goalStatus       a owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:string .
 cogt:parentGoal       a owl:ObjectProperty ;
