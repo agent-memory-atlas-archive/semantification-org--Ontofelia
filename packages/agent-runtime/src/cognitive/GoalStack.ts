@@ -54,8 +54,10 @@ export type GoalId = string;
 
 /**
  * Goal type taxonomy (doc 07 §2.2, registered in the TBox). `RespondToUser` is
- * the implicit safety-net goal; `ResolveConflict` and `CompletePlan` are
- * reserved for later steps and are never created by the goal decision tree.
+ * the implicit safety-net goal; `ResolveConflict` is created by the cycle
+ * manager for a conflict the turn surfaced in the sender's own data (not by the
+ * goal decision tree); `CompletePlan` is reserved for a later step and is never
+ * created yet.
  */
 export const GOAL_TYPES = {
   RespondToUser: `${COGT}RespondToUser`,

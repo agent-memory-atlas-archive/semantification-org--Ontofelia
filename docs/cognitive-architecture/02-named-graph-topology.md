@@ -51,21 +51,23 @@ or cycle ID.
 
 | URI | Role | Writable by | Retention |
 |---|---|---|---|
-| `urn:<agent>:cog:episodic` | Episodic LTM. All `cog:Episode` records. | `perception`, `execution`, `learning` phases (pipeline) | Tiered: full for 30 d, summarised for 1 y, deleted on user request |
-| `urn:<agent>:cog:procedural` | Procedural LTM. `cog:SkillTrace` + `cog:Skill` summaries. | `action-selection`, `learning` phases (pipeline) | Indefinite; traces older than 90 d may be compressed to skill summaries |
-| `urn:<agent>:cog:meta` | Reflective markers (one per cycle) + cross-cycle metacognitive notes | `learning` phase + scheduled metacog jobs | Indefinite, but rotated: detailed for 30 d, summary thereafter |
+| `urn:<agent>:cog:episodic` | Episodic LTM. All `cog:Episode` records. | `perception`, `execution`, `learning` phases (`core:writableBy "cognition"`) | Tiered: full for 30 d, summarised for 1 y, deleted on user request |
+| `urn:<agent>:cog:procedural` | Procedural LTM. `cog:SkillTrace` + `cog:Skill` summaries. | `action-selection`, `learning` phases (`core:writableBy "cognition"`) | Indefinite; traces older than 90 d may be compressed to skill summaries |
+| `urn:<agent>:cog:meta` | Reflective markers (one per cycle) + cross-cycle metacognitive notes | `learning` phase + scheduled metacog jobs (`core:writableBy "cognition"`) | Indefinite, but rotated: detailed for 30 d, summary thereafter (rotation is not implemented: nothing rotates or expires `cog:meta`) |
 
 ### 2.2 Parameterised graphs (per session and per cycle)
 
 | URI pattern | Role | Lifetime |
 |---|---|---|
-| `urn:<agent>:cog:working:<sessionId>:<cycleId>` | Working memory for one cycle. All buffers. | Cleared at cycle close; high-salience entries copied to next cycle's WM |
+| `urn:<agent>:cog:working:<sessionId>:<cycleId>` | Working memory for one cycle. All buffers. | Marked closed at cycle close (`cogt:closedAt` on the graph resource; nothing is deleted); high-salience entries copied to next cycle's WM; dropped by the 7-day age sweep |
 | `urn:<agent>:cog:goals:<sessionId>` | Goal stack for one session. Goals can outlive the session if they have a deadline beyond it; in that case they migrate to `urn:<agent>:cog:goals:longterm`. | Session lifetime + migration |
-| `urn:<agent>:cog:goals:longterm` | Goals with deadline > session boundary. Fixed graph but added here because it parallels the session one. | Indefinite until resolved/abandoned |
+| `urn:<agent>:cog:goals:longterm` | Goals with deadline > session boundary. A fixed URI, but accepted by the same `COG_PARAM` pattern as the session graphs (`longterm` is the reserved scope), not by the registry's exact list. | Indefinite until resolved/abandoned |
 | `urn:<agent>:cog:cycles:<sessionId>` | Cycle metadata — one `cog:Cycle` resource per turn, with phase records. | Session lifetime + 30 d for replay/debug |
 
-The cycle ID format is `cycle_<utc-iso>_<seq>`, e.g.
-`cycle_2026-05-31T18-04-32Z_001`.
+As built, the cycle ID is `cyc-<uuid>`, minted per turn (e.g.
+`cyc-0b7e2f4a-6c1d-4f0e-9a53-2d8c1e7b4a90`). The cycle resource is
+`urn:<agent>:cog:cycle:<id>`, and its phases are `<cycle IRI>_<n>` for n = 1
+to 6.
 
 ### 2.3 Shared additions
 
@@ -189,8 +191,8 @@ cogt:actor       a owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:range core:Person .
 
 # Working memory
-cogt:writtenTo   a owl:ObjectProperty ;
-    rdfs:domain cogt:WorkingMemoryEntry ; rdfs:range cogt:Buffer .
+cogt:writtenTo   a owl:DatatypeProperty ;    # the buffer name as a plain literal, e.g. "perceptionBuffer"
+    rdfs:domain cogt:WorkingMemoryEntry ; rdfs:range xsd:string .
 cogt:salience    a owl:DatatypeProperty ;
     rdfs:domain cogt:WorkingMemoryEntry ; rdfs:range xsd:decimal .
 cogt:writtenAt   a owl:DatatypeProperty ;
@@ -203,7 +205,9 @@ cogt:payload     a owl:DatatypeProperty ;
 # Goals
 cogt:goalType         a owl:ObjectProperty ;
     rdfs:domain cogt:Goal ; rdfs:range cogt:GoalType .
-cogt:status           a owl:DatatypeProperty ;
+# As stored by GoalStack the value is an IRI (e.g. cogt:AnswerQuestion). The TBox in
+# ontofelia-core.ttl declares the property an owl:DatatypeProperty (xsd:string).
+cogt:goalStatus       a owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:string .
 cogt:parentGoal       a owl:ObjectProperty ;
     rdfs:domain cogt:Goal ; rdfs:range cogt:Goal .
@@ -211,14 +215,14 @@ cogt:priority         a owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:decimal .
 cogt:successCriterion a owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:string .
-cogt:deadline         a owl:DatatypeProperty ;
+cogt:dueAt            a owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:dateTime .
 cogt:triggeredByEpisode a owl:ObjectProperty ;
     rdfs:domain cogt:Goal ; rdfs:range cogt:Episode .
 
 # Procedural
-cogt:forGoalType  a owl:ObjectProperty ;
-    rdfs:domain cogt:SkillTrace ; rdfs:range cogt:GoalType .
+cogt:forGoalType  a owl:DatatypeProperty ;     # the goal type's IRI, stored as a plain literal
+    rdfs:domain cogt:SkillTrace ; rdfs:range xsd:string .
 cogt:toolSequence a owl:DatatypeProperty ;
     rdfs:domain cogt:SkillTrace ; rdfs:range rdf:List .
 cogt:outcome      a owl:DatatypeProperty ;
@@ -268,26 +272,26 @@ export type GraphRole =
   | 'self' | 'skills' | 'setup'
   | 'claims' | 'evidence'
   | 'worldview' | 'schema' | 'conflicts' | 'inferred'
+  | 'inferred-user'   // urn:<agent>:inferred:user:<userId> (in the code, not part of this concept)
   | 'user' | 'session'
   // NEW:
   | 'cog-episodic'      // urn:<agent>:cog:episodic
   | 'cog-procedural'    // urn:<agent>:cog:procedural
   | 'cog-meta'          // urn:<agent>:cog:meta
   | 'cog-working'       // urn:<agent>:cog:working:<sessionId>:<cycleId>
-  | 'cog-goals-session' // urn:<agent>:cog:goals:<sessionId>
-  | 'cog-goals-long'    // urn:<agent>:cog:goals:longterm
+  | 'cog-goals'         // urn:<agent>:cog:goals:<sessionId> or :longterm
   | 'cog-cycles';       // urn:<agent>:cog:cycles:<sessionId>
 ```
 
 ### 4.2 New entries in `registerAgent`
 
-Per-agent fixed graphs added to the `fixed` array:
+Three per-agent fixed graphs are added to the `fixed` array (the long-term goals
+graph is not among them, see 4.3):
 
 ```typescript
 [GraphUriResolver.getCogEpisodicGraph(agentId),    'cog-episodic'],
 [GraphUriResolver.getCogProceduralGraph(agentId),  'cog-procedural'],
 [GraphUriResolver.getCogMetaGraph(agentId),        'cog-meta'],
-[GraphUriResolver.getCogGoalsLongtermGraph(agentId),'cog-goals-long'],
 ```
 
 ### 4.3 New pattern validator for parameterised graphs
@@ -297,32 +301,30 @@ regex). We add a second regex covering all three cognitive parameterised
 families:
 
 ```typescript
-// Pattern: urn:<agent>:cog:(working|goals|cycles):<scope>[ :<sub> ]
+// Pattern: urn:<agent>:cog:(working|goals|cycles):<scope>[:<cycleId>]
 const COG_PARAM =
   /^urn:([a-z][a-z0-9_-]*):cog:(working|goals|cycles):([^:]+)(?::([^:]+))?$/;
 
-const m = COG_PARAM.exec(graphUri);
-if (m) {
-  const [, agentId, family, scope1, scope2] = m;
-  if (!this.agents.has(agentId)) return null;
-  // working/cycles need session + cycle, goals just session
-  if (family === 'working' && !scope2) return null;
-  return {
-    uri: graphUri,
-    role:
-      family === 'working' ? 'cog-working' :
-      family === 'goals'   ? 'cog-goals-session' :
-                             'cog-cycles',
-    agentId,
-    parameterised: true,
-  };
+const cog = COG_PARAM.exec(graphUri);
+if (cog) {
+  const [, agentId, kind, scope, cycleId] = cog;
+  // working needs session + cycle; goals and cycles take exactly one scope
+  const wellFormed = kind === 'working' ? cycleId !== undefined : cycleId === undefined;
+  if (this.agents.has(agentId) && scope.length > 0 && wellFormed) {
+    const role =
+      kind === 'working' ? 'cog-working' :
+      kind === 'goals'   ? 'cog-goals' :
+                           'cog-cycles';
+    return { uri: graphUri, role, agentId, parameterised: true };
+  }
+  return null;
 }
 ```
 
-`urn:<agent>:cog:goals:longterm` is intentionally **not** parameterised
-(it's a fixed graph), even though its URI lexically looks like the goals-by-
-session pattern. The `register` step adds it to `exact`, so it matches before
-the regex runs.
+`urn:<agent>:cog:goals:longterm` is **not** in the registry's exact list. It is
+the reserved scope `longterm` of the `goals` pattern, so this regex accepts it
+and gives it the role `cog-goals` (`parameterised: true`), like a session goal
+graph.
 
 ### 4.4 New helper methods in `GraphUriResolver`
 
@@ -366,59 +368,42 @@ records every new graph:
 GRAPH <urn:shared:meta> {
   <urn:ontofelia:cog:episodic> a core:NamedGraph ;
       core:graphType    "cog-episodic" ;
-      core:writableBy   "pipeline" ;
+      core:writableBy   "cognition" ;
       core:visibility   "agent-only" ;
-      core:retentionDays 365 ;
-      core:retentionPolicy "tiered-summarise" .
+      rdfs:comment      "Episodic long-term memory: ..." .
 
   <urn:ontofelia:cog:procedural> a core:NamedGraph ;
       core:graphType    "cog-procedural" ;
-      core:writableBy   "pipeline" ;
+      core:writableBy   "cognition" ;
       core:visibility   "agent-only" ;
-      core:retentionPolicy "indefinite-compressed" .
+      rdfs:comment      "Procedural long-term memory: ..." .
 
   <urn:ontofelia:cog:meta> a core:NamedGraph ;
       core:graphType    "cog-meta" ;
-      core:writableBy   "pipeline" ;
+      core:writableBy   "cognition" ;
       core:visibility   "agent-only" ;
-      core:retentionPolicy "rotated" .
+      rdfs:comment      "Metacognition store: ..." .
 
   <urn:ontofelia:cog:goals:longterm> a core:NamedGraph ;
       core:graphType    "cog-goals" ;
-      core:writableBy   "pipeline" ;
+      core:writableBy   "cognition" ;
       core:visibility   "agent-only" ;
-      core:retentionPolicy "until-resolved" .
+      rdfs:comment      "Durable, cross-session goals: ..." .
 }
 ```
 
-Parameterised graphs (working, goals:session, cycles) are described once at
-the pattern level:
+As built (`bootstrap/meta.ttl`), the write policy of these graphs is
+`"cognition"`, and the entries carry an `rdfs:comment` instead of retention
+properties. The retention properties of the design (`core:retentionDays`,
+`core:retentionPolicy`) are not implemented: nothing writes them to
+`urn:shared:meta`, and nothing reads them (see §6).
 
-```turtle
-GRAPH <urn:shared:meta> {
-  <urn:ontofelia:cog:working:*> a core:NamedGraphPattern ;
-      core:graphType    "cog-working" ;
-      core:writableBy   "pipeline" ;
-      core:visibility   "agent-only" ;
-      core:retentionPolicy "per-cycle" .
-
-  <urn:ontofelia:cog:goals:*> a core:NamedGraphPattern ;
-      core:graphType    "cog-goals" ;
-      core:writableBy   "pipeline" ;
-      core:visibility   "agent-only" ;
-      core:retentionPolicy "session-lifetime-plus-migration" .
-
-  <urn:ontofelia:cog:cycles:*> a core:NamedGraphPattern ;
-      core:graphType    "cog-cycles" ;
-      core:writableBy   "pipeline" ;
-      core:visibility   "agent-only" ;
-      core:retentionDays 30 .
-}
-```
-
-(`core:NamedGraphPattern` is introduced for this purpose. Alternative: keep
-the existing `core:NamedGraph` class and add a `core:isPattern true` flag.
-Open question for review.)
+The parameterised graphs (working, goals:session, cycles) are **not** listed as
+resources in `urn:shared:meta`. Like the session graphs, their URIs are minted at
+runtime and validated by the `COG_PARAM` pattern in `GraphRegistry`; the bootstrap
+file lists them only in a comment, with the write policy `"cognition"`. The
+class `core:NamedGraphPattern` (and the alternative `core:isPattern` flag) of the
+design were never added.
 
 ---
 
@@ -429,14 +414,18 @@ Open question for review.)
 | `cog:episodic` | 30 days full | 90 days summarised, 365 days episode-IDs only | On user request, or after 365 d |
 | `cog:procedural` | Traces 90 d | Skill summaries forever | Skill summaries only on agent-reset |
 | `cog:meta` | 30 d full | Forever as rotated summary | On agent-reset |
-| `cog:working:*` | One cycle | — | Cleared at cycle end (high-salience entries copied forward) |
+| `cog:working:*` | One cycle | — | Marked closed at cycle end, dropped by the 7-day age sweep (high-salience entries copied forward) |
 | `cog:goals:<session>` | Session lifetime | — | Migrates to `goals:longterm` if `deadline > sessionEnd`; otherwise deleted |
 | `cog:goals:longterm` | Until resolved/abandoned | Forever (with status `resolved`/`abandoned`) | On user request |
-| `cog:cycles:<session>` | Session lifetime + 30 d | — | Cleared 30 d after session end |
+| `cog:cycles:<session>` | Session lifetime + 30 d | — | Dropped by the age sweep 30 d after the graph's last write |
 
-Retention is enforced by a scheduled job (see
-[`packages/scheduler/src/`](../../packages/scheduler/src/)) reading
-`core:retentionPolicy` from `urn:shared:meta`.
+As built, no job reads a retention property from `urn:shared:meta`; the periods
+are constants in the code. `CogCleanup` (the daily `/cog cleanup` job) drops
+working-memory graphs 7 days and cycle graphs 30 days after their last write,
+skill traces expire after 90 days (`TRACE_RETENTION_DAYS`), and the episodic
+tiers above are applied by the retention sweep only while `cog.flagRetention` is
+on. Nothing rotates or expires `cog:meta`; its "rotated" retention is not
+implemented.
 
 ---
 
@@ -459,11 +448,10 @@ urn:john:inferred                 (existing)
 urn:john:cog:episodic             (NEW)
 urn:john:cog:procedural           (NEW)
 urn:john:cog:meta                 (NEW)
-urn:john:cog:goals:longterm       (NEW)
 
 # patterns valid for john (NEW):
 urn:john:cog:working:<sessionId>:<cycleId>
-urn:john:cog:goals:<sessionId>
+urn:john:cog:goals:<sessionId>    (sessionId may be the reserved scope "longterm")
 urn:john:cog:cycles:<sessionId>
 ```
 

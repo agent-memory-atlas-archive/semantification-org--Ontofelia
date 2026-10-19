@@ -281,7 +281,7 @@ export class CognitiveConfig {
 
   /**
    * Argument-redaction rules of the procedural traces: the built-in rules plus
-   * the JSON literal `cog:argRedactionRules` on the config subject, when set
+   * the JSON literal `cogt:argRedactionRules` on the config subject, when set
    * (see ArgRedaction.ts). A missing, broken or unreadable value gives the
    * built-in rules; configured rules can only add to them.
    */

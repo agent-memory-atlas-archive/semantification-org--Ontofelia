@@ -31,8 +31,8 @@ Written by Phase 5 (execution) for every tool call, success **or** failure.
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:trace_2026-05-31T18-12-00Z_001 a cogt:SkillTrace ;
-    cogt:traceId        "trace_2026-05-31T18-12-00Z_001" ;
+cog:trace:4f2a9c1e a cogt:SkillTrace ;
+    cogt:traceId        "tr_2026-05-31T18-12-00-412Z_4f2a9c1e" ;
     cogt:toolName       "fs_read" ;                          # required
     cogt:toolArgsHash   "sha256:1f3a..." ;                   # required, content-addressed
     cogt:toolArgsBrief  "path=/root/Ontofelia/README.md" ;   # short, human readable
@@ -40,13 +40,13 @@ cog:trace_2026-05-31T18-12-00Z_001 a cogt:SkillTrace ;
     cogt:durationMs     147 ;
     cogt:outcome        "success" ;                          # success | error | partial
     cogt:errorClass     "" ;                                 # filled iff error
-    cogt:cycleId        "cycle_2026-05-31T18-12-00Z_001" ;
+    cogt:cycleId        "cyc-0001" ;
     cogt:sessionId      "sess_2026-05-31_18-04" ;
-    cogt:forGoal        cog:goal_20260531_204900_concept ;
-    cogt:forGoalType    cogt:WriteConceptDoc ;
+    cogt:forGoal        cog:goal:c9a1e5d2 ;
+    cogt:forGoalType    "urn:shared:ontology#cog/WriteConceptDoc" ;   # plain literal holding the goal type's IRI
     cogt:sequencePos    2 ;                                  # this is the 2nd tool in this cycle
     cogt:sequenceLen    7 ;                                  # cycle ended up using 7 tools
-    cogt:previousTrace  cog:trace_2026-05-31T18-11-58Z_001 ;
+    cogt:previousTrace  cog:trace:b7d30a58 ;
     cogt:userSatisfied  true ;                               # set at cycle-end via feedback signal
     cogt:agentId        "ontofelia" .
 ```
@@ -87,9 +87,9 @@ Maintained by the background consolidation job (§5). One row per
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
+cog:skill:fs_read:writeconceptdoc a cogt:Skill ;
     cogt:toolName        "fs_read" ;
-    cogt:forGoalType     cogt:WriteConceptDoc ;
+    cogt:forGoalType     "urn:shared:ontology#cog/WriteConceptDoc" ;
     cogt:successCount    42 ;
     cogt:failureCount    3 ;
     cogt:partialCount    1 ;
@@ -98,8 +98,8 @@ cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
     cogt:lastUsedAt      "2026-05-31T18:12:00Z"^^xsd:dateTime ;
     cogt:successRate     "0.93"^^xsd:decimal ;
     cogt:satisfactionRate "0.88"^^xsd:decimal ;          # of successCount, share with userSatisfied = true
-    cogt:hasTrace        cog:trace_2026-05-31T18-12-00Z_001,
-                         cog:trace_2026-05-31T18-11-58Z_001 ;
+    cogt:hasTrace        cog:trace:4f2a9c1e,
+                         cog:trace:b7d30a58 ;
     cogt:typicalArgPattern "path=/root/Ontofelia/{*}.md" .
 ```
 
@@ -108,18 +108,27 @@ cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
 Some skills are about a *sequence* of tools, not a single one. For these:
 
 ```turtle
-cog:seqskill_explore_repo a cogt:SequenceSkill ;
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read a cogt:SequenceSkill ;
     cogt:label           "explore_repo" ;
-    cogt:forGoalType     cogt:CodeAnalysisGoal ;
-    cogt:hasStep         [ cogt:stepIndex 1 ; cogt:toolName "fs_list" ;
-                           cogt:notes "list package roots" ] ,
-                         [ cogt:stepIndex 2 ; cogt:toolName "fs_read" ;
-                           cogt:notes "READMEs and root manifests" ] ,
-                         [ cogt:stepIndex 3 ; cogt:toolName "fs_read" ;
-                           cogt:notes "deep-dive into the largest packages" ] ;
-    cogt:successCount    7 ;
-    cogt:meanDurationMs  3842 .
+    cogt:forGoalType     "urn:shared:ontology#cog/CodeAnalysisGoal" ;
+    cogt:hasStep         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:1 ,
+                         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:2 ,
+                         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:3 ;
+    cogt:successCount    7 .
+
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:1
+    cogt:stepIndex 1 ; cogt:toolName "fs_list" .
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:2
+    cogt:stepIndex 2 ; cogt:toolName "fs_read" .
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:3
+    cogt:stepIndex 3 ; cogt:toolName "fs_read" .
 ```
+
+As built, the steps are IRI resources (`<skill IRI>:step:<n>`) that carry
+`stepIndex` and `toolName` only; `cogt:notes` is not written. A sequence skill
+carries `successCount`, `failureCount`, `successRate`, `satisfactionRate` and
+`agentId`; `meanDurationMs` and `lastUsedAt` are not written for it (only for
+single-tool skills).
 
 Sequence skills are first-class because action selection should sometimes
 choose a *sequence template* rather than a single next tool. (See §6.)
@@ -138,7 +147,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?skill ?tool ?successRate ?satRate ?meanMs WHERE {
   GRAPH <urn:ontofelia:cog:procedural> {
     ?skill a cogt:Skill ;
-           cogt:forGoalType      cogt:WriteConceptDoc ;
+           cogt:forGoalType      "urn:shared:ontology#cog/WriteConceptDoc" ;
            cogt:toolName         ?tool ;
            cogt:successRate      ?successRate ;
            cogt:satisfactionRate ?satRate ;
@@ -287,7 +296,7 @@ files). Two rules:
   values for the same logical args do not look like different calls.
 - **`toolArgsBrief`** is the human-readable form that ends up in retrieval;
   it is mandatorily redacted (`token=*****`, paths shortened to a base).
-  The redaction map lives in `urn:<agent>:setup` (`cog:argRedactionRules`).
+  The redaction map lives in `urn:<agent>:setup` (`cogt:argRedactionRules`).
 
 This keeps procedural memory shareable for cross-session learning without
 leaking credentials into a long-lived store.
@@ -313,24 +322,23 @@ memory_store`. After the consolidation job runs:
 
 ```turtle
 GRAPH <urn:ontofelia:cog:procedural> {
-  cog:seqskill_concept_doc_writing a cogt:SequenceSkill ;
+  cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store a cogt:SequenceSkill ;
       cogt:label "concept_doc_writing" ;
-      cogt:forGoalType  cogt:WriteConceptDoc ;
+      cogt:forGoalType  "urn:shared:ontology#cog/WriteConceptDoc" ;
       cogt:hasStep
-        [ cogt:stepIndex 1 ; cogt:toolName "fs_list" ;
-          cogt:notes "Inventory target directory" ] ,
-        [ cogt:stepIndex 2 ; cogt:toolName "fs_read" ;
-          cogt:notes "Read existing related docs to align style" ] ,
-        [ cogt:stepIndex 3 ; cogt:toolName "fs_write" ;
-          cogt:notes "Write the new doc(s)" ] ,
-        [ cogt:stepIndex 4 ; cogt:toolName "memory_store" ;
-          cogt:notes "Record decisions for future reference" ] ;
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:1 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:2 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:3 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:4 ;
       cogt:successCount    7 ;
       cogt:failureCount    0 ;
-      cogt:meanDurationMs  41382 ;
       cogt:successRate     "1.0"^^xsd:decimal ;
-      cogt:satisfactionRate "0.86"^^xsd:decimal ;
-      cogt:lastUsedAt      "2026-05-31T20:55:00Z"^^xsd:dateTime .
+      cogt:satisfactionRate "0.86"^^xsd:decimal .
+
+  # one resource per step, e.g.
+  cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:1
+      cogt:stepIndex 1 ; cogt:toolName "fs_list" .
+  # ... steps 2 to 4 the same way: fs_read, fs_write, memory_store
 }
 ```
 
@@ -383,7 +391,7 @@ there are no new reads or writes and the prompt is unchanged.
   `token|secret|passw|key|auth|cookie|credential` (at any depth), values that
   match a known credential shape, hex runs of 32+ characters, base64-like runs of
   40+, and `Bearer`/`Basic` credentials. The setup graph may add rules with one
-  JSON literal `cog:argRedactionRules` on the cognitive config subject:
+  JSON literal `cogt:argRedactionRules` on the cognitive config subject:
   `{"keyPatterns": ["^pin$"], "valuePatterns": ["^[0-9]{16}$"]}`. Configured
   rules only add to the built-ins.
 - **Retention.** Traces and adherence summaries older than 90 days are deleted
