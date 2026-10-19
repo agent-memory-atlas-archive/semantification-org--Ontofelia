@@ -86,7 +86,8 @@ export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
   { name: 'flagPromptShadow', key: 'promptShadow', description: 'Run the prompt assembler beside the normal prompt and record its output and a diff; the prompt is unchanged.' },
   { name: 'flagWorkingMemoryPrompt', key: 'workingMemoryPrompt', description: 'Build the cognitive prompt blocks (self, goal, recalled, skills, note) from working memory instead of the legacy strings.' },
   { name: 'flagInitiative', key: 'initiative', description: 'Allow self-started goal wakes (kill switch for unattended work).' },
-  { name: 'flagEpisodicConsolidation', key: 'episodicConsolidation', description: 'Daily, promote facts a user asserted in several independent episodes into that user\'s own graph (never the worldview).' },  { name: 'flagPreferenceConsolidation', key: 'preferenceConsolidation', description: 'Daily, promote a button choice a user repeated over the same alternatives into that user\'s own graph as a preference (never the worldview, never Guardian approvals).' },
+  { name: 'flagEpisodicConsolidation', key: 'episodicConsolidation', description: 'Daily, promote facts a user asserted in several independent episodes into that user\'s own graph (never the worldview).' },
+  { name: 'flagPreferenceConsolidation', key: 'preferenceConsolidation', description: 'Daily, promote a button choice a user repeated over the same alternatives into that user\'s own graph as a preference (never the worldview, never Guardian approvals).' },
 ];
 
 /**
