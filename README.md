@@ -119,7 +119,7 @@ EVAL_PROVIDER=openrouter EVAL_MODELS="deepseek/deepseek-v4-flash,openai/gpt-4o-m
 - Store facts as **real RDF triples** (not reified meta-data) — entities become OWL individuals
 - Build and evolve an **OWL ontology** (TBox) with automatic class/property extension
 - **KnowledgeEngine** — entity resolution, property resolution, ABox insertion, provenance
-- **OWL-DL reasoning** — automatic inference, consistency checking, disjoint class detection
+- **OWL 2 RL reasoning** (Reasonable) — rule-based materialisation of inferred triples; not an OWL-DL reasoner and no full consistency check. A separate SPARQL check flags entities in two disjoint classes as conflict records
 - **SPARQL 1.1** queries for precise, structured knowledge retrieval
 - Provenance tracking — every triple knows when/where/how it was learned
 
@@ -395,7 +395,7 @@ pnpm --filter @ontofelia/tools test
 - [x] Core architecture (Gateway, CLI, Agent Runtime)
 - [x] WebChat UI with real-time WebSocket
 - [x] Semantic Memory with embedded Oxigraph triplestore
-- [x] OWL-DL reasoning, ontology versioning, reflection
+- [x] OWL 2 RL reasoning, ontology versioning, reflection
 - [x] Tool system with policy engine and audit log
 - [x] Multi-channel support (Telegram, Discord)
 - [x] Skills and plugin system
