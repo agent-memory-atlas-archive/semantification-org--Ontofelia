@@ -11,7 +11,7 @@ import { InMemoryAdapter } from '@ontofelia/semantic-memory';
 import memoryRoutes from '../memory.js';
 import type { GatewayContext } from '../../context.js';
 
-const GRAPH = 'urn:ontofelia:agent:ontofelia:abox';
+const GRAPH = 'urn:ontofelia:worldview';
 const EX = 'http://example.org/';
 const DEADLINE_MS = 200;
 // Transitive closure over a chain is roughly quadratic; 2000 nodes take a few

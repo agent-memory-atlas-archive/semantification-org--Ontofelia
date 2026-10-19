@@ -8,7 +8,7 @@ import * as os from 'os';
 import { AuditLog } from '@ontofelia/tools';
 import { fileURLToPath } from 'url';
 import { Parser, Generator, type SparqlQuery } from 'sparqljs';
-import { checkQueryAst } from '../sparqlGuard.js';
+import { checkQueryAst, httpReadableGraphs } from '../sparqlGuard.js';
 
 const PRIMARY_AGENT_ID = 'ontofelia';
 
@@ -179,8 +179,14 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
    * SERVICE clause anywhere yields 400. Every triple pattern must lie inside a
    * GRAPH pattern, unless the query has a FROM clause that defines the default
    * graph; otherwise 400 (some backends expose the union of all graphs as the
-   * default graph). A GRAPH pattern with a variable name,
-   * or any user or session graph IRI (GRAPH, FROM, FROM NAMED), yields 403.
+   * default graph). A GRAPH pattern with a variable name, or any graph IRI
+   * (GRAPH, FROM, FROM NAMED) that is not on the allowlist of
+   * `httpReadableGraphs`, yields 403. The allowlist holds only graphs the agent
+   * shows to every user anyway; the agent-wide graphs that carry other users'
+   * data (claims, evidence, conflicts, episodic and the other cog graphs) and all
+   * user, inferred-user and session graphs are refused, whoever the caller is.
+   * The only credential is the gateway bearer token (see index.ts), which does
+   * not identify a user, so no per-caller widening exists.
    *
    * SELECT results are capped at 1000 rows (the query is rewritten to LIMIT
    * min(user limit, 1001); a 1001st row only sets `truncated`).
@@ -220,7 +226,9 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
       return reply.code(400).send({ error: 'Only SELECT and ASK queries are allowed' });
     }
 
-    const violation = checkQueryAst(parsed);
+    // Closed allowlist, rebuilt per request so agents added later are covered.
+    const allowedGraphs = httpReadableGraphs([PRIMARY_AGENT_ID, ...(agents ? agents.keys() : [])]);
+    const violation = checkQueryAst(parsed, allowedGraphs);
     if (violation) {
       return reply.code(violation.status).send({ error: violation.message });
     }

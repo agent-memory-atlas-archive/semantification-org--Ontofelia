@@ -10,7 +10,7 @@ import { getDefaultConfig } from '@ontofelia/config';
 import memoryRoutes from '../memory.js';
 import type { GatewayContext } from '../../context.js';
 
-const ABOX = 'urn:ontofelia:agent:ontofelia:abox';
+const ABOX = 'urn:ontofelia:worldview';
 const EX = 'http://example.org/';
 
 interface OxiTerm { termType: string; value: string }
@@ -57,7 +57,7 @@ describe('POST /api/knowledge/sparql', () => {
     await store.insertTriples('urn:ontofelia:user:alice', [
       { subject: EX + 'secret', predicate: EX + 'knows', object: EX + 'x' },
     ]);
-    await store.insertTriples('urn:ontofelia:bulk', Array.from({ length: 1005 }, (_, i) => ({
+    await store.insertTriples('urn:ontofelia:worldview', Array.from({ length: 1005 }, (_, i) => ({
       subject: EX + 'bulk/' + i, predicate: EX + 'kind', object: EX + 'Bulk',
     })));
 
@@ -161,17 +161,17 @@ describe('POST /api/knowledge/sparql', () => {
   });
 
   it('caps SELECT at 1000 rows and flags truncation', async () => {
-    const res = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:bulk> { ?s <${EX}kind> ?o } }`);
+    const res = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:worldview> { ?s <${EX}kind> ?o } }`);
     expect(res.statusCode).toBe(200);
     expect(res.json().bindings).toHaveLength(1000);
     expect(res.json().truncated).toBe(true);
   });
 
   it('respects a smaller user LIMIT and does not raise a larger one', async () => {
-    const small = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:bulk> { ?s <${EX}kind> ?o } } LIMIT 5`);
+    const small = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:worldview> { ?s <${EX}kind> ?o } } LIMIT 5`);
     expect(small.json().bindings).toHaveLength(5);
     expect(small.json().truncated).toBe(false);
-    const big = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:bulk> { ?s <${EX}kind> ?o } } LIMIT 5000`);
+    const big = await post(`SELECT ?s WHERE { GRAPH <urn:ontofelia:worldview> { ?s <${EX}kind> ?o } } LIMIT 5000`);
     expect(big.json().bindings).toHaveLength(1000);
     expect(big.json().truncated).toBe(true);
   });

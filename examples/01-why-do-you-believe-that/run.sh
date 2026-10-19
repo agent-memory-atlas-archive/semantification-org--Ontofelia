@@ -16,14 +16,13 @@ chat "Please remember: Ada Marlowe is a person, and she works at Helios Robotics
 echo "== 2. Ask the agent to justify its belief (reply is LLM-dependent) =="
 chat "Why do you believe that Ada Marlowe works at Helios Robotics?"
 
-# Steps 3-5 read the graph through the read-only SPARQL endpoint
+# Step 3 reads the fact through the read-only SPARQL endpoint
 # (POST /api/knowledge/sparql). Every triple pattern sits inside an explicit
-# GRAPH <iri>; user and session graphs are not readable there. A third party
-# such as Ada lands in the agent's worldview graph, its claim in the claims
-# graph and its evidence in the evidence graph (urn:<agent>:<role>).
+# GRAPH <iri>. The endpoint serves only graphs that hold no private user data:
+# user, session, claims, evidence and the cognitive graphs are refused (403)
+# because they carry other users' messages. A third party such as Ada lands in
+# the agent's worldview graph, which is served.
 WORLDVIEW="urn:$ONTOFELIA_AGENT:worldview"
-CLAIMS="urn:$ONTOFELIA_AGENT:claims"
-EVIDENCE="urn:$ONTOFELIA_AGENT:evidence"
 
 echo "== 3. The fact itself — real RDF triples in the worldview graph =="
 sparql "SELECT ?subject ?predicate ?object WHERE {
@@ -33,36 +32,13 @@ sparql "SELECT ?subject ?predicate ?object WHERE {
   }
 } ORDER BY ?predicate"
 
+# Steps 4 and 5 use the operator's graph dump (GET /api/knowledge/graphs), not
+# SPARQL: claims and evidence mix every user's data, so the SPARQL endpoint
+# refuses them.
 echo "== 4. The claim behind the fact — status, confidence, timestamps =="
-sparql "PREFIX onto: <urn:shared:ontology#>
-SELECT ?predicate ?object ?status ?confidence ?confidenceLabel ?learnedAt WHERE {
-  GRAPH <$CLAIMS> {
-    ?claim a onto:Claim ;
-           onto:claimSubject ?subject ;
-           onto:claimPredicate ?predicate ;
-           onto:claimObject ?object ;
-           onto:status ?status ;
-           onto:confidence ?confidence ;
-           onto:confidenceLabel ?confidenceLabel ;
-           onto:learnedAt ?learnedAt .
-    FILTER(CONTAINS(STR(?subject), \"Ada\"))
-  }
-} ORDER BY ?predicate"
+show_graph claims Ada
 
 echo "== 5. The evidence — the exact utterance the fact was learned from =="
-sparql "PREFIX onto: <urn:shared:ontology#>
-SELECT ?predicate ?evidenceType ?rawText ?capturedAt WHERE {
-  GRAPH <$CLAIMS> {
-    ?claim onto:claimSubject ?subject ;
-           onto:claimPredicate ?predicate ;
-           onto:hasEvidence ?evidence .
-    FILTER(CONTAINS(STR(?subject), \"Ada\"))
-  }
-  GRAPH <$EVIDENCE> {
-    ?evidence onto:evidenceType ?evidenceType ;
-              onto:rawText ?rawText ;
-              onto:capturedAt ?capturedAt .
-  }
-} ORDER BY ?predicate"
+show_graph evidence Ada
 
 echo "Done. Every fact in Ontofelia's memory is auditable like this."

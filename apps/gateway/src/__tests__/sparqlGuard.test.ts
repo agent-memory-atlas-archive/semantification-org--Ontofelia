@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { Parser } from 'sparqljs';
-import { checkQueryAst } from '../sparqlGuard.js';
+import { checkQueryAst, httpReadableGraphs } from '../sparqlGuard.js';
 
-const check = (q: string) => checkQueryAst(new Parser().parse(q));
+const ALLOWED = httpReadableGraphs(['ontofelia']);
+const check = (q: string) => checkQueryAst(new Parser().parse(q), ALLOWED);
 
 describe('sparqlGuard', () => {
   it('accepts explicit public graph patterns', () => {
-    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:agent:ontofelia:abox> { ?s ?p ?o } }')).toBeNull();
+    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } }')).toBeNull();
     expect(check('SELECT * FROM <urn:ontofelia:worldview> WHERE { ?s ?p ?o }')).toBeNull();
   });
 
@@ -55,9 +56,21 @@ describe('sparqlGuard', () => {
     }
   });
 
-  it('does not reject near-miss public graph names', () => {
-    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:users> { ?s ?p ?o } }')).toBeNull();
-    expect(check('SELECT * WHERE { GRAPH <urn:other:user:a> { ?s ?p ?o } }')).toBeNull();
+  it('refuses near-miss names too: only listed graphs pass', () => {
+    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:users> { ?s ?p ?o } }')?.status).toBe(403);
+    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:worldview2> { ?s ?p ?o } }')?.status).toBe(403);
+    expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:WORLDVIEW> { ?s ?p ?o } }')?.status).toBe(403);
+  });
+
+  it('refuses other agents\' private graphs, which the old prefix list missed', () => {
+    for (const q of [
+      'SELECT * WHERE { GRAPH <urn:other:user:a> { ?s ?p ?o } }',
+      'SELECT * WHERE { GRAPH <urn:other:session:a> { ?s ?p ?o } }',
+      'SELECT * WHERE { GRAPH <urn:ontofelia:inferred:user:a> { ?s ?p ?o } }',
+    ]) {
+      expect(check(q)?.status, q).toBe(403);
+      expect(check(q)?.message, q).toMatch(/private graph/);
+    }
   });
 
   describe('triple patterns outside GRAPH', () => {
@@ -66,14 +79,14 @@ describe('sparqlGuard', () => {
         'SELECT * WHERE { ?s ?p ?o }',
         'SELECT * WHERE { ?s <http://example.org/p>+ ?o }',
         'ASK { ?s ?p ?o }',
-        'SELECT * WHERE { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } ?a ?b ?c }',
-        'SELECT * WHERE { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } OPTIONAL { ?a ?b ?c } }',
-        'SELECT * WHERE { { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } } UNION { ?a ?b ?c } }',
-        'SELECT * WHERE { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } MINUS { ?a ?b ?c } }',
-        'SELECT * WHERE { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } FILTER EXISTS { ?a ?b ?c } }',
-        'SELECT * WHERE { GRAPH <urn:ontofelia:abox> { ?s ?p ?o } FILTER NOT EXISTS { ?a ?b ?c } }',
+        'SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } ?a ?b ?c }',
+        'SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } OPTIONAL { ?a ?b ?c } }',
+        'SELECT * WHERE { { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } } UNION { ?a ?b ?c } }',
+        'SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } MINUS { ?a ?b ?c } }',
+        'SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } FILTER EXISTS { ?a ?b ?c } }',
+        'SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { ?s ?p ?o } FILTER NOT EXISTS { ?a ?b ?c } }',
         'SELECT * WHERE { { SELECT * WHERE { ?a ?b ?c } } }',
-        'SELECT * FROM NAMED <urn:ontofelia:abox> WHERE { ?s ?p ?o }',
+        'SELECT * FROM NAMED <urn:ontofelia:worldview> WHERE { ?s ?p ?o }',
       ]) {
         const v = check(q);
         expect(v?.status, q).toBe(400);
@@ -82,8 +95,8 @@ describe('sparqlGuard', () => {
     });
 
     it('accepts graph-less patterns when FROM defines the default graph', () => {
-      expect(check('SELECT * FROM <urn:ontofelia:abox> WHERE { ?s ?p ?o OPTIONAL { ?a ?b ?c } }')).toBeNull();
-      expect(check('SELECT * FROM <urn:ontofelia:abox> WHERE { { SELECT * WHERE { ?a ?b ?c } } }')).toBeNull();
+      expect(check('SELECT * FROM <urn:ontofelia:worldview> WHERE { ?s ?p ?o OPTIONAL { ?a ?b ?c } }')).toBeNull();
+      expect(check('SELECT * FROM <urn:ontofelia:worldview> WHERE { { SELECT * WHERE { ?a ?b ?c } } }')).toBeNull();
     });
 
     it('accepts queries without triple patterns', () => {
@@ -92,7 +105,7 @@ describe('sparqlGuard', () => {
     });
 
     it('still reports private graphs inside covered patterns with 403', () => {
-      expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:abox> { GRAPH <urn:ontofelia:user:a> { ?s ?p ?o } } }')?.status).toBe(403);
+      expect(check('SELECT * WHERE { GRAPH <urn:ontofelia:worldview> { GRAPH <urn:ontofelia:user:a> { ?s ?p ?o } } }')?.status).toBe(403);
     });
   });
 });

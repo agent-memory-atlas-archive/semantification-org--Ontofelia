@@ -53,13 +53,14 @@ and read the claim from the graph.
 **3. Look at the graph yourself.** The gateway has a read-only SPARQL endpoint,
 `POST /api/knowledge/sparql` (see [`docs/api.md`](../../docs/api.md)). It accepts
 only `SELECT` and `ASK`, requires every triple pattern to sit inside an explicit
-`GRAPH <iri> { ... }`, and refuses the private per-user and per-session graphs
-with `403`. Everything this recipe needs lives in the agent's shared graphs
-`urn:<agent>:worldview`, `urn:<agent>:claims` and `urn:<agent>:evidence`; the
-agent id is `ontofelia` unless you set `ONTOFELIA_AGENT`. The `sparql` helper in
-`common.sh` posts the query and prints the result as a table (IRIs shortened:
-`entity:` is `urn:ontofelia:entity:`, `core:` is `urn:ontofelia:core#`, `onto:`
-is `urn:shared:ontology#`):
+`GRAPH <iri> { ... }`, and serves only graphs that hold no private user data
+(the shared vocabulary, `urn:<agent>:worldview`, `schema`, `inferred`, `self`,
+`skills`). Everything else is refused with `403`: the per-user and per-session
+graphs, and also `claims`, `evidence`, `conflicts` and the cognitive graphs,
+because those collect the messages of every user. The agent id is `ontofelia`
+unless you set `ONTOFELIA_AGENT`. The `sparql` helper in `common.sh` posts the
+query and prints the result as a table (IRIs shortened: `entity:` is
+`urn:ontofelia:entity:`, `core:` is `urn:ontofelia:core#`):
 
 ```bash
 source ../common.sh
@@ -71,42 +72,10 @@ sparql 'SELECT ?subject ?predicate ?object WHERE {
     FILTER(CONTAINS(STR(?subject), "Ada"))
   }
 } ORDER BY ?predicate'
-
-# the claim: status, confidence, timestamps
-sparql 'PREFIX onto: <urn:shared:ontology#>
-SELECT ?predicate ?object ?status ?confidence ?confidenceLabel ?learnedAt WHERE {
-  GRAPH <urn:ontofelia:claims> {
-    ?claim a onto:Claim ;
-           onto:claimSubject ?subject ;
-           onto:claimPredicate ?predicate ;
-           onto:claimObject ?object ;
-           onto:status ?status ;
-           onto:confidence ?confidence ;
-           onto:confidenceLabel ?confidenceLabel ;
-           onto:learnedAt ?learnedAt .
-    FILTER(CONTAINS(STR(?subject), "Ada"))
-  }
-} ORDER BY ?predicate'
-
-# the evidence: the exact source utterance (joins claims and evidence graph)
-sparql 'PREFIX onto: <urn:shared:ontology#>
-SELECT ?predicate ?evidenceType ?rawText ?capturedAt WHERE {
-  GRAPH <urn:ontofelia:claims> {
-    ?claim onto:claimSubject ?subject ;
-           onto:claimPredicate ?predicate ;
-           onto:hasEvidence ?evidence .
-    FILTER(CONTAINS(STR(?subject), "Ada"))
-  }
-  GRAPH <urn:ontofelia:evidence> {
-    ?evidence onto:evidenceType ?evidenceType ;
-              onto:rawText ?rawText ;
-              onto:capturedAt ?capturedAt .
-  }
-} ORDER BY ?predicate'
 ```
 
-Output shape (claim timestamps will differ; the model may phrase predicates
-differently, so your rows can vary):
+Output shape (the model may phrase predicates differently, so your rows can
+vary):
 
 ```
 subject             predicate     object
@@ -114,19 +83,41 @@ subject             predicate     object
 entity:Ada_Marlowe  rdf:type      entity:Person
 entity:Ada_Marlowe  rdfs:label    Ada Marlowe
 entity:Ada_Marlowe  core:worksAt  entity:Helios_Robotics
-
-predicate     object                  status    confidence  confidenceLabel  learnedAt
-------------  ----------------------  --------  ----------  ---------------  ------------------------
-core:worksAt  entity:Helios_Robotics  accepted  0.95        high             2026-10-05T23:11:21.592Z
-
-predicate     evidenceType  rawText                                                                      capturedAt
-------------  ------------  ---------------------------------------------------------------------------  ------------------------
-core:worksAt  message-span  Please remember: Ada Marlowe is a person, and she works at Helios Robotics.  2026-10-05T23:11:21.589Z
 ```
 
-(Abridged. Facts about *you* are written to your private user graph, which the
-endpoint deliberately does not expose; that is why this recipe teaches the
-agent a fact about a third party.)
+The claim and the evidence live in graphs the SPARQL endpoint does not serve.
+As the operator you read them with the graph dump `GET /api/knowledge/graphs`;
+the shared helper filters it:
+
+```bash
+show_graph claims Ada       # the claim: status, confidence, timestamps
+show_graph evidence Ada     # the evidence: the exact source utterance
+```
+
+From the same run (claim and evidence IDs will differ):
+
+```
+--- graph urn:ontofelia:claims (29 triples) ---
+<urn:claim:...> a <urn:shared:ontology#Claim> ;
+  claimSubject   <urn:ontofelia:entity:Ada_Marlowe> ;
+  claimPredicate <urn:ontofelia:core#worksAt> ;
+  claimObject    <urn:ontofelia:entity:Helios_Robotics> ;
+  confidence     "0.95" ; confidenceLabel "high" ; status "accepted" ;
+  learnedAt      "2026-07-03T11:50:24.661Z" ;
+  hasEvidence    <urn:evidence:...> ;
+  sourceSpan     "Ada Marlowe is a person, and she works at Helios Robotics." .
+
+--- graph urn:ontofelia:evidence (5 triples) ---
+<urn:evidence:...> a <urn:shared:ontology#Evidence> ;
+  evidenceType "message-span" ;
+  rawText "Ada Marlowe is a person, and she works at Helios Robotics." ;
+  capturedAt "2026-07-03T11:50:24.658Z" .
+```
+
+(The API returns one triple per line; the block above is condensed for
+readability. `run.sh` shows the raw form. Facts about *you* are written to your
+private user graph, which neither endpoint path is meant for; that is why this
+recipe teaches the agent a fact about a third party.)
 
 ## What just happened
 
