@@ -401,7 +401,7 @@ explicitly rather than guess. This is enforceable from the metaBuffer:
 ```turtle
 cog:wm:<id> a cogt:WorkingMemoryEntry ;
     cogt:writtenTo "metaBuffer" ;
-    cogt:entryKind "reflection" ;
+    cogt:entryKind "unknown-nudge" ;
     cogt:salience  1.0 ;
     cogt:payload   "Retrieval was empty for entity in question. " +
                    "Acceptable answers: 'I don't know', 'never seen X', " +

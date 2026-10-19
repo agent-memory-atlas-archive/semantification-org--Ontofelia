@@ -114,7 +114,7 @@ GRAPH <urn:ontofelia:cog:episodic> {
       cogt:cycleId       "cyc-0001" ;
       cogt:sessionId     "sess_2026-05-31_18-04" ;
       cogt:channel       "webchat" ;
-      cogt:actor         <urn:entity:Alice> ;
+      cogt:actor         <urn:entity:agent-sender:alice> ;   # urn:entity:agent-sender:<URI-encoded sender id>
       cogt:about         <urn:entity:OntofeliaProject> ;
       cogt:payload       "ontofelia" ;
       cogt:salience      "0.6"^^xsd:decimal ;

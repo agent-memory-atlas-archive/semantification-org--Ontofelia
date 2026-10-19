@@ -47,7 +47,9 @@ cog:trace:4f2a9c1e a cogt:SkillTrace ;
     cogt:sequencePos    2 ;                                  # this is the 2nd tool in this cycle
     cogt:sequenceLen    7 ;                                  # cycle ended up using 7 tools
     cogt:previousTrace  cog:trace:b7d30a58 ;
-    cogt:userSatisfied  true ;                               # set at cycle-end via feedback signal
+    cogt:userSatisfied  true ;                               # back-filled from the next message of the same user
+    cogt:satisfactionWeight "0.3000"^^xsd:decimal ;          # written with userSatisfied; how much the signal counts
+    cogt:forUser        "alice" ;                            # cognitive user key of the turn's sender
     cogt:agentId        "ontofelia" .
 ```
 
@@ -249,7 +251,7 @@ export class ProceduralMemory {
   }
 
   async recordTrace(t: TraceInput): Promise<TraceId> { /* ... */ }
-  async backfillSatisfaction(traceId: TraceId, satisfied: boolean | null): Promise<void> { /* ... */ }
+  async backfillSatisfaction(traceId: TraceId, satisfied: boolean | null, weight?: number): Promise<void> { /* ... */ }
 
   async suggestSkills(forGoalType: string, k = 5): Promise<SkillSuggestion[]> { /* ... */ }
   async suggestSequenceSkills(forGoalType: string, k = 3): Promise<SequenceSkillSuggestion[]> { /* ... */ }
@@ -265,14 +267,22 @@ export interface TraceInput {
   durationMs: number;
   outcome: 'success' | 'error' | 'partial';
   errorClass?: string;
-  forGoal: string;           // goal URI
-  forGoalType: string;       // GoalType URI
-  cycleId: string;
-  sessionId: string;
+  forGoal?: string;          // goal URI
+  forGoalType?: string;      // GoalType URI
+  cycleId?: string;
+  sessionId?: string;
   sequencePos: number;
   sequenceLen?: number;      // unknown until cycle end
   previousTrace?: string;
-  proceduralAdherence: boolean | null;
+  proceduralAdherence?: boolean | null;  // null/absent: no suggestion was shown
+  forUser?: string;          // cognitive user key of the turn's sender
+  maskedArgs?: MaskedArgHash[];  // digests of masked arguments; written as cogt:maskedArg
+}
+
+export interface MaskedArgHash {
+  path: string;              // sanitised argument path
+  digest: string;            // hex digest of the raw value; the value itself is never stored
+  scheme?: 'hmac-sha256' | 'sha256';
 }
 
 export interface SkillSuggestion {
