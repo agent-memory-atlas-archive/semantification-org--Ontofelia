@@ -1673,6 +1673,21 @@ export class KnowledgeEngine {
   }
 
   /**
+   * Read-only SELECT for the Vault-LD export. The caller names every graph by
+   * explicit IRI; a query that reads a variable graph (`GRAPH ?g`), federates
+   * (`SERVICE`), imports a dataset (`FROM`) or is not a SELECT is refused.
+   */
+  async selectExplicitGraphs(sparql: string): Promise<Array<Record<string, { type: string; value: string; datatype?: string; 'xml:lang'?: string; language?: string }>>> {
+    const body = sparql;
+    if (!/^\s*(PREFIX\s+[^\s:]*:\s*<[^>]*>\s*)*SELECT\b/i.test(body)
+      || /\bGRAPH\s*[?$]/i.test(body) || /\b(SERVICE|FROM)\b/i.test(body)) {
+      throw new Error('selectExplicitGraphs: only a SELECT over explicitly named graphs is allowed');
+    }
+    const res = await this.triplestore.query(sparql);
+    return (res.bindings ?? []) as never;
+  }
+
+  /**
    * Read-only: the `sourceUri`s of the evidence behind each claim. A claim
    * without document evidence maps to an empty list. Claim URIs must be IRIs.
    */

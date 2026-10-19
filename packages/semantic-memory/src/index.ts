@@ -33,3 +33,4 @@ export * from './ingestion/SemanticIngestionService.js';
 export * from './sparql/scopeGuard.js';
 export * from './ingestion/VaultNoteMapper.js';
 export * from './ingestion/VaultImporter.js';
+export * from './export/VaultExporter.js';

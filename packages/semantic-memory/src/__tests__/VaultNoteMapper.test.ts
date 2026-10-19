@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mapVaultNote, type VaultNote } from '../ingestion/VaultNoteMapper.js';
+import { mapVaultNote, isReferenceString, isWikiLinkSafe, type VaultNote } from '../ingestion/VaultNoteMapper.js';
 import { assertValidEvidenceSourceUri } from '../provenance/ClaimProvenanceService.js';
 
 const hummus = (over: Partial<VaultNote> = {}): VaultNote => ({
@@ -96,5 +96,50 @@ describe('mapVaultNote', () => {
     expect(uri).toBe('vault://demo/Soups%20%26%20Stews/Red%20Lentil%20Soup.md');
     expect(() => assertValidEvidenceSourceUri(uri)).not.toThrow();
     expect(r.facts[0].subject).toBe('Red Lentil Soup');
+  });
+});
+
+describe('explicit value objects', () => {
+  const map = (fm: Record<string, unknown>) =>
+    mapVaultNote(hummus({ frontmatter: { type: '[[Recipe]]', ...fm } }));
+  const by = (r: ReturnType<typeof map>, k: string) => r.facts.filter(f => f.predicate === k);
+
+  it('{"@value"} is a literal even when it looks like a wiki link or a CURIE', () => {
+    const r = map({ a: { '@value': '[[X]]' }, b: { '@value': 'ex:thing' }, c: '[[X]]', d: 'ex:thing' });
+    expect(by(r, 'a')[0]).toMatchObject({ object: '[[X]]', objectType: 'literal' });
+    expect(by(r, 'b')[0]).toMatchObject({ object: 'ex:thing', objectType: 'literal' });
+    expect(by(r, 'c')[0]).toMatchObject({ object: 'X', objectType: 'Concept' });
+    expect(by(r, 'd')[0]).toMatchObject({ object: 'ex:thing', objectType: 'Concept' });
+    expect(isReferenceString('[[X]]')).toBe(true);
+    expect(isReferenceString('ex:thing')).toBe(true);
+    expect(isReferenceString('plain text')).toBe(false);
+    expect(isReferenceString('http://x/y')).toBe(false);
+  });
+
+  it('{"@language"} is validated and reported as not stored', () => {
+    const r = map({ city: { '@value': 'Köln', '@language': 'de' }, bad: { '@value': 'x', '@language': 'd e' } });
+    expect(by(r, 'city')[0]).toMatchObject({ object: 'Köln', objectType: 'literal' });
+    expect(r.unmapped).toContainEqual({ key: 'city', reason: 'language tag not stored (literal kept without it)' });
+    expect(by(r, 'bad')).toHaveLength(0);
+    expect(r.unmapped).toContainEqual({ key: 'bad', reason: 'invalid language tag' });
+  });
+
+  it('{"@id"} is a reference to exactly that name or IRI', () => {
+    const r = map({ a: { '@id': 'a/b|c#d' }, b: { '@id': 'http://example.org/x#Y' }, c: { '@id': 'http://x/a>b' } });
+    expect(by(r, 'a')[0]).toMatchObject({ object: 'a/b|c#d', objectType: 'Concept' });
+    expect(by(r, 'b')[0]).toMatchObject({ object: 'http://example.org/x#Y', objectType: 'Concept' });
+    expect(by(r, 'c')).toHaveLength(0);
+    expect(r.unmapped).toContainEqual({ key: 'c', reason: 'invalid IRI reference' });
+    expect(isWikiLinkSafe('Beta')).toBe(true);
+    expect(isWikiLinkSafe('a/b')).toBe(false);
+    expect(isWikiLinkSafe(' Beta')).toBe(false);
+  });
+
+  it('other objects stay unmapped', () => {
+    const r = map({ a: { '@value': 'x', other: 1 }, b: { foo: 1 }, c: { '@value': '  ' } });
+    expect(r.facts.filter(f => ['a', 'b', 'c'].includes(f.predicate))).toHaveLength(0);
+    expect(r.unmapped).toContainEqual({ key: 'a', reason: 'nested object or list (not mapped)' });
+    expect(r.unmapped).toContainEqual({ key: 'b', reason: 'nested object or list (not mapped)' });
+    expect(r.unmapped).toContainEqual({ key: 'c', reason: 'empty value' });
   });
 });
