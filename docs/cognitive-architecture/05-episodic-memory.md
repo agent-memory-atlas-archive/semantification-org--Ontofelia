@@ -300,7 +300,8 @@ groups). All configurable in `urn:<agent>:setup`.
 
 ### 6.4 As built: pattern 1 (repeated entity assertion)
 
-Behind `cog.flagEpisodicConsolidation` (off by default; `/cog flag
+Behind `cog.flagEpisodicConsolidation` (on in a new install, off in an
+existing one until `/cog defaults apply`; `/cog flag
 episodicconsolidation on`). A daily job (`cog.consolidate-episodes`) and the
 owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
 §6.2 on purpose, as a privacy decision:
@@ -367,8 +368,8 @@ owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
 
 ### 6.5 As built: pattern 3 (user preference)
 
-Behind `cog.flagPreferenceConsolidation` (**off by default, on new installs and
-existing ones; not part of `/cog defaults`**; `/cog flag preferenceconsolidation
+Behind `cog.flagPreferenceConsolidation` (**off by default, on new and existing
+installs alike; not part of `/cog defaults`**; `/cog flag preferenceconsolidation
 on`). It runs inside the same daily job and the same owner-only command as
 pattern 1 (`cog.consolidate-episodes`, `/cog consolidate-episodes`); each pattern
 follows its own flag, and the command reports one line per pattern that ran.

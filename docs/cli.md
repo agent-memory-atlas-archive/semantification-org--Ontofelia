@@ -314,7 +314,7 @@ These commands are available inside any chat session (Web UI, Telegram):
 | `/skills` | List installed skills |
 | `/skill <name> [input]` | Execute a skill |
 | `/plugins` | List installed plugins |
-| `/cog [health\|retain\|consolidate\|scan\|migrate\|debug on\|debug off\|cycle on\|cycle off\|cycles\|explain <cycleId>]` | Cognitive-architecture maintenance and inspection. `cycle on\|off` switches the cycle manager (needed by `arm_goal`); owner-only, live owner turn |
+| `/cog [health\|defaults [apply]\|flags\|flag <name> on\|off\|retain\|consolidate\|consolidate-episodes\|cleanup\|scan\|migrate\|debug on\|debug off\|cycle on\|cycle off\|cycles\|explain [cycleId]]` | Cognitive-architecture maintenance and inspection; owner-only. `migrate`, `debug on\|off`, `flags`, `flag <name> on\|off`, `defaults apply` and `cycle on\|off` change settings and need a live owner turn (`cycle on\|off` switches the cycle manager, needed by `arm_goal`). The others (`health`, `defaults`, `retain`, `consolidate`, `consolidate-episodes`, `cleanup`, `scan`, `cycles`, `explain`) also run from a scheduler envelope, as the daily jobs do |
 | `/goals` | List the agent's goals (owner-only) |
 | `/initiative [on\|off\|help]` | Self-initiated cycles: report, or switch on/off (owner-only) |
 | `/stop` | Stop the agent |

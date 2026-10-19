@@ -274,8 +274,10 @@ behaviour when off: the legacy path runs and nothing is written.
 The *Default* column is what a flag is when it has no triple (always off). The
 *New install* column is what the boot step of §7.1 writes on a new install.
 
-The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
-`CognitiveConfig.ts`; the test `CogDocsSync` keeps this table in step with it):
+The fourteen feature flags (the allowlist `COGNITIVE_FLAGS` in
+`CognitiveConfig.ts`; the test `describe('default-on set')` in
+`CognitiveDefaults.test.ts` keeps this table in step with it: it compares the
+rows and the *Default* and *New install* columns with `COGNITIVE_FLAGS`):
 
 | Flag | Short key | Default | New install | What it switches on |
 |---|---|---|---|---|
@@ -370,7 +372,7 @@ owner turn for `apply`):
 Every step back is one owner command and needs no restart (flags are read per
 message):
 
-- `/cog flag <name> off` turns one flag off, any of the thirteen.
+- `/cog flag <name> off` turns one flag off, any of the fourteen.
 - `/cog cycle off` turns the whole layer off for messages: they run on the
   legacy path again, and no new cycle, episode, skill-trace, working-memory or
   reflective record is written by a message. The other flags may stay on; they

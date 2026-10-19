@@ -129,7 +129,8 @@ a string, it's a graph it can interrogate.
 
 ### 2.3 As built: derived capabilities and constraints
 
-Behind `cog.flagSelfModelQuery` (default off) the capability and constraint
+Behind `cog.flagSelfModelQuery` (on in a new install, off in an existing one
+until `/cog defaults apply`) the capability and constraint
 records are **derived**, not written by hand. Seeding runs at boot and at
 `/reseed-persona`, and when the flag is switched on with `/cog flag`; with the
 flag off nothing is derived and the prompt does not change. Sources:
