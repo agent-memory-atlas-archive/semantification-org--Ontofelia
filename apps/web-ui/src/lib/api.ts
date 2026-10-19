@@ -61,6 +61,18 @@ export interface ChatMessage {
   attachments?: { name: string; type: string; data: string }[];
 }
 
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(status: number, body?: unknown) {
+    super(`API Error: ${status}`);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function apiFetch<T>(endpoint: string, token: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${endpoint}`, {
     ...options,
@@ -72,7 +84,13 @@ async function apiFetch<T>(endpoint: string, token: string, options: RequestInit
   
   if (!response.ok) {
     if (response.status === 401) throw new Error('Unauthorized');
-    throw new Error(`API Error: ${response.status}`);
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+    throw new ApiError(response.status, body);
   }
   
   return response.json();
@@ -120,11 +138,15 @@ export async function renameSession(token: string, sessionId: string, displayNam
   });
 }
 
-export async function changeModel(token: string, model: string): Promise<{ success: boolean; model: string }> {
+export async function changeModel(
+  token: string,
+  model: string,
+  force = false
+): Promise<{ success: boolean; model: string; warning?: string }> {
   return apiFetch('/config/model', token, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model })
+    body: JSON.stringify(force ? { model, force: true } : { model })
   });
 }
 
@@ -152,8 +174,9 @@ export interface CogCycleSummary {
 
 export interface CogPhase {
   phaseUri: string;
-  ordinal: number;
+  phaseIndex: number;
   phaseKind: string;
+  phaseStatus?: string;
   startedAt: string;
   endedAt: string;
 }
@@ -210,14 +233,47 @@ export interface CogGoal {
   successCriterion?: string;
   deadline?: string;
   longTerm?: boolean;
+  nextAction?: string | null;
+  waitingUntil?: string | null;
+}
+
+export interface CogInitiativeReport {
+  enabled: boolean;
+  counters: { inHour: number; maxPerHour: number; inDay: number; maxPerDay: number } | null;
+  episodes: Array<{ at: string; why: string; outcome: string | null }>;
+  notifications: Array<{ at: string; delivered: boolean; reason: string; priority: string | null }>;
+}
+
+export interface CogEpisodeBrief {
+  uri: string;
+  episodeType: string;
+  occurredAt: string;
+  payload?: string;
+  partOfGoal?: string;
+  tags: string[];
+}
+
+export interface CogGoalBrief {
+  uri: string;
+  goalLabel: string;
+  goalType: string;
+  goalStatus: string;
+  priority: number;
 }
 
 export interface CogExplainAction {
   entryId: string;
   payload: string;
   forGoal?: string;
-  goal?: CogGoal;
-  triggeringEpisode?: CogEpisode;
+  goal?: CogGoalBrief;
+  triggeringEpisode?: CogEpisodeBrief;
+  callId?: string;
+  toolName?: string;
+  args?: string;
+  outcome?: 'success' | 'error';
+  denialClass?: string;
+  durationMs?: number;
+  episodes: CogEpisodeBrief[];
 }
 
 export interface CogExplainRetrieval {
@@ -225,15 +281,21 @@ export interface CogExplainRetrieval {
   payload: string;
   refersTo?: string;
   sourceGraph?: string;
-  episode?: CogEpisode;
+  episode?: CogEpisodeBrief;
 }
 
 export interface CogExplanation {
   cycleId: string;
   cycleUri: string;
   found: boolean;
+  status?: string;
+  startedAt?: string;
+  response?: CogEpisodeBrief;
+  goals: CogGoalBrief[];
   actions: CogExplainAction[];
   retrievals: CogExplainRetrieval[];
+  workingMemory: Array<{ buffer: string; count: number; kinds: string[] }>;
+  episodes: CogEpisodeBrief[];
 }
 
 /** Thrown when the debug panel flag is off (HTTP 403). */
@@ -274,6 +336,10 @@ export function fetchCogGoals(token: string, sessionId: string): Promise<CogGoal
 export function fetchCogEpisodes(token: string, entity?: string, limit = 50): Promise<CogEpisode[]> {
   const q = entity ? `&entity=${encodeURIComponent(entity)}` : '';
   return cogFetch(`/cog/inspect/episodes?limit=${limit}${q}`, token);
+}
+
+export function fetchCogInitiative(token: string, limit = 10): Promise<CogInitiativeReport> {
+  return cogFetch(`/cog/inspect/initiative?limit=${limit}`, token);
 }
 
 export function fetchCogExplain(token: string, sessionId: string, cycleId: string): Promise<CogExplanation> {

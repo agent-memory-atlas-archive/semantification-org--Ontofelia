@@ -159,7 +159,6 @@ export const configSchema = z.object({
     target: z.string().optional(),
     // Separate, higher budget reserved for the (future) approval-request path
     // so approval prompts are not starved by ordinary notifications (§8).
-    approvalMaxPerDay: z.number().int().min(0).default(10),
   }).superRefine((n, ctx) => {
     // Fail config load early with a clear message rather than throwing deep in
     // the notification path (H1) or silently disabling quiet hours (L3).
@@ -181,7 +180,7 @@ export const configSchema = z.object({
         }
       }
     }
-  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high', approvalMaxPerDay: 10 }),
+  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high' }),
   memory: z.object({
     backend: z.enum(['fuseki', 'oxigraph', 'memory']).default('oxigraph'),
     triplestore: z.object({
@@ -271,6 +270,7 @@ export const configSchema = z.object({
     baseUrl: z.string().optional(),
     defaultModel: z.string().default('mock'),
     aliases: z.record(z.string(), z.string()).default({}),
+    models: z.array(z.string()).optional(),
     maxTokens: z.number().optional(),
     temperature: z.number().optional(),
     timeout: z.number().optional(),
