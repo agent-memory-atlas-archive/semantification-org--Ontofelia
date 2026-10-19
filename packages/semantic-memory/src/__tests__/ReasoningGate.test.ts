@@ -454,6 +454,49 @@ describe('catch-up', () => {
     expect((await rig.engine.catchUpInferredGraphs(AGENT, { force: true })).status).toBe('ran');
   });
 
+  it('a skipped fact whose insert lands after the run read its state keeps the marker', async () => {
+    const { rig, inferred } = await run([{ f: WORLD_FACTS[0], ctx: ownerCtx }], 1);
+    // Hold the base-triple insert of the next fact: the gate has already marked
+    // the graphs stale at that point, but the fact is not in the store yet.
+    const realUpdate = rig.store.update.bind(rig.store);
+    let insertReached!: () => void;
+    const reached = new Promise<void>(r => { insertReached = r; });
+    let releaseInsert!: () => void;
+    const insertHeld = new Promise<void>(r => { releaseInsert = r; });
+    let held = false;
+    vi.spyOn(rig.store, 'update').mockImplementation(async (q: string) => {
+      if (!held && q.includes('INSERT DATA') && q.includes(`<urn:ontofelia:entity:Tom> <${CORE}mentors> <urn:ontofelia:entity:Lena>`)) {
+        held = true;
+        insertReached();
+        await insertHeld;
+      }
+      return realUpdate(q);
+    });
+    const storing = rig.engine.storeFact(fact('Tom', 'mentors', 'Lena', 'Widget'), ownerCtx);
+    await reached;
+    // The run starts now, reads the graphs without the fact, and is held at its end.
+    const real = rig.engine.rebuildInferredGraphs.bind(rig.engine);
+    let releaseRun!: () => void;
+    const runHeld = new Promise<void>(r => { releaseRun = r; });
+    vi.spyOn(rig.engine, 'rebuildInferredGraphs').mockImplementationOnce(async (a: string) => {
+      const out = await real(a);
+      await runHeld;
+      return out;
+    });
+    const running = rig.engine.catchUpInferredGraphs(AGENT);
+    await new Promise(r => setTimeout(r, 50));
+    releaseInsert();
+    await storing;
+    releaseRun();
+    expect(await running).toMatchObject({ status: 'ran', stillStale: true });
+    expect(await markerRows(rig.store)).toHaveLength(1);
+    expect(await inferred()).not.toContain(expect.stringContaining('mentoredBy'));
+    // The next run sees the fact and derives its inverse.
+    expect((await rig.engine.catchUpInferredGraphs(AGENT)).status).toBe('ran');
+    expect((await inferred()).join('\n')).toContain('mentoredBy');
+    expect(await markerRows(rig.store)).toEqual([]);
+  });
+
   it('a fact stored during a run keeps the marker, and the next run covers it', async () => {
     const { rig, inferred } = await run([{ f: WORLD_FACTS[0], ctx: ownerCtx }], 1);
     const real = rig.engine.rebuildInferredGraphs.bind(rig.engine);
