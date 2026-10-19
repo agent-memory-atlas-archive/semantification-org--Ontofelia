@@ -52,6 +52,17 @@ function isApiPath(rawUrl: string): boolean {
   return isPathUnder(rawUrl, '/api');
 }
 
+/** Serves the built web UI from `webUiDist` and falls back to index.html for non-API, non-WS paths. */
+export async function registerWebUi(fastify: FastifyInstance, webUiDist: string): Promise<void> {
+  await fastify.register(fastifyStatic, { root: webUiDist, prefix: '/' });
+  fastify.setNotFoundHandler(async (request, reply) => {
+    if (!isApiPath(request.url) && !isPathUnder(request.url, '/ws') && !isPathUnder(request.url, '/webhooks')) {
+      return reply.sendFile('index.html');
+    }
+    reply.code(404).send({ error: 'Not found' });
+  });
+}
+
 export async function startGateway(config: OntofeliaConfig): Promise<FastifyInstance> {
   // Guard against dual-package hazard (tsx may resolve this module twice)
   if ((globalThis as Record<symbol, boolean>)[GATEWAY_GUARD]) {
@@ -427,13 +438,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   // Static UI files
   const webUiDist = path.resolve(currentDir, '..', '..', 'web-ui', 'dist');
   if (fs.existsSync(webUiDist)) {
-    await fastify.register(fastifyStatic, { root: webUiDist, prefix: '/' });
-    fastify.setNotFoundHandler(async (request, reply) => {
-      if (!isApiPath(request.url) && !isPathUnder(request.url, '/ws') && !isPathUnder(request.url, '/webhooks')) {
-        return reply.sendFile('index.html');
-      }
-      reply.code(404).send({ error: 'Not found' });
-    });
+    await registerWebUi(fastify, webUiDist);
   }
 
   // Cleanup hook
