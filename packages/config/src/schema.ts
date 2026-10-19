@@ -81,6 +81,14 @@ export const configSchema = z.object({
       token: z.string().optional(),
       allowedChats: z.array(z.string()).default([]),
       ownerChatId: z.string().optional(),
+      // Telegram user id of the owner (digits). Only this account is treated as
+      // the owner; every other approved account gets its own identity without
+      // owner rights. A bare number in JSON5 is accepted and normalised to a
+      // string. When unset, every approved account is the owner (legacy mode).
+      ownerId: z.union([
+        z.string().regex(/^[0-9]+$/, 'must be a Telegram user id (digits only)'),
+        z.number().int().positive().transform((n) => String(n)),
+      ]).optional(),
       // Show a live "thinking"/progress status message that updates along the
       // agent's processing phases (in addition to the always-on typing
       // indicator). Defaults to on when unset; set false to keep the chat
@@ -151,7 +159,6 @@ export const configSchema = z.object({
     target: z.string().optional(),
     // Separate, higher budget reserved for the (future) approval-request path
     // so approval prompts are not starved by ordinary notifications (§8).
-    approvalMaxPerDay: z.number().int().min(0).default(10),
   }).superRefine((n, ctx) => {
     // Fail config load early with a clear message rather than throwing deep in
     // the notification path (H1) or silently disabling quiet hours (L3).
@@ -173,7 +180,7 @@ export const configSchema = z.object({
         }
       }
     }
-  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high', approvalMaxPerDay: 10 }),
+  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high' }),
   memory: z.object({
     backend: z.enum(['fuseki', 'oxigraph', 'memory']).default('oxigraph'),
     triplestore: z.object({
@@ -263,6 +270,7 @@ export const configSchema = z.object({
     baseUrl: z.string().optional(),
     defaultModel: z.string().default('mock'),
     aliases: z.record(z.string(), z.string()).default({}),
+    models: z.array(z.string()).optional(),
     maxTokens: z.number().optional(),
     temperature: z.number().optional(),
     timeout: z.number().optional(),
