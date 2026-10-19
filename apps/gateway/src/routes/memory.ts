@@ -1,7 +1,7 @@
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { GatewayContext } from '../context.js';
 import { createLogger, resolveAgentId } from '@ontofelia/core';
-import { GraphUriResolver, SHARED_GRAPHS, importVault } from '@ontofelia/semantic-memory';
+import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -215,7 +215,23 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
         `Self graph re-seeded from bootstrap/self.ttl: bootstrap ${report.bootstrapBefore} → ${report.bootstrapAfter}, ` +
         `${report.preserved} learned/other triple(s) preserved`,
       );
-      return report;
+      // After the persona, never before: the derived self-model reads the behavior
+      // directives the reseed just wrote. Only with the self-model flag on (the
+      // runtime does nothing with it off); the response gains a field only when
+      // something was derived or the derivation failed.
+      let selfModel: { capabilities: number; constraints: number } | undefined;
+      let selfModelError: string | undefined;
+      try {
+        selfModel = await agents.get(PRIMARY_AGENT_ID)?.seedDerivedSelfModelIfEnabled();
+      } catch (e) {
+        selfModelError = (e as Error).message;
+        logger.warn('Self-model re-derivation after reseed failed: ' + selfModelError);
+      }
+      return {
+        ...report,
+        ...(selfModel ? { selfModel } : {}),
+        ...(selfModelError !== undefined ? { selfModelError } : {}),
+      };
     } catch (e) {
       logger.error('Failed to reseed self graph: ' + (e as Error).message);
       return reply.code(500).send({ error: (e as Error).message });
@@ -270,6 +286,29 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
       }
       logger.error('Vault import failed: ' + message);
       return reply.code(500).send({ error: 'Vault import failed' });
+    }
+  });
+
+  // --- Vault-LD export (read-only) ---
+  // Writes nothing on the server and takes no folder: the notes are returned as
+  // JSON and the client decides where (and whether) to write them. Serialised
+  // with imports of the same agent so it never reads a half-applied import.
+  fastify.get('/api/knowledge/vault-export', async (
+    request: FastifyRequest<{ Querystring: { agentId?: string } }>,
+    reply,
+  ) => {
+    const agentId = resolveAgentId(request.query?.agentId);
+    if (!agents.get(agentId)) return reply.code(404).send({ error: 'Agent not found' });
+    try {
+      const report = await serialiseVaultImport(agentId, () =>
+        buildVaultExport(knowledgeEngine, { agentId }));
+      return {
+        notes: report.notes.map(n => ({ path: n.path, content: n.content })),
+        totals: report.totals,
+      };
+    } catch (e) {
+      logger.error('Vault export failed: ' + ((e as Error).message ?? ''));
+      return reply.code(500).send({ error: 'Vault export failed' });
     }
   });
 
