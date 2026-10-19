@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@fastify/multipart": "^10.0.0",
-    "@fastify/static": "^9.1.3",
+    "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@ontofelia/agent-runtime": "workspace:*",
     "@ontofelia/channels": "workspace:*",
