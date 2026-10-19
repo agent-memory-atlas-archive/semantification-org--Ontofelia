@@ -60,6 +60,13 @@ describe('Config Schema', () => {
     expect((parsed.channels as Record<string, unknown>).unknown_app).toBeUndefined();
   });
 
+  it('loads an old config carrying the removed notifications.approvalMaxPerDay key', () => {
+    const parsed = configSchema.parse({ notifications: { maxPerDay: 3, approvalMaxPerDay: 7 } });
+    expect(parsed.notifications.maxPerDay).toBe(3);
+    expect('approvalMaxPerDay' in parsed.notifications).toBe(false);
+    expect('approvalMaxPerDay' in configSchema.parse({}).notifications).toBe(false);
+  });
+
   // H1/L3 — notification policy validation at config load.
   it('accepts a valid IANA notifications.timezone', () => {
     const parsed = configSchema.parse({ notifications: { timezone: 'Europe/Berlin' } });
