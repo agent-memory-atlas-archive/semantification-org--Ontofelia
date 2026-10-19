@@ -206,6 +206,11 @@ export function renderTelegramChecklist(steps: string[]): string {
   return `${TELEGRAM_STATUS_HEADER}\n\n${lines.join('\n')}`;
 }
 
+/** The channel's reference to a sent keyboard message: what a later button press is matched to. */
+export function telegramOfferRef(chatId: string | number, messageId: number): string {
+  return `telegram:${String(chatId)}:${messageId}`;
+}
+
 export async function setupTelegramChannel(
   config: OntofeliaConfig,
   telegramAdapter: TelegramAdapter,
@@ -216,11 +221,19 @@ export async function setupTelegramChannel(
   if (ownerWarning) logger.warn(ownerWarning);
   const ownerId = config.channels?.telegram?.ownerId;
 
+  /**
+   * Send a reply. When it carries inline buttons and `offeredTo` is given, the
+   * sent keyboard message is recorded as a `choice-offered` episode of that
+   * sender (best effort; Guardian prompts do not go through here).
+   */
   const sendTelegramResponse = async (
     replyTarget: string,
     response: import('@ontofelia/agent-runtime').AgentResponse,
-    replyTo?: string
+    replyTo?: string,
+    offeredTo?: { agent: AgentRuntime; sender: MessageEnvelope['sender'] },
   ) => {
+    // The id of the message that carries the keyboard (the last chunk).
+    let keyboardMessageId: number | undefined;
     const usedTokens = response.usage?.totalTokens || 0;
     const usedK = (usedTokens / 1000).toFixed(1);
     const providerName = response.provider || config.provider?.name || 'llm';
@@ -309,7 +322,8 @@ export async function setupTelegramChannel(
           }
 
           try {
-            await bot.sendMessage(replyTarget, chunks[i], chunkOpts);
+            const sentMsg = await bot.sendMessage(replyTarget, chunks[i], chunkOpts);
+            if (isLast && opts.reply_markup) keyboardMessageId = sentMsg?.message_id;
           } catch (e: unknown) {
             const errMsg = (e as Error).message || '';
             // Markdown parser errors are sticky — once one chunk trips the
@@ -325,7 +339,8 @@ export async function setupTelegramChannel(
               if (isLast && opts.reply_markup) {
                 fallbackOpts.reply_markup = opts.reply_markup;
               }
-              await bot.sendMessage(replyTarget, chunks[i], fallbackOpts);
+              const sentMsg = await bot.sendMessage(replyTarget, chunks[i], fallbackOpts);
+              if (isLast && opts.reply_markup) keyboardMessageId = sentMsg?.message_id;
             } catch (plainErr: unknown) {
               logger.error(
                 `Telegram send failed (chunk ${i + 1}/${chunks.length}): ` +
@@ -334,6 +349,22 @@ export async function setupTelegramChannel(
             }
           }
         }
+      }
+    }
+
+    // Choice capture: the buttons were SENT (the keyboard message has an id), so
+    // they are an offer to this sender. Never fails the reply.
+    if (offeredTo && keyboardMessageId !== undefined && response.inlineButtons && response.inlineButtons.length > 0) {
+      try {
+        await offeredTo.agent.recordChoiceOffered({
+          sender: offeredTo.sender,
+          channel: 'telegram',
+          sessionId: response.sessionId,
+          offerRef: telegramOfferRef(replyTarget, keyboardMessageId),
+          buttons: response.inlineButtons,
+        });
+      } catch (e: unknown) {
+        logger.warn('Telegram choice-offered capture failed: ' + (e as Error).message);
       }
     }
   };
@@ -461,7 +492,7 @@ export async function setupTelegramChannel(
         removeDebug();
         removeDebug = undefined;
         await clearStatus();
-        await sendTelegramResponse(replyTarget, response, envelope.id);
+        await sendTelegramResponse(replyTarget, response, envelope.id, { agent, sender: envelope.sender });
       } catch (err: unknown) {
         const errMsg = (err as Error).message || 'Unknown error';
         logger.error('Telegram handler error: ' + errMsg);
@@ -538,6 +569,21 @@ export async function setupTelegramChannel(
 
         const agent = agents.get(PRIMARY_AGENT_ID);
         if (agent) {
+          // Choice capture: the press of a button of an earlier offer. Guardian
+          // approvals (`g:`) returned above and never reach here; the capture
+          // refuses them again. Only the same user's press counts (checked in the
+          // capture against the user the offer went to). Never fails the press.
+          if (!query.data.startsWith('g:')) {
+            try {
+              await agent.recordChoiceMade({
+                sender,
+                offerRef: telegramOfferRef(chatId, query.message.message_id),
+                callbackData: query.data,
+              });
+            } catch (e: unknown) {
+              logger.warn('Telegram choice-made capture failed: ' + (e as Error).message);
+            }
+          }
           const envelope: MessageEnvelope = {
             id: query.id,
             channel: 'telegram',
@@ -565,7 +611,7 @@ export async function setupTelegramChannel(
                 message_id: query.message.message_id,
               });
             } catch {
-              await sendTelegramResponse(chatId, response);
+              await sendTelegramResponse(chatId, response, undefined, { agent, sender });
             }
           }
         }

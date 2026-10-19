@@ -44,6 +44,8 @@ matters for future recall. Concretely:
 | `impasse-flagged` | Any phase wrote a `cogt:Impasse` | The phase that flagged |
 | `meta-reflected` | Phase 6 writes the reflective marker | Phase 6 |
 | `consolidation-promoted` | A pattern was promoted from episodic to semantic | Background job |
+| `choice-offered` | A response with inline buttons was sent (the alternatives) | The channel adapter, via the runtime (§6.5) |
+| `choice-made` | The same user pressed one of those buttons | The channel adapter, via the runtime (§6.5) |
 
 `impasse-flagged` and `meta-reflected` are written by the metacognition step of
 a cycle (`flagMetacognition`) and only when episodes are on
@@ -262,7 +264,8 @@ Patterns the consolidation job looks for:
    [06](06-procedural-memory.md)).
 
 3. **User preference.** "User accepted suggestion X over Y in N episodes." →
-   Write into `urn:<agent>:user:<userId>` as a `core:preference` fact.
+   Write into `urn:<agent>:user:<userId>` as a `core:preference` fact. As built
+   in §6.5.
 
 4. **Stable channel-routing rule.** "Every Telegram message from sender X is
    followed by tool-call Y." → Stored as procedural pattern with channel
@@ -362,10 +365,70 @@ owner-only `/cog consolidate-episodes` run it. It deviates from the sketch in
   `consolidation-promoted` episode stays, so the ledger still blocks a
   re-promotion.
 
-Pattern 3 (user preference, "accepted X over Y") is not built. It needs a capture
-of the offered alternatives (which options were on the table and which one was
-chosen), and no episode records that yet, so it cannot be detected
-deterministically.
+### 6.5 As built: pattern 3 (user preference)
+
+Behind `cog.flagPreferenceConsolidation` (**off by default, on new installs and
+existing ones; not part of `/cog defaults`**; `/cog flag preferenceconsolidation
+on`). It runs inside the same daily job and the same owner-only command as
+pattern 1 (`cog.consolidate-episodes`, `/cog consolidate-episodes`); each pattern
+follows its own flag, and the command reports one line per pattern that ran.
+With the flag off nothing is read or written.
+
+- **The one capture source.** An agent response that carries `inlineButtons`
+  (today the `/model` picker) and the user's later press of one of those buttons
+  (the Telegram callback). Nothing is inferred from free text. The gateway calls
+  `AgentRuntime.recordChoiceOffered` after the buttons were sent and
+  `recordChoiceMade` on a press; both write only while `cog.flagEpisodicMemory`
+  is on, and a failure never reaches the reply.
+- **`choice-offered`** (salience 0.3). Alternatives are the buttons: one tag
+  `alt:["<callbackData>","<label>"]` each, plus `offer-ref:<channel reference of
+  the sent message>` (Telegram: `telegram:<chat>:<message>`), and `forUser`,
+  `sessionId`, `channel` and `factGraph` as on an inbound episode. At least two
+  and at most 20 distinct values (each at most 128 characters); a single button
+  offers no "X over Y". A value or label with a credential shape marks the
+  episode secret-classed.
+- **`choice-made`** (salience 0.5). Linked to the offer by `cogt:precededBy`,
+  with the pressed value as the tag `chosen:<callbackData>`; user, session and
+  fact graph are those of the offer. Written only if the offer exists, **went to
+  the same user** (the offer's `forUser` equals the presser's key), listed the
+  value, and was not answered before. A press by any other user, of a value that
+  was not offered, of an unknown offer or a second press writes nothing.
+- **Guardian approvals are excluded completely.** A `g:` callback is never an
+  alternative of an offer and a press of one is refused by the capture itself
+  (and the gateway never routes it there). An approval is a security decision and
+  never becomes a preference.
+- **Signature and count.** The signature of an offer is the sorted set of its
+  alternatives' values. A (user, signature, chosen value) qualifies with at least
+  K = 3 distinct offers answered with that value in at least Q = 2 distinct
+  evidence groups: the same K and Q (`cog:consolidationMinEpisodes`,
+  `cog:consolidationMinGroups`) and the same group (one session on one UTC day)
+  as pattern 1. Each offer counts once. Choices over different alternatives are
+  never pooled.
+- **Contradiction.** If any of the newest K choices over the same signature chose
+  another alternative, nothing is promoted for that signature (counted as
+  `contradicted`). An older contradiction does not block.
+- **Exclusions** (as pattern 1, where they apply): secret-classed episodes, an
+  episode or session flagged `cogt:sessionUntrusted`, a choice without a usable
+  fact graph, and a choice whose offer is missing, went to another user, or did
+  not list the value.
+- **Target and minting.** `core:preference` (`urn:shared:ontology#preference`,
+  declared in the TBox as a datatype property with label and comment, not
+  functional) with the user's canonical entity node as subject and a plain string
+  object that names the chosen value and the alternatives (`chose "/model a" over
+  "/model b"`), written into `urn:<agent>:user:<key>` of that user only, taken
+  from the choice's `factGraph`; never the worldview, never another user. The
+  existing Claim/Evidence write with `sourceKind "consolidation-preference"`; the
+  evidence lists the choice and offer episodes (`core:sourceEpisode`). A
+  `consolidation-promoted` episode with `forUser` carries `claim-hash:<sha256>`
+  over (kind, user, signature, chosen value) and is the ledger: a rerun is a no-op
+  and a retracted preference does not come back.
+- **Bounds.** As pattern 1: 200 users, the newest 500 `choice-made` episodes per
+  user, 20 promotions per user and 100 per run. No model call, no watermark.
+- **Not done.** A promoted preference is not withdrawn when the user later chooses
+  differently (the ledger only prevents a second promotion of the same choice);
+  a different, later-qualifying choice over the same alternatives is promoted as
+  a further fact. Retraction through `memory_retract` removes the triple from the
+  user graph like any other fact.
 
 ---
 

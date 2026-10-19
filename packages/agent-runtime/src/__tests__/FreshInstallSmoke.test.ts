@@ -39,7 +39,7 @@ describe('fresh install, defaults on: three turns by two users', () => {
       const e = await install();
       // The boot step turned the layer on; no flag was set by hand.
       for (const f of COGNITIVE_FLAGS) {
-        expect(await e.cfg.isEnabled(f), f.name).toBe(f.name !== 'flagRetention' && f.name !== 'flagInitiative');
+        expect(await e.cfg.isEnabled(f), f.name).toBe(f.name !== 'flagRetention' && f.name !== 'flagInitiative' && f.name !== 'flagPreferenceConsolidation');
       }
       await how(e, ALICE_SAYS, ALICE);
       await how(e, BOB_SAYS, BOB);

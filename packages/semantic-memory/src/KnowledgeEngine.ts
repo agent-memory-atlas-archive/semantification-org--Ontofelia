@@ -10,6 +10,11 @@ import { sparqlTripleLine } from './utils/TripleSyntax.js';
 import { FactInput, FactContext, FactPreview, StoreResult } from './types.js';
 
 const ENTITY_NS = 'urn:ontofelia:entity:';
+
+/** The canonical entity node of a user (the subject of facts about them), by the id of their user graph. */
+export function userEntityUri(userId: string): string {
+  return `${ENTITY_NS}user:${encodeURIComponent(userId)}`;
+}
 const CORE_NS = 'urn:ontofelia:core#';
 const COGT_NS = 'urn:shared:ontology#cog/';
 const TBOX_GRAPH = 'urn:shared:ontology';
@@ -1084,7 +1089,7 @@ export class KnowledgeEngine {
    * one node so their facts do not scatter across duplicate entities.
    */
   private userEntityUri(userId: string): string {
-    return `${ENTITY_NS}user:${encodeURIComponent(userId)}`;
+    return userEntityUri(userId);
   }
 
   /**
@@ -1729,8 +1734,9 @@ export class KnowledgeEngine {
    *  - its subject, predicate and object are the terms the duplicate check used;
    *  - its status is `accepted`;
    *  - it is not `core:privacyClass "secret"`;
-   *  - it is not a consolidation (`sourceKind` `consolidation-episodic`), which
-   *    is a derived copy and not something a user stated.
+   *  - it is not a consolidation (`sourceKind` `consolidation-episodic` or
+   *    `consolidation-preference`), which is a derived copy and not something a
+   *    user stated.
    * If several qualify, the oldest (`learnedAt`, then IRI) is used. Returns its
    * IRI, or `undefined` when nothing qualifies (then nothing is written).
    * Best effort: a failure here never turns a duplicate into an error.
@@ -1752,6 +1758,7 @@ export class KnowledgeEngine {
           OPTIONAL { ?c <${ONT}learnedAt> ?learned . }
           FILTER NOT EXISTS { ?c <${ONT}privacyClass> "secret" }
           FILTER NOT EXISTS { ?c <${ONT}sourceKind> "consolidation-episodic" }
+          FILTER NOT EXISTS { ?c <${ONT}sourceKind> "consolidation-preference" }
         } } ORDER BY ?learned ?c LIMIT 1`);
       const claimUri = res.bindings?.[0]?.c?.value;
       if (!claimUri) return undefined;
@@ -1915,6 +1922,13 @@ export class KnowledgeEngine {
     /** Deterministic hash of the promotion; stored as the claim's ingestion run. */
     claimHash: string;
     confidenceNumeric?: number;
+    /**
+     * Which consolidation promotes: `consolidation-episodic` (pattern 1, the
+     * default) or `consolidation-preference` (pattern 3). Nothing else is accepted.
+     */
+    sourceKind?: 'consolidation-episodic' | 'consolidation-preference';
+    /** Text of the evidence; defaults to the pattern 1 wording. */
+    sourceSpan?: string;
   }): Promise<{ outcome: 'promoted' | 'already-present' | 'already-known' | 'conflict'; claimUri?: string; targetGraph: string }> {
     if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
       throw new Error('promoteToUserGraph: a concrete user key is required');
@@ -1970,11 +1984,11 @@ export class KnowledgeEngine {
       predicate: p.predicateUri,
       object: p.object.value,
       objectType: p.object.kind === 'iri' ? 'Concept' : 'literal',
-      sourceKind: 'consolidation-episodic',
+      sourceKind: p.sourceKind === 'consolidation-preference' ? 'consolidation-preference' : 'consolidation-episodic',
       evidenceType: 'consolidation',
       confidenceLabel: 'medium',
       confidenceNumeric: p.confidenceNumeric,
-      sourceSpan: `Consolidated from ${p.sourceEpisodes.length} episodes of one user.`,
+      sourceSpan: p.sourceSpan ?? `Consolidated from ${p.sourceEpisodes.length} episodes of one user.`,
     };
     const context: FactContext = {
       agentId: p.agentId,

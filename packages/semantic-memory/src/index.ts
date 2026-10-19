@@ -23,6 +23,8 @@ export * from './cognitive/EpisodicMemory.js';
 export * from './cognitive/ProceduralMemory.js';
 export * from './cognitive/SelfModel.js';
 export * from './cognitive/EpisodicConsolidation.js';
+export * from './cognitive/ChoiceCapture.js';
+export * from './cognitive/PreferenceConsolidation.js';
 
 // Ontology Learning pipeline (Milestone 1)
 export * from './ingestion/types.js';

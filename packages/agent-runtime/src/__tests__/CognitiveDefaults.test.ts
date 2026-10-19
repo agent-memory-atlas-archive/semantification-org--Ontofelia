@@ -14,7 +14,7 @@ import { GraphUriResolver } from '@ontofelia/semantic-memory';
 
 const SETUP = GraphUriResolver.getSetupGraph(AGENT);
 const SUBJECT = `urn:${AGENT}:setup:cognitive`;
-const KEEP_OFF = ['flagRetention', 'flagInitiative'];
+const KEEP_OFF = ['flagRetention', 'flagInitiative', 'flagPreferenceConsolidation'];
 
 const flagValues = async (e: Env) =>
   Object.fromEntries(await Promise.all(COGNITIVE_FLAGS.map(async (f) => [f.name, await e.cfg.isEnabled(f)])));
@@ -33,9 +33,9 @@ const schedulerEnv = (text: string): MessageEnvelope => ({
 } as MessageEnvelope);
 
 describe('default-on set', () => {
-  it('is every flag except retention and initiative; the docs table says the same', async () => {
+  it('is every flag except retention, initiative and the preference consolidation; the docs table says the same', async () => {
     const names = defaultOnFlags().map((f) => f.name);
-    expect(names).toHaveLength(COGNITIVE_FLAGS.length - 2);
+    expect(names).toHaveLength(COGNITIVE_FLAGS.length - 3);
     for (const k of KEEP_OFF) expect(names).not.toContain(k);
     const { promises: fs } = await import('fs');
     const doc = await fs.readFile(new URL('../../../../docs/cognitive-architecture/09-integration-and-migration.md', import.meta.url), 'utf8');
@@ -137,6 +137,7 @@ describe('/cog defaults', () => {
     expect(text).toContain(`${defaultOnFlags().length - 1} of ${defaultOnFlags().length} flags would change`);
     expect(text).toContain('• flagRetention: stays off');
     expect(text).toContain('• flagInitiative: stays off');
+    expect(text).toContain('• flagPreferenceConsolidation: stays off');
     expect(text).toContain('The defaults were never written on this install.');
     expect(await dump(e)).toBe(before);
   });
@@ -153,7 +154,7 @@ describe('/cog defaults', () => {
     const v = await flagValues(e);
     for (const f of COGNITIVE_FLAGS) {
       // retention was ON before (set by the owner); apply never turns it on and never turns it off either
-      expect(v[f.name]).toBe(f.name === 'flagInitiative' ? false : true);
+      expect(v[f.name]).toBe(f.name === 'flagInitiative' || f.name === 'flagPreferenceConsolidation' ? false : true);
     }
     expect((await setupTriples(e)).filter((x) => x.startsWith('salience'))).toEqual(keysBefore);
     expect(await e.cfg.unknownNudgeAllUsers()).toBe(false);
