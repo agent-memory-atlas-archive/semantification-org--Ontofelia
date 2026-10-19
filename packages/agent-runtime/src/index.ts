@@ -2833,7 +2833,7 @@ Users can use these commands:
         }
         if (pref.enabled && pref.report) {
           const y = pref.report;
-          lines.push(`🧩 Preference consolidation: ${y.choicesScanned} choices of ${y.users} user(s), ${y.qualified} qualified, ${y.promoted} promoted, ${y.alreadyPresent + y.alreadyPromoted} already known, ${y.contradicted} contradicted.`);
+          lines.push(`🧩 Preference consolidation: ${y.choicesScanned} choices of ${y.users} user(s), ${y.qualified} qualified, ${y.promoted} promoted, ${y.alreadyPresent + y.alreadyPromoted} already known, ${y.contradicted} contradicted, ${y.superseded} superseded.`);
         }
         return { text: lines.join('\n'), sessionId: session.sessionId };
       }

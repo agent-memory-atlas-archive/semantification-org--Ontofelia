@@ -37,8 +37,32 @@
  * value); a `consolidation-promoted` episode carries it as the tag
  * `claim-hash:<sha256>` and is the ledger, shared with pattern 1 (the hashes
  * cannot collide, the kind is part of the hashed data). A hash found there is
- * never promoted again, so a preference the user later retracted does not come
- * back. A triple already in the user's graph is not duplicated.
+ * never promoted again unless the system withdrew it (see Shift), so a
+ * preference the user later retracted does not come back. A triple already in the user's graph is not duplicated.
+ *
+ * Shift: when (user, signature, v) is promoted, the preferences pattern 3
+ * itself promoted earlier into the same user's graph for the same signature
+ * and a different value w are withdrawn, so the graph never holds two
+ * contradicting preferences for one offer signature. Pattern 3's own triples
+ * are identified by their provenance, not by their text: an accepted claim with
+ * `sourceKind "consolidation-preference"` and ingestion run
+ * `consolidation:<hash>` for the hash of (user, signature, w), and only while
+ * the ledger lists that hash as standing. A preference another source wrote
+ * (also one with the very same text) is never touched. The withdrawal goes
+ * through the engine's belief-revision path (`KnowledgeEngine.withdrawConsolidatedPreferences`):
+ * the base triple leaves the user graph, the claim stays in the claims graph with
+ * status "superseded" and a link to the new claim. A `consolidation-superseded`
+ * episode of the same user records it (tags `old-value:`, `new-value:`,
+ * `superseded-hash:`, `claim-hash:` of the new promotion) and counts as
+ * `superseded` in the report. Withdrawal happens only on a promotion, never
+ * from an `alreadyPromoted` or `alreadyPresent` candidate.
+ *
+ * A system withdrawal is NOT a user retraction. The `superseded-hash:` tag
+ * releases the withdrawn value's ledger entry (a later `consolidation-promoted`
+ * of the same hash puts it back), so if the user later settles on w again
+ * (newest K choices all w, K offers in Q groups) w is promoted again and the
+ * value in between is withdrawn in turn. A preference the user retracted by hand
+ * leaves no such episode: its hash stays in the ledger and it does not come back.
  *
  * The fact: subject the user's canonical entity node, predicate `core:preference`
  * (`urn:shared:ontology#preference`), object a plain string that names the chosen
@@ -56,7 +80,9 @@ import {
   isUsableUserKey,
   type EpisodicConsolidationSettings,
 } from './EpisodicConsolidation.js';
-import { CLAIM_HASH_TAG, EpisodicMemory, type ChoiceMadeRecord, type ChoiceOfferRecord } from './EpisodicMemory.js';
+import {
+  CLAIM_HASH_TAG, NEW_VALUE_TAG, OLD_VALUE_TAG, SUPERSEDED_HASH_TAG, EpisodicMemory, type ChoiceMadeRecord, type ChoiceOfferRecord,
+} from './EpisodicMemory.js';
 
 /** The predicate of a promoted preference: `core:preference`. */
 export const CORE_PREFERENCE_PREDICATE = 'urn:shared:ontology#preference';
@@ -85,6 +111,8 @@ export interface PreferenceConsolidationReport {
   /** Candidates that reached K and Q. */
   qualified: number;
   promoted: number;
+  /** Earlier preferences of pattern 3 withdrawn because a different value was promoted for the same signature. */
+  superseded: number;
   /** Qualified but the ledger already lists the hash. */
   alreadyPromoted: number;
   /** Qualified but the user graph already holds the triple or an accepted claim. */
@@ -110,6 +138,7 @@ function emptyReport(now: Date): PreferenceConsolidationReport {
     groupsSeen: 0,
     qualified: 0,
     promoted: 0,
+    superseded: 0,
     alreadyPromoted: 0,
     alreadyPresent: 0,
     contradicted: 0,
@@ -322,7 +351,7 @@ export class PreferenceConsolidation {
         (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0),
     );
 
-    const ledger = await this.episodic.promotedHashes(userKey);
+    const ledger = await this.episodic.activePromotedHashes(userKey);
     const subject = userEntityUri(graphKey);
     let written = 0;
     for (const c of qualified) {
@@ -369,6 +398,41 @@ export class PreferenceConsolidation {
       ledger.add(c.hash);
       written++;
       report.promoted++;
+
+      // The shift: earlier preferences of pattern 3 over the same signature with
+      // another value are withdrawn (provenance and ledger decide what is ours).
+      const rivals = c.values
+        .filter((w) => w !== c.chosen)
+        .map((w) => ({ w, hash: preferenceClaimHash(hashKey, c.signature, w) }))
+        .filter((r) => ledger.has(r.hash));
+      if (rivals.length > 0 && res.claimUri) {
+        const withdrawn = await this.engine.withdrawConsolidatedPreferences({
+          agentId: this.agentId,
+          userKey: graphKey,
+          subjectUri: subject,
+          predicateUri: CORE_PREFERENCE_PREDICATE,
+          claimHashes: rivals.map((r) => r.hash),
+          supersedingClaimUri: res.claimUri,
+        });
+        for (const gone of withdrawn) {
+          const old = rivals.find((r) => r.hash === gone.claimHash) as { w: string; hash: string };
+          await this.episodic.append({
+            episodeType: 'consolidation-superseded',
+            occurredAt: now,
+            forUser: userKey,
+            factGraph: graph,
+            about: [subject],
+            tags: [
+              'consolidation', PREFERENCE_PROMOTION_TAG,
+              `${SUPERSEDED_HASH_TAG}${old.hash}`, `${CLAIM_HASH_TAG}${c.hash}`,
+              `${OLD_VALUE_TAG}${old.w}`, `${NEW_VALUE_TAG}${c.chosen}`,
+            ],
+            salience: 0.3,
+          });
+          ledger.delete(old.hash);
+          report.superseded++;
+        }
+      }
     }
     return written;
   }

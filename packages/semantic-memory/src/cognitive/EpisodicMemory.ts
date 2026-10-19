@@ -15,7 +15,7 @@
  *    which the embedded Oxigraph WASM build cannot evaluate.
  */
 
-import { ALL_USERS_SCOPE, OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
+import { ALL_USERS_SCOPE, OWNER_USER_KEY, compareIso, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
 import { escapeSparqlStringContent, sparqlIri, sparqlStringLiteral } from '../utils/SparqlSyntax.js';
 
@@ -47,6 +47,7 @@ export type EpisodeType =
   | 'impasse-flagged'
   | 'meta-reflected'
   | 'consolidation-promoted'
+  | 'consolidation-superseded'
   | 'choice-offered'
   | 'choice-made'
   | (string & {});
@@ -163,6 +164,17 @@ export interface ClaimEpisode {
 
 /** Tag prefix of a `consolidation-promoted` episode: the promotion's claim hash. */
 export const CLAIM_HASH_TAG = 'claim-hash:';
+
+/**
+ * Tag prefix of a `consolidation-superseded` episode: the claim hash of the
+ * promotion that was withdrawn (the ledger entry it releases).
+ */
+export const SUPERSEDED_HASH_TAG = 'superseded-hash:';
+
+/** Tag prefix of a `consolidation-superseded` episode: the withdrawn value. */
+export const OLD_VALUE_TAG = 'old-value:';
+/** Tag prefix of a `consolidation-superseded` episode: the value that replaced it. */
+export const NEW_VALUE_TAG = 'new-value:';
 
 /** Tag prefix of a `choice-offered` episode: one alternative, as JSON `[callbackData, label]`. */
 export const CHOICE_ALT_TAG = 'alt:';
@@ -1246,6 +1258,44 @@ export class EpisodicMemory {
     const out = new Set<string>();
     for (const h of hits) {
       for (const t of h.tags) if (t.startsWith(CLAIM_HASH_TAG)) out.add(t.slice(CLAIM_HASH_TAG.length));
+    }
+    return out;
+  }
+
+  /**
+   * The claim hashes of one user's promotions that stand NOW: a hash promoted
+   * (`consolidation-promoted`, tag `claim-hash:`) and not withdrawn since by the
+   * system (`consolidation-superseded`, tag `superseded-hash:`). A withdrawal
+   * counts only while no later promotion of the same hash exists, so a value the
+   * consolidation withdrew and later promoted again is back in the ledger. A tie
+   * in time counts as withdrawn (the safe side: a repeated promotion finds the
+   * triple already present). Scoped to the user's own episodes; a hand
+   * retraction leaves no episode, so such a hash stays in the ledger.
+   */
+  async activePromotedHashes(userScope: UserScope): Promise<Set<string>> {
+    assertScope(userScope);
+    const latest = (hits: EpisodeHit[], prefix: string): Map<string, string> => {
+      const m = new Map<string, string>();
+      for (const h of hits) {
+        for (const t of h.tags) {
+          if (!t.startsWith(prefix)) continue;
+          const hash = t.slice(prefix.length);
+          const seen = m.get(hash);
+          if (seen === undefined || compareIso(h.occurredAt, seen) > 0) m.set(hash, h.occurredAt);
+        }
+      }
+      return m;
+    };
+    const promoted = latest(
+      await this.runSelect(`?ep <${COGT}episodeType> "consolidation-promoted" .`, userScope), CLAIM_HASH_TAG,
+    );
+    const withdrawn = latest(
+      await this.runSelect(`?ep <${COGT}episodeType> "consolidation-superseded" .`, userScope), SUPERSEDED_HASH_TAG,
+    );
+    const out = new Set<string>();
+    for (const [hash, when] of promoted) {
+      const w = withdrawn.get(hash);
+      if (w === undefined || compareIso(when, w) > 0) out.add(hash);
     }
     return out;
   }

@@ -192,7 +192,7 @@ describe('preference consolidation through the runtime', { timeout: 60_000 }, ()
     it('with the flag on it promotes into the offered user\'s graph only, and a rerun changes nothing', async () => {
       await cfg.setEnabled(PREF_FLAG, true);
       const res = await runtime.handleMessage(env('/cog consolidate-episodes'));
-      expect(res.text).toBe('🧩 Preference consolidation: 5 choices of 2 user(s), 1 qualified, 1 promoted, 0 already known, 0 contradicted.');
+      expect(res.text).toBe('🧩 Preference consolidation: 5 choices of 2 user(s), 1 qualified, 1 promoted, 0 already known, 0 contradicted, 0 superseded.');
       expect(await prefs()).toEqual([`urn:${AGENT}:user:anna ${userEntityUri('anna')}`]);
       const after = await quads();
       const again = await runtime.handleMessage(env('/cog consolidate-episodes'));

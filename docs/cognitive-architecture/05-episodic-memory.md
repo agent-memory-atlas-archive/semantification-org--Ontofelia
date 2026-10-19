@@ -44,6 +44,7 @@ matters for future recall. Concretely:
 | `impasse-flagged` | Any phase wrote a `cogt:Impasse` | The phase that flagged |
 | `meta-reflected` | Phase 6 writes the reflective marker | Phase 6 |
 | `consolidation-promoted` | A pattern was promoted from episodic to semantic | Background job |
+| `consolidation-superseded` | A preference promoted earlier was withdrawn by a later one over the same alternatives (§6.5) | Background job |
 | `choice-offered` | A response with inline buttons was sent (the alternatives) | The channel adapter, via the runtime (§6.5) |
 | `choice-made` | The same user pressed one of those buttons | The channel adapter, via the runtime (§6.5) |
 
@@ -425,12 +426,21 @@ With the flag off nothing is read or written.
   and a retracted preference does not come back.
 - **Bounds.** As pattern 1: 200 users, the newest 500 `choice-made` episodes per
   user, 20 promotions per user and 100 per run. No model call, no watermark.
-- **Not done.** A promoted preference is not withdrawn when the user later chooses
-  differently (the ledger only prevents a second promotion of the same choice);
-  a different, later-qualifying choice over the same alternatives is promoted as
-  a further fact. Retraction through `memory_retract` removes the triple from the
-  user graph like any other fact.
-
+- **Shift.** When a value is promoted, the preferences pattern 3 itself promoted
+  earlier into the same user's graph for the same signature and another value are
+  withdrawn through the engine's belief-revision path: the triple leaves the user
+  graph, the claim stays with status `superseded` and a link to the new claim, and
+  a `consolidation-superseded` episode of that user records the old and the new
+  value (counted as `superseded`). Pattern 3's own triples are found by claim
+  provenance (`sourceKind "consolidation-preference"`, ingestion run
+  `consolidation:<hash>`) and the ledger, never by text; a preference another
+  source wrote is untouched. A system withdrawal is not a user retraction: it
+  releases the value's ledger entry, so a later consistent shift back promotes it
+  again, while a preference retracted by hand does not come back.
+- **Not done.** A user already holding two preferences from before the shift
+  rule is not repaired (withdrawal happens only on a new promotion). Retraction
+  through `memory_retract` removes the triple from the user graph like any other
+  fact.
 ---
 
 ## 7. Retention

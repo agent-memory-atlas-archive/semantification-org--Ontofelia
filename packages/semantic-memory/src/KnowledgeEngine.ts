@@ -2011,6 +2011,90 @@ export class KnowledgeEngine {
   }
 
   /**
+   * Withdraw preferences the preference consolidation (pattern 3) promoted
+   * earlier, because a different value now supersedes them: each is retired
+   * through the belief-revision path ({@link retireSupersededClaim}), so the
+   * claim stays in the claims graph with status "superseded" and a forward link
+   * to the superseding claim, the base triple leaves the user graph, derived
+   * triples are retracted and a Conflict record is written.
+   *
+   * What counts as pattern 3's own: an ACCEPTED claim with `sourceKind
+   * "consolidation-preference"` and `ingestionRunId "consolidation:<hash>"` for
+   * one of the given promotion hashes, asserted in the given user's graph on
+   * the given subject and predicate. Nothing else is touched: a triple written
+   * by another source has no such claim, and a claim of another source for the
+   * very same text keeps the triple (the old claim is then left alone). The
+   * target is fixed by `userKey`; no parameter selects another graph.
+   *
+   * @returns the claims that were withdrawn, with the object they carried.
+   */
+  async withdrawConsolidatedPreferences(p: {
+    agentId: string;
+    userKey: string;
+    subjectUri: string;
+    predicateUri: string;
+    /** Promotion hashes (64 hex digits) of the values to withdraw. */
+    claimHashes: string[];
+    /** The claim that supersedes them. */
+    supersedingClaimUri: string;
+  }): Promise<Array<{ claimHash: string; claimUri: string; object: string }>> {
+    if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
+      throw new Error('withdrawConsolidatedPreferences: a concrete user key is required');
+    }
+    const targetGraph = this.assertGraph(GraphUriResolver.getUserGraph(p.agentId, p.userKey));
+    const claimsGraph = GraphUriResolver.getClaimsGraph(p.agentId);
+    const ONT = 'urn:shared:ontology#';
+    const subjectIri = sparqlIri(p.subjectUri);
+    const predicateIri = sparqlIri(p.predicateUri);
+    sparqlIri(p.supersedingClaimUri);
+    const out: Array<{ claimHash: string; claimUri: string; object: string }> = [];
+    for (const claimHash of [...new Set(p.claimHashes)]) {
+      if (!/^[0-9a-f]{64}$/.test(claimHash)) continue;
+      const found = await this.triplestore.query(`
+        SELECT ?c ?o WHERE { GRAPH ${sparqlIri(claimsGraph)} {
+          ?c a <${ONT}Claim> ;
+             <${ONT}claimSubject> ${subjectIri} ;
+             <${ONT}claimPredicate> ${predicateIri} ;
+             <${ONT}claimObject> ?o ;
+             <${ONT}assertedInGraph> ${sparqlIri(targetGraph)} ;
+             <${ONT}sourceKind> "consolidation-preference" ;
+             <${ONT}ingestionRunId> ${sparqlStringLiteral(`consolidation:${claimHash}`)} ;
+             <${ONT}status> "accepted" .
+        } }`);
+      for (const b of found.bindings ?? []) {
+        const claimUri = b['c']?.value;
+        const oTerm = b['o'];
+        if (!claimUri || !oTerm || claimUri === p.supersedingClaimUri) continue;
+        let objectTriple: string;
+        try {
+          sparqlIri(claimUri);
+          objectTriple = oTerm.type === 'uri' ? sparqlIri(oTerm.value) : sparqlStringLiteral(oTerm.value);
+        } catch {
+          continue;
+        }
+        // Another source holds an accepted claim for exactly this triple: the
+        // triple is not pattern 3's alone, so it is left in place.
+        const shared = await this.triplestore.ask(`
+          ASK { GRAPH ${sparqlIri(claimsGraph)} {
+            ?other a <${ONT}Claim> ;
+                   <${ONT}claimSubject> ${subjectIri} ;
+                   <${ONT}claimPredicate> ${predicateIri} ;
+                   <${ONT}claimObject> ${objectTriple} ;
+                   <${ONT}assertedInGraph> ${sparqlIri(targetGraph)} ;
+                   <${ONT}status> "accepted" .
+            FILTER (?other != ${sparqlIri(claimUri)})
+          } }`);
+        if (shared) continue;
+        const done = await this.retireSupersededClaim(
+          { claimUri, objectTriple, assertedInGraph: targetGraph }, p.agentId, p.supersedingClaimUri,
+        );
+        if (done) out.push({ claimHash, claimUri, object: oTerm.value });
+      }
+    }
+    return out;
+  }
+
+  /**
    * The write half of {@link storeFact}, shared with the episodic consolidation
    * ({@link promoteToUserGraph}): belief revision on functional properties,
    * on-write materialization, the base triple, the owner name link, inferred

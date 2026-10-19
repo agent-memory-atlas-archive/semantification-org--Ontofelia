@@ -280,6 +280,179 @@ describe('preference consolidation', { timeout: 60_000 }, () => {
       expect((await prefTriples())[0].o).toBe(preferenceObject('/model a', AB));
     });
 
+    describe('a shift of preference withdraws the earlier one', () => {
+      const SUBJECT = userEntityUri('anna');
+      const objA = preferenceObject('/model a', AB);
+      const objB = preferenceObject('/model b', AB);
+      const hash = (user: string, chosen: string) => preferenceClaimHash(user, choiceSignature(AB), chosen);
+      const at = (day: number) => new Date(T0 + day * DAY);
+
+      /** The user's three newest choices over AB are `chosen`, in three sessions on three days. */
+      async function shiftTo(user: string, chosen: string, firstDay: number) {
+        for (let i = 0; i < 3; i++) await choose(user, `${user}-shift-${chosen}-${firstDay + i}`, firstDay + i, chosen);
+      }
+      const claimStatus = async (obj: string, user = 'anna'): Promise<string[]> =>
+        ((await store.query(`SELECT ?st WHERE { GRAPH <${CLAIMS}> { ?c <${CORE}claimObject> ${JSON.stringify(obj)} ;
+          <${CORE}sourceKind> "consolidation-preference" ; <${CORE}assertedInGraph> <${userGraph(user)}> ; <${CORE}status> ?st } }`)).bindings ?? [])
+          .map((b) => b.st.value).sort();
+      const superseding = async (): Promise<Array<{ old: string; by: string }>> =>
+        ((await store.query(`SELECT ?old ?by WHERE { GRAPH <${CLAIMS}> { ?old <${CORE}supersededBy> ?by } }`)).bindings ?? [])
+          .map((b) => ({ old: b.old.value, by: b.by.value }));
+
+      it('A promoted, then B promoted after a consistent shift: exactly one preference, B', async () => {
+        await threeChoices('anna');
+        const first = await job.run(undefined, at(3));
+        expect(first.promoted).toBe(1);
+        expect(first.superseded).toBe(0);
+        expect((await prefTriples()).map((t) => t.o)).toEqual([objA]);
+
+        await shiftTo('anna', '/model b', 4);
+        const r = await job.run(undefined, at(8));
+        expect(r.promoted).toBe(1);
+        expect(r.superseded).toBe(1);
+        expect(await prefTriples()).toEqual([{ g: userGraph('anna'), s: SUBJECT, o: objB }]);
+        // History is kept: the old claim is superseded and points forward to the new one.
+        expect(await claimStatus(objA)).toEqual(['superseded']);
+        expect(await claimStatus(objB)).toEqual(['accepted']);
+        const links = await superseding();
+        expect(links).toHaveLength(1);
+        expect((await claimsOf('consolidation-preference'))).toEqual([links[0].by]);
+
+        // A rerun is a no-op: nothing promoted, nothing withdrawn, nothing written.
+        const quads = await quadCount();
+        const eps = await episodeCount();
+        const again = await job.run(undefined, at(9));
+        expect(again.promoted).toBe(0);
+        expect(again.superseded).toBe(0);
+        expect(await quadCount()).toBe(quads);
+        expect(await episodeCount()).toBe(eps);
+      });
+
+      it('never touches a preference another source wrote, nor one of another signature', async () => {
+        await threeChoices('anna');
+        // Another source (the user's own statement) holds a preference on the same subject, with
+        // a claim of its own; it even names the same alternatives.
+        const stated = 'prefers "/model a" when in a hurry';
+        const claim = 'urn:test:claim:stated';
+        await store.update(`INSERT DATA {
+          GRAPH <${userGraph('anna')}> { <${SUBJECT}> <${CORE_PREFERENCE_PREDICATE}> ${JSON.stringify(stated)} }
+          GRAPH <${CLAIMS}> { <${claim}> a <${CORE}Claim> ; <${CORE}claimSubject> <${SUBJECT}> ;
+            <${CORE}claimPredicate> <${CORE_PREFERENCE_PREDICATE}> ; <${CORE}claimObject> ${JSON.stringify(stated)} ;
+            <${CORE}assertedInGraph> <${userGraph('anna')}> ; <${CORE}sourceKind> "user" ; <${CORE}status> "accepted" }
+        }`);
+        // Pattern 3 over another signature (c over d) stays as well.
+        const CD = ['/model c', '/model d'];
+        for (let i = 0; i < 3; i++) await choose('anna', `cd${i}`, i, '/model c', CD);
+        await job.run(undefined, at(3));
+        expect((await prefTriples()).map((t) => t.o).sort()).toEqual([objA, preferenceObject('/model c', CD), stated].sort());
+
+        await shiftTo('anna', '/model b', 4);
+        const r = await job.run(undefined, at(8));
+        expect(r.superseded).toBe(1);
+        expect((await prefTriples()).map((t) => t.o).sort()).toEqual([objB, preferenceObject('/model c', CD), stated].sort());
+        const st = await store.query(`SELECT ?st WHERE { GRAPH <${CLAIMS}> { <${claim}> <${CORE}status> ?st } }`);
+        expect((st.bindings ?? []).map((b) => b.st.value)).toEqual(['accepted']);
+      });
+
+      it('keeps the triple when another source holds a claim for exactly the same text', async () => {
+        await threeChoices('anna');
+        await job.run(undefined, at(3));
+        // The user later states the very same sentence themself: that claim is not pattern 3's.
+        await store.update(`INSERT DATA { GRAPH <${CLAIMS}> { <urn:test:claim:same> a <${CORE}Claim> ;
+          <${CORE}claimSubject> <${SUBJECT}> ; <${CORE}claimPredicate> <${CORE_PREFERENCE_PREDICATE}> ;
+          <${CORE}claimObject> ${JSON.stringify(objA)} ; <${CORE}assertedInGraph> <${userGraph('anna')}> ;
+          <${CORE}sourceKind> "user" ; <${CORE}status> "accepted" } }`);
+        await shiftTo('anna', '/model b', 4);
+        const r = await job.run(undefined, at(8));
+        expect(r.promoted).toBe(1);
+        expect(r.superseded).toBe(0);
+        expect((await prefTriples()).map((t) => t.o).sort()).toEqual([objA, objB].sort());
+        expect(await claimStatus(objA)).toEqual(['accepted']);
+      });
+
+      it('records the withdrawal as an episode of the user, with both values, and in no other scope', async () => {
+        await threeChoices('anna');
+        await threeChoices('bob');
+        await job.run(undefined, at(3));
+        await shiftTo('anna', '/model b', 4);
+        await job.run(undefined, at(8));
+
+        const eps = (await em.recent('anna', 200)).filter((e) => e.episodeType === 'consolidation-superseded');
+        expect(eps).toHaveLength(1);
+        expect(eps[0].forUser).toBe('anna');
+        expect(Date.parse(eps[0].occurredAt)).toBe(at(8).getTime());
+        expect(eps[0].about).toEqual([SUBJECT]);
+        expect(eps[0].tags).toContain('old-value:/model a');
+        expect(eps[0].tags).toContain('new-value:/model b');
+        expect(eps[0].tags).toContain(`superseded-hash:${hash('anna', '/model a')}`);
+        expect(eps[0].tags).toContain(`claim-hash:${hash('anna', '/model b')}`);
+        // Not in bob's scope, and as an episode graph fact only `anna` ever appears as its user.
+        expect((await em.recent('bob', 200)).filter((e) => e.episodeType === 'consolidation-superseded')).toEqual([]);
+        const users = await store.query(`SELECT DISTINCT ?u WHERE { GRAPH <${EPISODIC}> { ?e <${COGT}episodeType> "consolidation-superseded" ; <${COGT}forUser> ?u } }`);
+        expect((users.bindings ?? []).map((b) => b.u.value)).toEqual(['anna']);
+        const fg = await store.query(`SELECT DISTINCT ?g WHERE { GRAPH <${EPISODIC}> { ?e <${COGT}episodeType> "consolidation-superseded" ; <${COGT}factGraph> ?g } }`);
+        expect((fg.bindings ?? []).map((b) => b.g.value)).toEqual([userGraph('anna')]);
+        // The withdrawal is no evidence for pattern 1.
+        expect((await em.claimEpisodes('anna', 100)).episodes.filter((e) => e.uri === eps[0].uri)).toEqual([]);
+      });
+
+      it('another user\'s preference for the same signature is untouched', async () => {
+        await threeChoices('anna');
+        await threeChoices('bob');
+        await job.run(undefined, at(3));
+        expect((await prefTriples()).map((t) => `${t.g} ${t.o}`).sort()).toEqual(
+          [`${userGraph('anna')} ${objA}`, `${userGraph('bob')} ${objA}`].sort(),
+        );
+        await shiftTo('anna', '/model b', 4);
+        const r = await job.run(undefined, at(8));
+        expect(r.superseded).toBe(1);
+        expect((await prefTriples()).map((t) => `${t.g} ${t.o}`).sort()).toEqual(
+          [`${userGraph('anna')} ${objB}`, `${userGraph('bob')} ${objA}`].sort(),
+        );
+        expect(await claimStatus(objA, 'bob')).toEqual(['accepted']);
+      });
+
+      it('a system withdrawal is no retraction: a consistent shift back promotes the first value again', async () => {
+        await threeChoices('anna');
+        await job.run(undefined, at(3));
+        await shiftTo('anna', '/model b', 4);
+        await job.run(undefined, at(8));
+        expect((await prefTriples()).map((t) => t.o)).toEqual([objB]);
+
+        // While the newest choices are still B, A does not come back (contradicted).
+        await shiftTo('anna', '/model a', 9);
+        const back = await job.run(undefined, at(13));
+        expect(back.promoted).toBe(1);
+        expect(back.alreadyPromoted).toBe(0);
+        expect(back.superseded).toBe(1);
+        expect(await prefTriples()).toEqual([{ g: userGraph('anna'), s: SUBJECT, o: objA }]);
+        expect(await claimStatus(objA)).toEqual(['accepted', 'superseded']);
+        expect(await claimStatus(objB)).toEqual(['superseded']);
+
+        // And now stable again.
+        const quads = await quadCount();
+        const again = await job.run(undefined, at(14));
+        expect(again.promoted + again.superseded).toBe(0);
+        expect(await quadCount()).toBe(quads);
+      });
+
+      it('a preference the user retracted by hand is not re-promoted, and its absence withdraws nothing', async () => {
+        await threeChoices('anna');
+        await job.run(undefined, at(3));
+        const [pc] = await claimsOf('consolidation-preference');
+        await store.update(`DELETE WHERE { GRAPH <${userGraph('anna')}> { <${SUBJECT}> <${CORE_PREFERENCE_PREDICATE}> ?o } }`);
+        await store.update(`DELETE WHERE { GRAPH <${CLAIMS}> { <${pc}> ?p ?o } }`);
+        await shiftTo('anna', '/model b', 4);
+        await job.run(undefined, at(8));
+        await shiftTo('anna', '/model a', 9);
+        const r = await job.run(undefined, at(13));
+        // A's hash is in the ledger and was never withdrawn by the system: it stays blocked.
+        expect(r.alreadyPromoted).toBe(1);
+        expect(r.superseded).toBe(0);
+        expect((await prefTriples()).map((t) => t.o)).toEqual([objB]);
+      });
+    });
+
     it('a rerun is a no-op: identical quad and episode count, nothing promoted', async () => {
       await threeChoices('anna');
       await job.run();
