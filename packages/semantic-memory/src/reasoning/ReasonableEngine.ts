@@ -105,7 +105,9 @@ export class ReasonableEngine {
     const p = sparqlIri(t.predicate);
     let o = '';
     if (typeof t.object === 'string') {
-      o = (t.object.startsWith('http') || t.object.startsWith('urn:')) ? sparqlIri(t.object) : sparqlStringLiteral(t.object);
+      // A bare string is always a literal: its content says nothing about
+      // what the term is. A caller that means an IRI passes {type: 'uri'}.
+      o = sparqlStringLiteral(t.object);
     } else {
       if (t.object.type === 'uri') o = sparqlIri(t.object.value);
       else o = sparqlStringLiteral(t.object.value) + (t.object.language ? sparqlLangTag(t.object.language) : '');

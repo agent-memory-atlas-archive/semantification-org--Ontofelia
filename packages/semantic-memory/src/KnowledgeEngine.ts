@@ -2043,7 +2043,7 @@ export class KnowledgeEngine {
       subject: subject.uri,
       predicate: predicate.uri,
       object: fact.objectType === 'literal' || !fact.objectType
-        ? fact.object
+        ? { type: 'literal', value: fact.object }
         : { type: 'uri', value: objectUri },
     };
     try {
