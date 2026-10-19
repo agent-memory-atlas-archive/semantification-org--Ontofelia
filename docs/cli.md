@@ -247,6 +247,10 @@ ontofelia ontology rollback <version>      # Roll back to a version (e.g. v001)
 
 ontofelia reasoning conflicts              # Show detected knowledge conflicts
 ontofelia reasoning reflect                # Trigger a memory reflection manually
+ontofelia reasoning gate                   # Show the reasoning gate setting (off by default)
+ontofelia reasoning gate --threshold 20000 # Skip synchronous reasoning above 20 000 ABox triples
+ontofelia reasoning gate --off             # Turn the gate off again
+ontofelia reasoning catchup [--force]      # Rebuild the inferred graphs now if the gate left them stale
 ```
 
 ---

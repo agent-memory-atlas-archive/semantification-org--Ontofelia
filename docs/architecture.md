@@ -103,7 +103,7 @@ The knowledge graph system. See [knowledge-graph-concept.md](knowledge-graph-con
 
 - **KnowledgeEngine** — central orchestration layer for entity resolution, predicate registration, fact insertion, Claim/Evidence provenance, and conflict detection
 - **Oxigraph** — embedded RDF triplestore (in-process, no sidecar, no separate port). The optional Fuseki adapter remains as a legacy sidecar backend.
-- **Reasonable** — OWL reasoner. Materialization runs only over accepted knowledge graphs (not over Claim/Evidence metadata).
+- **Reasonable** — OWL reasoner. Materialization runs only over accepted knowledge graphs (not over Claim/Evidence metadata). On large graphs the owner can switch on the [reasoning gate](reasoning-gate.md) (off by default): above a size threshold the synchronous step is skipped and a background catch-up rebuilds the inferred graphs.
 - **Named graphs** — agent-overarching `urn:shared:<graph>` (e.g. `urn:shared:ontology`, `urn:shared:world`, `urn:shared:shapes`) and agent-scoped `urn:<agent>:<graph>` (e.g. `urn:ontofelia:self`, `urn:ontofelia:worldview`, `urn:ontofelia:user:<id>`, `urn:ontofelia:claims`, `urn:ontofelia:evidence`, `urn:ontofelia:schema`, `urn:ontofelia:conflicts`, `urn:ontofelia:session:<id>`)
 - **Truth Maintenance** — every extracted fact is accepted immediately; conflicts are resolved post-hoc via belief revision (`status "superseded"`)
 - **Agent-local schema graph** — new predicates from the parser land in `urn:<agent>:schema`; the shared TBox (`urn:shared:ontology`) stays admin-only

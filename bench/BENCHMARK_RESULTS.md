@@ -99,7 +99,8 @@ At 17 quads/fact this maps to:
    reasoner from O(N) to O(degree). Materialised closure can be rebuilt
    periodically rather than on the hot path.
 
-3. **Per-graph reasoning gate.** Skip materialisation if
+3. **Per-graph reasoning gate** (implemented, off by default; see
+   `docs/reasoning-gate.md` and section H). Skip materialisation if
    `aboxBytes > threshold` (e.g. 5 MB) — log it so an offline job can
    reconstruct the inferred graph later. Crucial for chat latency.
 
