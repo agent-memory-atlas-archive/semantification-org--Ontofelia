@@ -217,7 +217,7 @@ ontofelia cron remove <id>
 ontofelia cron run <id>                    # Trigger a job manually
 
 ontofelia webhooks list
-ontofelia webhooks create                  # Interactive: name, path, auth method, secret
+ontofelia webhooks create                  # Interactive: name, path, auth method, secret, host tools (default off)
 ontofelia webhooks delete <id>
 ```
 

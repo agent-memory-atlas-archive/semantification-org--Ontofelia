@@ -341,11 +341,13 @@ Remove / manually trigger a job.
 
 #### `GET /api/webhooks` / `POST /api/webhooks` / `DELETE /api/webhooks/:id`
 
-Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", ... }`).
+Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", "allowHostTools", ... }`). `allowHostTools` is optional and must be a boolean (default `false`); see below.
 
 #### `POST /webhooks/:path`
 
 Inbound webhook receiver (outside `/api/*`; authenticated per webhook via HMAC-SHA256 or Bearer secret, with payload-size and replay protection). The payload is handed to the configured agent as a prompt.
+
+A webhook turn gets no host tools (`exec`, `fs_*`, `cron_manage`, `hostOnly` tools): the payload often comes from third parties and the answer goes back to the caller. Set `"allowHostTools": true` on the webhook definition to re-enable them for that webhook. The flag is read only from the stored definition; a field of that name in a request payload or header has no effect. See [Tools & Security](tools-and-security.md#who-gets-host-tools).
 
 ---
 
