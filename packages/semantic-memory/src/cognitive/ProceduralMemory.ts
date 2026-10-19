@@ -647,7 +647,7 @@ export class ProceduralMemory {
     // --- Skill summaries, grouped by (toolName, forGoalType). ---
     const groups = new Map<string, TraceHit[]>();
     for (const tr of traces) {
-      const key = `${tr.toolName} ${tr.forGoalType ?? ''}`;
+      const key = `${tr.toolName}\u0000${tr.forGoalType ?? ''}`;
       const arr = groups.get(key) ?? [];
       arr.push(tr);
       groups.set(key, arr);
@@ -805,7 +805,7 @@ export class ProceduralMemory {
       if (tools.length < 2) continue;
       const forGoalType = ordered[0].forGoalType;
       const sig = tools.join('>');
-      const key = `${forGoalType ?? ''} ${sig}`;
+      const key = `${forGoalType ?? ''}\u0000${sig}`;
       const agg =
         patterns.get(key) ??
         ({ forGoalType, tools, cycles: 0, satisfiedCycles: 0, okCycles: 0 } as PatternAgg);
