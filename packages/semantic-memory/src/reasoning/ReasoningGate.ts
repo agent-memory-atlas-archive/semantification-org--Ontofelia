@@ -59,6 +59,30 @@ export async function readAsyncThreshold(
 }
 
 /**
+ * Write (or, with `null`, remove) `reasoning/asyncThreshold`. Only a positive
+ * integer turns the gate on; anything else is rejected rather than stored, so
+ * the stored value is always one `readAsyncThreshold` reads back unchanged.
+ */
+export async function writeAsyncThreshold(
+  triplestore: TriplestoreAdapter,
+  assertWritable: (graph: string) => string,
+  agentId: string,
+  threshold: number | null,
+): Promise<void> {
+  if (threshold !== null && !(Number.isSafeInteger(threshold) && threshold >= 1)) {
+    throw new Error('asyncThreshold must be a positive integer, or null to turn the gate off');
+  }
+  const graph = sparqlIri(assertWritable(GraphUriResolver.getSetupGraph(agentId)));
+  const subject = sparqlIri(reasoningSettingsSubject(agentId));
+  const predicate = sparqlIri(ASYNC_THRESHOLD);
+  await triplestore.update(`DELETE WHERE { GRAPH ${graph} { ${subject} ${predicate} ?v } }`);
+  if (threshold !== null) {
+    await triplestore.update(`INSERT DATA { GRAPH ${graph} { ${subject} ${predicate}
+      "${threshold}"^^<http://www.w3.org/2001/XMLSchema#integer> } }`);
+  }
+}
+
+/**
  * Number of triples in `graphs` (the ABox the reasoner would read). A plain
  * COUNT over the in-memory store: far cheaper than the Turtle dump and the two
  * reasoner runs it is used to avoid. Returns `undefined` when it cannot be

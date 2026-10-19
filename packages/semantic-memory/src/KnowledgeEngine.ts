@@ -2,7 +2,7 @@ import { TriplestoreAdapter, TriplestoreConfig, Triple } from '@ontofelia/core';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { ReasonableEngine } from './reasoning/ReasonableEngine.js';
-import { InferredStaleTracker, readAsyncThreshold, countTriples } from './reasoning/ReasoningGate.js';
+import { InferredStaleTracker, readAsyncThreshold, writeAsyncThreshold, countTriples } from './reasoning/ReasoningGate.js';
 import { ClaimProvenanceService, assertValidEvidenceSourceUri } from './provenance/ClaimProvenanceService.js';
 import { GraphUriResolver, SHARED_GRAPHS } from './utils/GraphUriResolver.js';
 import { GraphRegistry } from './utils/GraphRegistry.js';
@@ -1268,6 +1268,27 @@ export class KnowledgeEngine {
       + '); inferred graphs are stale until the catch-up runs',
     );
     return true;
+  }
+
+  /**
+   * Turn the reasoning gate on (a positive ABox triple count) or off (`null`).
+   * Takes effect on the next stored fact, no restart.
+   */
+  async setAsyncThreshold(agentId: string, threshold: number | null): Promise<void> {
+    await writeAsyncThreshold(this.triplestore, (g) => this.assertGraph(g), agentId, threshold);
+  }
+
+  /** The gate as configured and the state of the inferred graphs. */
+  async reasoningGateStatus(agentId: string): Promise<{
+    asyncThreshold: number;
+    staleSince: string | null;
+    catchUpRunning: boolean;
+  }> {
+    return {
+      asyncThreshold: await readAsyncThreshold(this.triplestore, agentId),
+      staleSince: (await this.staleTracker.staleSince(agentId)) ?? null,
+      catchUpRunning: this.catchups.has(agentId),
+    };
   }
 
   /** Since when the inferred graphs may lag behind the facts; `undefined` when they are current. */

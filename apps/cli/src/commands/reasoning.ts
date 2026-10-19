@@ -51,6 +51,32 @@ export function registerReasoningCommand(program: Command) {
     });
 
   reasoningCmd
+    .command('gate')
+    .description('Show or set the reasoning gate (skip synchronous reasoning above N ABox triples)')
+    .option('--threshold <n>', 'turn the gate on above this many ABox triples')
+    .option('--off', 'turn the gate off (the default)')
+    .action(async (opts: { threshold?: string, off?: boolean }) => {
+      try {
+        const config = await loadConfig();
+        const url = `http://127.0.0.1:${config.gateway.port}/api/reasoning/gate`;
+        const headers = { 'Authorization': `Bearer ${config.gateway.token}`, 'Content-Type': 'application/json' };
+        let res: Response;
+        if (opts.off || opts.threshold !== undefined) {
+          const asyncThreshold = opts.off ? null : Number(opts.threshold);
+          res = await fetch(url, { method: 'PUT', headers, body: JSON.stringify({ asyncThreshold }) });
+        } else {
+          res = await fetch(url, { headers });
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status} - ${await res.text()}`);
+        const data = await res.json() as { asyncThreshold: number, staleSince: string | null, catchUpRunning: boolean };
+        console.log(data.asyncThreshold > 0 ? `Gate on: above ${data.asyncThreshold} ABox triples` : 'Gate off (default)');
+        console.log(data.staleSince ? `Inferred graphs stale since ${data.staleSince}${data.catchUpRunning ? ' (catch-up running)' : ''}` : 'Inferred graphs current');
+      } catch (err: unknown) {
+        console.error(chalk.red(`Failed: ${(err as Error).message}`));
+      }
+    });
+
+  reasoningCmd
     .command('catchup')
     .description('Rebuild the inferred graphs now if the reasoning gate left them stale')
     .option('--force', 'rebuild even when nothing is marked stale')

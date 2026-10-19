@@ -129,6 +129,33 @@ describe('settings', () => {
     expect(await readAsyncThreshold(rig.store as unknown as TriplestoreAdapter, AGENT)).toBe(expected);
   });
 
+  it('setAsyncThreshold writes what readAsyncThreshold reads, and null removes it', async () => {
+    const ts = rig.store as unknown as TriplestoreAdapter;
+    await rig.engine.setAsyncThreshold(AGENT, 20_000);
+    expect(await readAsyncThreshold(ts, AGENT)).toBe(20_000);
+    expect(await rig.engine.reasoningGateStatus(AGENT)).toEqual({
+      asyncThreshold: 20_000, staleSince: null, catchUpRunning: false,
+    });
+    await rig.engine.setAsyncThreshold(AGENT, 5);
+    expect(await readAsyncThreshold(ts, AGENT)).toBe(5);
+    expect(await graphRows(rig.store, SETUP)).toHaveLength(1);
+    await rig.engine.setAsyncThreshold(AGENT, null);
+    expect(await readAsyncThreshold(ts, AGENT)).toBe(0);
+    expect(await graphRows(rig.store, SETUP)).toEqual([]);
+  });
+
+  it.each([0, -3, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('setAsyncThreshold refuses %j', async (bad) => {
+    await expect(rig.engine.setAsyncThreshold(AGENT, bad)).rejects.toThrow(/positive integer/);
+    expect(await graphRows(rig.store, SETUP)).toEqual([]);
+  });
+
+  it('a threshold set through setAsyncThreshold gates storeFact', async () => {
+    await rig.engine.setAsyncThreshold(AGENT, 1);
+    await rig.engine.storeFact(fact('Anna', 'livesIn', 'Hamburg', 'Place'), ownerCtx);
+    expect(rig.materialize).not.toHaveBeenCalled();
+    expect((await rig.engine.reasoningGateStatus(AGENT)).staleSince).not.toBeNull();
+  });
+
   it('a failing read means "never skip"', async () => {
     const broken = { query: async () => { throw new Error('down'); } } as unknown as TriplestoreAdapter;
     expect(await readAsyncThreshold(broken, AGENT)).toBe(0);

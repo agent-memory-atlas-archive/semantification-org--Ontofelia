@@ -72,6 +72,24 @@ export default async function systemRoutes(fastify: FastifyInstance, ctx: Gatewa
     return reflectionRunner.reflect(PRIMARY_AGENT_ID);
   });
 
+  // The reasoning gate: current setting and state of the inferred graphs ...
+  fastify.get('/api/reasoning/gate', async () => {
+    return knowledgeEngine.reasoningGateStatus(PRIMARY_AGENT_ID);
+  });
+
+  // ... and the switch. `{ "asyncThreshold": 20000 }` turns it on at that many
+  // ABox triples, `{ "asyncThreshold": null }` (or 0) turns it off.
+  fastify.put('/api/reasoning/gate', async (request: FastifyRequest<{ Body: { asyncThreshold?: number | null } }>, reply) => {
+    const value = request.body?.asyncThreshold;
+    if (value === undefined) return reply.code(400).send({ error: 'asyncThreshold is required (a positive integer, or null/0 for off)' });
+    try {
+      await knowledgeEngine.setAsyncThreshold(PRIMARY_AGENT_ID, value === null || value === 0 ? null : value);
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+    return knowledgeEngine.reasoningGateStatus(PRIMARY_AGENT_ID);
+  });
+
   // Run the reasoning catch-up now (same call as the background job): rebuilds
   // the inferred graphs when the reasoning gate left them stale. `?force=true`
   // rebuilds even when nothing is marked stale.
