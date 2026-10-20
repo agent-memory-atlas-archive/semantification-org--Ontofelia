@@ -202,8 +202,9 @@ The owner marker is written by `CycleManager` only for a human owner turn
 true, `chatType` is `dm` or `group`, `channel` is not `system`, `cron` or
 `webhook`, and the sender id is not `scheduler`, `cron` or `initiative`. The
 initiative envelope, scheduled cron jobs (whose text the agent can write
-itself), the `/api/cron-trigger` endpoint and webhooks all claim `isOwner: true`
-and therefore never produce a valid mandate. The same predicate sets
+itself) and the `/api/cron-trigger` endpoint all claim `isOwner: true`, and
+webhooks arrive with `isOwner: false`; none of them therefore produces a valid
+mandate. The same predicate sets
 `ToolContext.ownerPresent`, which `arm_goal` and `update_goal_step` require
 (the latter also accepts an initiative cycle for its own goal). Episodes written
 before the marker existed lack it and fail the gate (§10).

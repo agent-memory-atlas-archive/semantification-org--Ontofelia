@@ -101,7 +101,9 @@ export default async function systemRoutes(fastify: FastifyInstance, ctx: Gatewa
       channel: 'webhook', accountId: 'system', chatType: 'webhook',
       sender: { id: `webhook:${webhook.id}`, channelPrefix: 'webhook', isOwner: false },
       timestamp: new Date().toISOString(), text: prompt, mentions: [], attachments: [],
-      routingHints: { forceNewSession: true }
+      // The host-tool opt-in comes from the stored webhook record only, never
+      // from the request (payload, headers). A literal `true` is required.
+      routingHints: { forceNewSession: true, ...(webhook.allowHostTools === true ? { allowHostTools: true } : {}) }
     };
 
     try {
