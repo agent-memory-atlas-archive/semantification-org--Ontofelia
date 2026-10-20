@@ -81,11 +81,80 @@ describe('ToolPolicyEngine', () => {
       expect(engine.isAllowed(createTool('memory_ask'), person).allowed).toBe(true);
     });
 
-    it('keeps the owner and machine senders as they were', () => {
+    it('keeps the owner as it was', () => {
       const engine = new ToolPolicyEngine({ allow: ['exec'], deny: [] });
       expect(engine.isAllowed(createTool('exec', true), { ...person, isOwner: true }).allowed).toBe(true);
-      const webhook = engine.isAllowed(createTool('exec', true), { ...person, channelType: 'webhook' as never, senderId: 'webhook:w1' });
-      expect(webhook.allowed).toBe(true);
+    });
+  });
+
+  describe('webhooks get no host tools unless their config says so', () => {
+    const webhook: ToolContext = { ...mockContext, channelType: 'webhook', senderId: 'webhook:w1', isOwner: false };
+    const hostTools = [createTool('exec', true), createTool('fs_write', true), createTool('fs_read'), createTool('fs_list')];
+
+    it('denies fs_read, fs_list, exec and fs_write without approval, despite the allow-list', () => {
+      for (const allow of [[], ['exec', 'fs_write', 'fs_read', 'fs_list']]) {
+        const engine = new ToolPolicyEngine({ allow, deny: [] });
+        for (const tool of hostTools) {
+          const res = engine.isAllowed(tool, webhook);
+          expect(res.allowed, tool.name).toBe(false);
+          expect(res.requiresApproval, tool.name).toBeFalsy();
+          expect(res.reason).toMatch(/reserved for the owner/);
+        }
+        expect(engine.filterAllowed(hostTools, webhook)).toEqual([]);
+      }
+    });
+
+    it('denies a hostOnly or default-denied custom tool too, and ignores isOwner', () => {
+      const engine = new ToolPolicyEngine({ allow: [], deny: [] });
+      for (const tool of [createTool('custom_host', true), createTool('cron_manage')]) {
+        expect(engine.isAllowed(tool, webhook).allowed, tool.name).toBe(false);
+        expect(engine.isAllowed(tool, { ...webhook, isOwner: true }).allowed, tool.name).toBe(false);
+        expect(engine.isAllowed(tool, { ...webhook, isOwner: true }).requiresApproval, tool.name).toBeFalsy();
+      }
+    });
+
+    it('still allows a tool that is not a host tool', () => {
+      const engine = new ToolPolicyEngine({ allow: [], deny: [] });
+      expect(engine.isAllowed(createTool('memory_ask'), webhook).allowed).toBe(true);
+      expect(engine.isAllowed(createTool('ontology_inspect'), webhook).allowed).toBe(true);
+    });
+
+    it('fails closed: only a literal true turns the flag on', () => {
+      const engine = new ToolPolicyEngine({ allow: ['fs_read'], deny: [] });
+      for (const allowHostTools of [false, undefined, 'true', 1, 'yes', {}, null]) {
+        const res = engine.isAllowed(createTool('fs_read'), { ...webhook, allowHostTools: allowHostTools as never });
+        expect(res.allowed, String(allowHostTools)).toBe(false);
+      }
+    });
+
+    it('with allowHostTools: true behaves as before', () => {
+      const ctx: ToolContext = { ...webhook, allowHostTools: true };
+      const engine = new ToolPolicyEngine({ allow: [], deny: [] });
+      expect(engine.isAllowed(createTool('fs_read'), ctx).allowed).toBe(true);
+      expect(engine.isAllowed(createTool('fs_list'), ctx).allowed).toBe(true);
+      const exec = engine.isAllowed(createTool('exec', true), ctx);
+      expect(exec.allowed).toBe(false);
+      expect(exec.requiresApproval).toBe(true);
+      expect(engine.isAllowed(createTool('exec', true), { ...ctx, isOwner: true }).requiresApproval).toBe(true);
+      expect(new ToolPolicyEngine({ allow: ['exec'], deny: [] }).isAllowed(createTool('exec', true), ctx).allowed).toBe(true);
+      expect(new ToolPolicyEngine({ allow: [], deny: ['fs_read'] }).isAllowed(createTool('fs_read'), ctx).allowed).toBe(false);
+    });
+
+    it('the flag does not lift the person gate', () => {
+      const engine = new ToolPolicyEngine({ allow: ['fs_read'], deny: [] });
+      const person: ToolContext = { ...mockContext, channelType: 'telegram', senderId: 'telegram:42', isOwner: false, allowHostTools: true };
+      expect(engine.isAllowed(createTool('fs_read'), person).allowed).toBe(false);
+    });
+  });
+
+  describe('nodes (paired devices) are unchanged', () => {
+    it('keeps cli/node senders as they were', () => {
+      const node: ToolContext = { ...mockContext, channelType: 'cli', senderId: 'node:n1', isOwner: false };
+      const engine = new ToolPolicyEngine({ allow: ['exec', 'fs_read'], deny: [] });
+      expect(engine.isAllowed(createTool('exec', true), node).allowed).toBe(true);
+      expect(engine.isAllowed(createTool('fs_read'), node).allowed).toBe(true);
+      const open = new ToolPolicyEngine({ allow: [], deny: [] });
+      expect(open.isAllowed(createTool('exec', true), node).requiresApproval).toBe(true);
     });
   });
 });

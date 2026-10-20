@@ -26,7 +26,7 @@ export function registerWebhooksCommand(program: Command) {
         const hooks = await res.json() as Record<string, unknown>[];
         console.log(chalk.blue.bold(`\nWebhooks (${hooks.length}):`));
         hooks.forEach(h => {
-          console.log(`- ${chalk.green(h.id)}: ${h.name} | Path: ${h.path} | Agent: ${h.agentId} | Auth: ${h.authMethod} | Enabled: ${h.enabled}`);
+          console.log(`- ${chalk.green(h.id)}: ${h.name} | Path: ${h.path} | Agent: ${h.agentId} | Auth: ${h.authMethod} | Enabled: ${h.enabled} | Host tools: ${h.allowHostTools === true ? 'allowed' : 'off'}`);
         });
       } catch (err: unknown) {
         console.error(chalk.red(`Failed to list webhooks: ${(err as Error).message}`));
@@ -51,12 +51,13 @@ export function registerWebhooksCommand(program: Command) {
         const agentId = await input({ message: 'Agent ID:', default: 'default' });
         const promptTxt = await input({ message: 'Prefix prompt (optional):' });
         const isEnabled = await confirm({ message: 'Enable webhook?', default: true });
+        const allowHostTools = await confirm({ message: 'Allow host tools (files, shell) for this webhook? Webhook text often comes from third parties.', default: false });
         
         const config = await loadConfig();
         const res = await fetch(`http://127.0.0.1:${config.gateway.port}/api/webhooks`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${config.gateway.token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, path: hookPath, secret, authMethod, agentId, prompt: promptTxt, enabled: isEnabled, maxPayloadBytes: 1048576, replayWindowMs: 300000 })
+          body: JSON.stringify({ name, path: hookPath, secret, authMethod, agentId, prompt: promptTxt, enabled: isEnabled, allowHostTools, maxPayloadBytes: 1048576, replayWindowMs: 300000 })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status} - ${await res.text()}`);
         console.log(chalk.green(`✔ Webhook created.`));
