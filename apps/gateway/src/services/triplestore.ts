@@ -61,6 +61,8 @@ export async function initTriplestore(config: OntofeliaConfig, currentDir: strin
   // knowledgeEngine.registry.registerAgent(<id>).
   const graphRegistry = GraphRegistry.create([PRIMARY_AGENT_ID]);
   const knowledgeEngine = new KnowledgeEngine(triplestore, undefined, graphRegistry);
+  // Audit lines of the reasoning gate and its catch-up go to the gateway log.
+  knowledgeEngine.setLogger(logger);
   try {
     const coreOntologyForTBox = await fs.promises.readFile(
       path.resolve(currentDir, '..', '..', '..', 'packages', 'semantic-memory', 'dist', 'ontologies', 'ontofelia-core.ttl'),
