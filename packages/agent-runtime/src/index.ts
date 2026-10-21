@@ -1134,6 +1134,12 @@ Users can use these commands:
       channelType: envelope.channel,
       senderId: envelope.sender.id,
       isOwner: envelope.sender.isOwner,
+      // Per-webhook opt-in to host tools, set by the gateway from the stored
+      // webhook config. Honoured on webhook envelopes only; anything but a
+      // literal `true` leaves the flag off (the tool policy fails closed).
+      ...(envelope.channel === 'webhook' && envelope.routingHints?.allowHostTools === true
+        ? { allowHostTools: true }
+        : {}),
       // Authoritative "nobody is watching" signal (docs §5–§6, §8). Threaded
       // from chatType so the ToolExecutor can hard-deny non-allowlisted tools at
       // the EXECUTION chokepoint (not merely hide them from the LLM), and so

@@ -5,7 +5,7 @@ import { safeCompareSecret } from '@ontofelia/security';
 
 export default async function systemRoutes(fastify: FastifyInstance, ctx: GatewayContext) {
   const { agents, config, fusekiManager, triplestore, channelRegistry,
-    conflictDetector, reflectionRunner, mediaStore, signedUrlService,
+    conflictDetector, reflectionRunner, knowledgeEngine, mediaStore, signedUrlService,
     mimeDetector, nodeRegistry, webhookRegistry } = ctx;
 
   // Bearer guard for routes that live OUTSIDE the global /api/* auth hook
@@ -72,6 +72,34 @@ export default async function systemRoutes(fastify: FastifyInstance, ctx: Gatewa
     return reflectionRunner.reflect(PRIMARY_AGENT_ID);
   });
 
+  // The reasoning gate: current setting and state of the inferred graphs ...
+  fastify.get('/api/reasoning/gate', async () => {
+    return knowledgeEngine.reasoningGateStatus(PRIMARY_AGENT_ID);
+  });
+
+  // ... and the switch. `{ "asyncThreshold": 20000 }` turns it on at that many
+  // ABox triples, `{ "asyncThreshold": null }` (or 0) turns it off.
+  fastify.put('/api/reasoning/gate', async (request: FastifyRequest<{ Body: { asyncThreshold?: number | null } }>, reply) => {
+    const value = request.body?.asyncThreshold;
+    if (value === undefined) return reply.code(400).send({ error: 'asyncThreshold is required (a positive integer, or null/0 for off)' });
+    try {
+      await knowledgeEngine.setAsyncThreshold(PRIMARY_AGENT_ID, value === null || value === 0 ? null : value);
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+    return knowledgeEngine.reasoningGateStatus(PRIMARY_AGENT_ID);
+  });
+
+  // Run the reasoning catch-up now (same call as the background job): rebuilds
+  // the inferred graphs when the reasoning gate left them stale. `?force=true`
+  // rebuilds even when nothing is marked stale.
+  fastify.post('/api/reasoning/catchup', async (request: FastifyRequest<{ Querystring: { force?: string } }>) => {
+    const force = request.query.force === 'true' || request.query.force === '1';
+    const result = await knowledgeEngine.catchUpInferredGraphs(PRIMARY_AGENT_ID, { force });
+    const staleSince = await knowledgeEngine.inferredStaleSince(PRIMARY_AGENT_ID).catch(() => undefined);
+    return { ...result, staleSince: staleSince ?? null };
+  });
+
   fastify.post('/webhooks/:path', async (request: FastifyRequest<{ Params: { path: string }, Body: unknown }>, reply) => {
     const fullPath = `/webhooks/${request.params.path}`;
     const webhook = webhookRegistry.getByPath(fullPath);
@@ -101,7 +129,9 @@ export default async function systemRoutes(fastify: FastifyInstance, ctx: Gatewa
       channel: 'webhook', accountId: 'system', chatType: 'webhook',
       sender: { id: `webhook:${webhook.id}`, channelPrefix: 'webhook', isOwner: false },
       timestamp: new Date().toISOString(), text: prompt, mentions: [], attachments: [],
-      routingHints: { forceNewSession: true }
+      // The host-tool opt-in comes from the stored webhook record only, never
+      // from the request (payload, headers). A literal `true` is required.
+      routingHints: { forceNewSession: true, ...(webhook.allowHostTools === true ? { allowHostTools: true } : {}) }
     };
 
     try {

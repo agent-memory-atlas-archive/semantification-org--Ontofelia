@@ -49,6 +49,12 @@ export interface ToolContext {
   channelType: ChannelType;
   senderId: string;
   isOwner: boolean;
+  /**
+   * Webhook envelopes only: true when the stored webhook configuration sets
+   * `allowHostTools: true`. Without it a webhook gets no host tool. The runtime
+   * derives it from the gateway-set routing hint, never from request content.
+   */
+  allowHostTools?: boolean;
   sandboxConfig?: {
     scope: 'agent' | 'session' | 'off';
     workspaceAccess: 'none' | 'ro' | 'rw';
