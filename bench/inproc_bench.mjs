@@ -10,6 +10,16 @@
  *      (which exercises reasoner materialize + supersession check + insert +
  *       claim/evidence creation + persistent flush)
  *   5. report timings
+ *
+ * Usage: node bench/inproc_bench.mjs [levels] [--async-threshold=N]
+ *   levels               comma-separated fact counts (default 0,1000,5000,15000,30000,60000)
+ *   --async-threshold=N  turn the reasoning gate on (setup key reasoning/asyncThreshold):
+ *                        above N ABox triples storeFact skips the synchronous materialization.
+ *                        The level also times the catch-up that rebuilds the inferred graphs.
+ *                        Without the flag the gate is off, as in a default install.
+ *
+ * `peakRssMB` is the process high-water mark: run one level per process
+ * (e.g. under `systemd-run --user --scope -p MemoryMax=6G`) to read it per size.
  */
 
 import { performance } from 'node:perf_hooks';
@@ -21,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 
 import {
-  OxigraphAdapter, KnowledgeEngine, GraphRegistry, GraphUriResolver, SHARED_GRAPHS,
+  OxigraphAdapter, KnowledgeEngine, GraphRegistry, GraphUriResolver, SHARED_GRAPHS, REASONING_NS, reasoningSettingsSubject,
 } from '../packages/semantic-memory/dist/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -104,7 +114,7 @@ async function bulkLoad(triplestore, quads) {
   }
 }
 
-async function runOneLevel(facts) {
+async function runOneLevel(facts, asyncThreshold) {
   const tmp = mkdtempSync(path.join(tmpdir(), 'ontofelia-bench-'));
   const dataDir = path.join(tmp, 'triplestore');
   mkdirSync(dataDir, { recursive: true });
@@ -130,6 +140,14 @@ async function runOneLevel(facts) {
 
   const registry = GraphRegistry.create(['ontofelia']);
   const engine = new KnowledgeEngine(triplestore, undefined, registry);
+  // Keep stdout clean for the JSON result; the engine's audit lines go to stderr.
+  engine.setLogger({ info: () => {}, warn: (m) => console.error(`  [engine] ${m}`) });
+  if (asyncThreshold > 0) {
+    await triplestore.update(
+      `INSERT DATA { GRAPH <${GraphUriResolver.getSetupGraph('ontofelia')}> {
+        <${reasoningSettingsSubject('ontofelia')}> <${REASONING_NS}asyncThreshold> "${asyncThreshold}" } }`,
+    );
+  }
 
   // Bulk-load synthetic quads
   const tGen = performance.now();
@@ -211,6 +229,15 @@ async function runOneLevel(facts) {
   }
   const storeAvg = storeMsTotal / 5;
 
+  // With the gate on, the inferred graphs are stale now: time the catch-up.
+  let catchUp;
+  const peakRssBeforeCatchUpMB = Math.round(process.resourceUsage().maxRSS / 1024);
+  if (asyncThreshold > 0) {
+    const tCatch = performance.now();
+    const r = await engine.catchUpInferredGraphs('ontofelia');
+    catchUp = { status: r.status, ms: Math.round(performance.now() - tCatch), sharedTriples: r.shared };
+  }
+
   // Time a reasoning step on its own (skip the rest of the pipeline)
   // Use the reasoner via the in-engine path that storeFact uses.
   // We measure by calling storeFact again and isolating: actually easier to
@@ -231,20 +258,30 @@ async function runOneLevel(facts) {
     firstStoreMs: Math.round(storeMs),
     steadyStoresMs: steady,
     avgStoreMs: Math.round(storeAvg),
+    asyncThreshold,
+    ...(catchUp ? { catchUp, peakRssBeforeCatchUpMB } : {}),
+    peakRssMB: Math.round(process.resourceUsage().maxRSS / 1024),
   };
 }
 
-const levelsArg = process.argv[2];
+const flagArgs = process.argv.slice(2).filter(a => a.startsWith('--'));
+const positional = process.argv.slice(2).filter(a => !a.startsWith('--'));
+const thresholdFlag = flagArgs.find(a => a.startsWith('--async-threshold='));
+const ASYNC_THRESHOLD = thresholdFlag ? Number.parseInt(thresholdFlag.split('=')[1], 10) : 0;
+if (!Number.isInteger(ASYNC_THRESHOLD) || ASYNC_THRESHOLD < 0) {
+  console.error('--async-threshold must be a non-negative integer'); process.exit(2);
+}
+const levelsArg = positional[0];
 const LEVELS = levelsArg
   ? levelsArg.split(',').map(n => Number.parseInt(n, 10))
   : [0, 1000, 5000, 15000, 30000, 60000];
 
-console.error('Levels:', LEVELS.join(', '));
+console.error('Levels:', LEVELS.join(', '), '| reasoning gate:', ASYNC_THRESHOLD > 0 ? `on (threshold ${ASYNC_THRESHOLD})` : 'off');
 const results = [];
 for (const n of LEVELS) {
   console.error(`\n=== Facts: ${n} ===`);
   try {
-    const r = await runOneLevel(n);
+    const r = await runOneLevel(n, ASYNC_THRESHOLD);
     console.error(`  total triples: ${r.total}`);
     console.error(`  dataset.nq:   ${r.datasetMB} MB`);
     console.error(`  bulk load:    ${r.loadMs} ms`);
@@ -252,6 +289,8 @@ for (const n of LEVELS) {
     console.error(`  first store:  ${r.firstStoreMs} ms`);
     console.error(`  steady avg:   ${r.avgStoreMs} ms (per call)`);
     console.error(`  steady runs:  [${r.steadyStoresMs.join(', ')}] ms`);
+    if (r.catchUp) console.error(`  catch-up:     ${r.catchUp.ms} ms (${r.catchUp.status}, ${r.catchUp.sharedTriples} inferred triples)`);
+    console.error(`  peak RSS:     ${r.peakRssMB} MB${r.peakRssBeforeCatchUpMB ? ` (${r.peakRssBeforeCatchUpMB} MB before the catch-up)` : ''}`);
     results.push(r);
   } catch (e) {
     console.error(`  FAILED: ${e.message}`);

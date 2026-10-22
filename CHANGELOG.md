@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Behaviour change: webhooks no longer get host tools by default.** A webhook turn now gets no host tool (`exec`, `fs_*`, `cron_manage`, `hostOnly` tools), not even with approval and not through the allow-list, exactly like a non-owner person in a chat: webhook text often comes from third parties and the answer goes back to the caller. An existing webhook that reads files or runs commands must be recreated or edited in `scheduler/webhooks.json` with `"allowHostTools": true`; new webhooks accept the field via `POST /api/webhooks` and `ontofelia webhooks create` (default off, must be a boolean). The flag is read only from the stored webhook definition, never from the request; anything but a literal `true` is off. Paired devices (nodes) are unchanged. See `docs/tools-and-security.md`, section "Who gets host tools".
 - **Cognitive layer on by default for new installs.** A new install (self graph seeded in that boot, nothing else of the agent in the store) starts with every cognitive flag on except `flagRetention` and `flagInitiative`. Upgrading changes nothing: an existing install keeps its flags and opts in with the owner command `/cog defaults apply` (`/cog defaults` shows the difference first). Rollback: `/cog flag <name> off` or `/cog cycle off`; nothing is deleted by turning it off. See `docs/cognitive-architecture/09-integration-and-migration.md` section 7.
 
 ### Added
+- **Reasoning gate (off by default).** With the setup key `reasoning/asyncThreshold` set, `storeFact` skips the synchronous OWL materialization once the graphs the reasoner reads hold more triples than the threshold, logs the skip and marks the inferred graphs stale. A `reasoning.catchup` cron job (every five minutes, only does work when the marker is set) rebuilds the inferred graphs; `ontofelia reasoning catchup` and `POST /api/reasoning/catchup` run it now, `ontofelia reasoning gate` and `/api/reasoning/gate` show and set the threshold. Trade-off: inferred triples may be missing until the next catch-up. Without the setting nothing changes. See `docs/reasoning-gate.md`.
+- `bench/inproc_bench.mjs` takes `--async-threshold=N`, times the catch-up and reports peak RSS.
 - `/cog defaults` and `/cog defaults apply` (owner only).
 - Soak metrics in `/cog health` (owner only): persist latency p50 and p95, graph sizes per family, impasse rate per 100 cycles, dumps per turn.
 

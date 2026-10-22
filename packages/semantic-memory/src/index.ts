@@ -3,6 +3,7 @@ export * from './adapters/FusekiAdapter.js';
 export * from './adapters/InMemoryAdapter.js';
 export * from './adapters/OxigraphAdapter.js';
 export * from './reasoning/ReasonableEngine.js';
+export * from './reasoning/ReasoningGate.js';
 export * from './ontology/OntologyManager.js';
 export * from './reasoning/ConflictDetector.js';
 export * from './reflection/ReflectionRunner.js';

@@ -90,6 +90,15 @@ tools: {
 
 > **Current default:** The NoopSandboxAdapter (scope `off`) is active by default. However, **in production**, if `scope` is `off` and dangerous tools (`exec`, `cron_manage`, `fs_write`) are allowed, the Gateway will refuse to start. This prevents accidental exposure of the host system.
 
+### Who gets host tools
+
+Host tools are the tools that act on the machine or its files: `exec`, `cron_manage`, `fs_write`, every `fs_*` tool, and any tool marked `hostOnly`.
+
+- **The owner** gets them under the rules above (default-deny, allow-list, approval).
+- **A non-owner person in a chat** (Telegram, Discord, ...) never gets them, not even with approval and not through the allow-list. Approving a pairing grants a conversation, not the owner's machine.
+- **A webhook** gets none by default, on the same terms. Webhook text often comes from third parties (a commit message, an issue title, a form field) and the agent's answer goes back to the caller, so a crafted payload must not be able to read files or run commands. To let a particular webhook use host tools, set `allowHostTools: true` in that webhook's own record, for example `POST /api/webhooks` with `{ ..., "allowHostTools": true }` or the prompt in `ontofelia webhooks create`. The flag is read only from the stored record, never from the payload or headers of a request, and anything other than a literal `true` counts as off. With the flag on, the usual rules apply again (default-deny tools still need approval unless the allow-list names them). Webhooks that do not use host tools need no change.
+- **Nodes** (paired devices) are unchanged: the owner pairs them, so they are not gated.
+
 ## Guardian Policy (Human-in-the-Loop)
 
 Ontofelia implements a human-in-the-loop approval flow for potentially dangerous tools.
@@ -227,6 +236,7 @@ interface ToolContext {
   channelType: ChannelType;
   senderId: string;
   isOwner: boolean;
+  allowHostTools?: boolean;   // webhook turns only: the stored webhook opted in to host tools
   sandboxConfig?: {
     scope: 'agent' | 'session' | 'off';
     workspaceAccess: 'none' | 'ro' | 'rw';

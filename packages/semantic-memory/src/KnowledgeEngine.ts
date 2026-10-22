@@ -2,6 +2,7 @@ import { TriplestoreAdapter, TriplestoreConfig, Triple } from '@ontofelia/core';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { ReasonableEngine } from './reasoning/ReasonableEngine.js';
+import { InferredStaleTracker, readAsyncThreshold, writeAsyncThreshold, countTriples } from './reasoning/ReasoningGate.js';
 import { ClaimProvenanceService, assertValidEvidenceSourceUri } from './provenance/ClaimProvenanceService.js';
 import { GraphUriResolver, SHARED_GRAPHS } from './utils/GraphUriResolver.js';
 import { GraphRegistry } from './utils/GraphRegistry.js';
@@ -153,8 +154,39 @@ export interface EntityFact {
   superseded?: { previousObject: string; previousLabel: string; supersededAt?: string };
 }
 
+/** Minimal sink for the engine's audit lines; the gateway passes its pino logger. */
+export interface EngineLogger {
+  info(message: string): void;
+  warn(message: string): void;
+}
+
+/** Outcome of {@link KnowledgeEngine.catchUpInferredGraphs}. */
+export interface CatchUpResult {
+  /**
+   * `ran`: the inferred graphs were rebuilt. `not-stale`: nothing to do.
+   * `busy`: another catch-up of this agent is running. `unavailable`: no
+   * in-process reasoner (e.g. Fuseki). `failed`: the rebuild threw; the marker
+   * is kept so the next run retries.
+   */
+  status: 'ran' | 'not-stale' | 'busy' | 'unavailable' | 'failed';
+  /** Triples written to the shared inferred graph. */
+  shared?: number;
+  /** Triples written per user inferred graph. */
+  perUser?: Record<string, number>;
+  /** True when facts were skipped during the run, so the marker stays set. */
+  stillStale?: boolean;
+  error?: string;
+}
+
 export class KnowledgeEngine {
   private reasoner?: ReasonableEngine;
+  private logger: EngineLogger = {
+    info: (m) => console.info(`[KnowledgeEngine] ${m}`),
+    warn: (m) => console.warn(`[KnowledgeEngine] ${m}`),
+  };
+  private readonly staleTracker: InferredStaleTracker;
+  /** Catch-ups in flight, per agent. At most one runs at a time. */
+  private readonly catchups = new Map<string, Promise<CatchUpResult>>();
   private claimService: ClaimProvenanceService;
   /** Whitelist of permitted Named Graphs — see GraphRegistry. */
   private readonly graphRegistry: GraphRegistry;
@@ -170,6 +202,12 @@ export class KnowledgeEngine {
     }
     this.graphRegistry = graphRegistry ?? GraphRegistry.create(['ontofelia']);
     this.claimService = new ClaimProvenanceService(this.triplestore, this.graphRegistry);
+    this.staleTracker = new InferredStaleTracker(this.triplestore, (g) => this.assertGraph(g));
+  }
+
+  /** Route the engine's audit lines (reasoning gate skips, catch-up runs) to `logger`. */
+  setLogger(logger: EngineLogger): void {
+    this.logger = logger;
   }
 
   /**
@@ -1204,6 +1242,101 @@ export class KnowledgeEngine {
   }
 
   /**
+   * The reasoning gate. True when the synchronous materialisation of a fact
+   * stored in `targetGraph` must be skipped: the owner set
+   * `reasoning/asyncThreshold` and the graphs the reasoner would read hold more
+   * triples than that (or a catch-up is rebuilding the inferred graphs right
+   * now, which a concurrent materialisation would race). The skip is logged
+   * and the stale marker is durable before this returns true; if it cannot be
+   * written the answer is false and the fact is materialised as usual.
+   * With no setting this is a single cheap read and always false.
+   */
+  private async shouldDeferMaterialization(agentId: string, targetGraph: string): Promise<boolean> {
+    const threshold = await readAsyncThreshold(this.triplestore, agentId);
+    const running = this.catchups.has(agentId);
+    if (threshold === 0 && !running) return false;
+    const aboxGraphs = GraphUriResolver.getInferenceScope(agentId, targetGraph).aboxGraphs;
+    let size: number | undefined;
+    if (!running) {
+      size = await countTriples(this.triplestore, aboxGraphs);
+      if (size === undefined || size <= threshold) return false;
+    }
+    if (!(await this.staleTracker.markStale(agentId))) return false;
+    this.logger.info(
+      `reasoning gate: skipped synchronous materialization (agent=${agentId} graph=${targetGraph} `
+      + (running ? 'reason=catch-up-running' : `abox-triples=${size} threshold=${threshold}`)
+      + '); inferred graphs are stale until the catch-up runs',
+    );
+    return true;
+  }
+
+  /**
+   * Turn the reasoning gate on (a positive ABox triple count) or off (`null`).
+   * Takes effect on the next stored fact, no restart.
+   */
+  async setAsyncThreshold(agentId: string, threshold: number | null): Promise<void> {
+    await writeAsyncThreshold(this.triplestore, (g) => this.assertGraph(g), agentId, threshold);
+  }
+
+  /** The gate as configured and the state of the inferred graphs. */
+  async reasoningGateStatus(agentId: string): Promise<{
+    asyncThreshold: number;
+    staleSince: string | null;
+    catchUpRunning: boolean;
+  }> {
+    return {
+      asyncThreshold: await readAsyncThreshold(this.triplestore, agentId),
+      staleSince: (await this.staleTracker.staleSince(agentId)) ?? null,
+      catchUpRunning: this.catchups.has(agentId),
+    };
+  }
+
+  /** Since when the inferred graphs may lag behind the facts; `undefined` when they are current. */
+  async inferredStaleSince(agentId: string): Promise<string | undefined> {
+    return this.staleTracker.staleSince(agentId);
+  }
+
+  /**
+   * Catch-up for skipped materialisations: when the stale marker is set (or
+   * `force` is true), rebuild every inferred graph of the agent from its facts
+   * with {@link rebuildInferredGraphs}, then clear the marker, unless a fact
+   * was skipped while the rebuild ran (the marker stays and the next run
+   * covers it). Never runs concurrently with itself for one agent.
+   */
+  async catchUpInferredGraphs(agentId: string, opts: { force?: boolean } = {}): Promise<CatchUpResult> {
+    if (!this.reasoner) return { status: 'unavailable' };
+    if (this.catchups.has(agentId)) return { status: 'busy' };
+    const run = this.runCatchUp(agentId, opts.force === true);
+    this.catchups.set(agentId, run);
+    try {
+      return await run;
+    } finally {
+      this.catchups.delete(agentId);
+    }
+  }
+
+  private async runCatchUp(agentId: string, force: boolean): Promise<CatchUpResult> {
+    try {
+      const since = await this.staleTracker.staleSince(agentId);
+      if (since === undefined && !force) return { status: 'not-stale' };
+      const epoch = this.staleTracker.epoch(agentId);
+      const started = Date.now();
+      const { shared, perUser } = await this.rebuildInferredGraphs(agentId);
+      const cleared = await this.staleTracker.clearIfUnchanged(agentId, epoch);
+      this.logger.info(
+        `reasoning catch-up: rebuilt inferred graphs (agent=${agentId} shared=${shared} `
+        + `users=${Object.keys(perUser).length} ms=${Date.now() - started}`
+        + `${since ? ` stale-since=${since}` : ''}${cleared ? '' : ' still-stale=true'})`,
+      );
+      return { status: 'ran', shared, perUser, stillStale: !cleared };
+    } catch (e) {
+      const error = (e as Error).message;
+      this.logger.warn(`reasoning catch-up failed (agent=${agentId}): ${error}; inferred graphs stay marked stale`);
+      return { status: 'failed', error };
+    }
+  }
+
+  /**
    * Recompute the inferred graph that belongs to `sourceGraph` (the worldview
    * or one user's graph) from scratch: reason over its current triples (plus
    * the worldview for a user graph) and replace that inferred graph with the
@@ -2064,7 +2197,12 @@ export class KnowledgeEngine {
   // empty. That is why the inferred graph stayed dead even though the
   // reasoner itself works.
   let inferredTriples: Array<{ subject: string; predicate: string; object: unknown }> = [];
-  if (this.reasoner && status === 'accepted') {
+  // Reasoning gate (off unless the owner sets `reasoning/asyncThreshold`): on a
+  // large graph the synchronous materialisation is skipped and a background
+  // catch-up rebuilds the inferred graphs later.
+  const deferMaterialization = this.reasoner !== undefined && status === 'accepted'
+    && await this.shouldDeferMaterialization(context.agentId, targetGraph);
+  if (this.reasoner && status === 'accepted' && !deferMaterialization) {
     const inputTriple: Triple = {
       subject: subject.uri,
       predicate: predicate.uri,
@@ -2094,6 +2232,9 @@ export class KnowledgeEngine {
       }
     `);
   }
+
+  // The skipped fact is in the store now (see InferredStaleTracker.touch).
+  if (deferMaterialization) this.staleTracker.touch(context.agentId);
 
   // 4b-bis. Owner↔named-person entity resolution: when the user declares
   // their own name (e.g. "I am Alice", "my name is Alice"), materialize

@@ -82,6 +82,12 @@ export interface RoutingHints {
    * goal as the active context (docs/initiative-architecture.md §6).
    */
   initiativeGoalId?: string;
+  /**
+   * Set by the gateway only on a `webhook` envelope, and only from the stored
+   * webhook configuration (`allowHostTools: true`), never from the request. The
+   * runtime copies it into `ToolContext.allowHostTools`.
+   */
+  allowHostTools?: boolean;
 }
 
 export interface ChannelCapabilities {
