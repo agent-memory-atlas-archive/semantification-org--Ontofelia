@@ -1,14 +1,28 @@
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { GatewayContext } from '../context.js';
 import { createLogger, resolveAgentId } from '@ontofelia/core';
-import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport } from '@ontofelia/semantic-memory';
+import { GraphUriResolver, SHARED_GRAPHS, importVault, buildVaultExport, QueryTimeoutError, createQueryExecutor } from '@ontofelia/semantic-memory';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { AuditLog } from '@ontofelia/tools';
 import { fileURLToPath } from 'url';
+import { Parser, Generator, type SparqlQuery } from 'sparqljs';
+import { checkQueryAst, httpReadableGraphs } from '../sparqlGuard.js';
 
 const PRIMARY_AGENT_ID = 'ontofelia';
+
+/** Maximum number of rows returned by `POST /api/knowledge/sparql`. */
+const SPARQL_MAX_ROWS = 1000;
+
+const SPARQL_DEFAULT_TIMEOUT_MS = 5000;
+const SPARQL_MIN_TIMEOUT_MS = 100;
+const SPARQL_MAX_TIMEOUT_MS = 60000;
+
+function resolveSparqlDeadline(configured: unknown): number {
+  const n = typeof configured === 'number' && Number.isFinite(configured) ? configured : SPARQL_DEFAULT_TIMEOUT_MS;
+  return Math.min(SPARQL_MAX_TIMEOUT_MS, Math.max(SPARQL_MIN_TIMEOUT_MS, Math.round(n)));
+}
 const AGENT_GRAPH_ROLES = [
   ['self', GraphUriResolver.getSelfGraph(PRIMARY_AGENT_ID)],
   ['skills', GraphUriResolver.getSkillsGraph(PRIMARY_AGENT_ID)],
@@ -54,6 +68,16 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
   const logger = createLogger('routes-memory');
 
   let lastKnowledgeDelete = 0;
+
+  // The SPARQL endpoint runs queries through an executor so a runaway query can
+  // be stopped (worker thread for Oxigraph). It starts its worker lazily.
+  const sparqlDeadlineMs = resolveSparqlDeadline(ctx.config?.memory?.sparqlTimeoutMs);
+  const sparqlExecutor = ctx.sparqlExecutor ?? createQueryExecutor(triplestore);
+  if (!ctx.sparqlExecutor) {
+    fastify.addHook('onClose', async () => {
+      await sparqlExecutor.close();
+    });
+  }
 
   const listRegisteredGraphUris = () => {
     return [
@@ -144,6 +168,103 @@ export default async function memoryRoutes(fastify: FastifyInstance, ctx: Gatewa
     } catch (e) {
       logger.error('Failed to read knowledge graphs: ' + (e as Error).message);
       return reply.code(500).send({ error: (e as Error).message });
+    }
+  });
+
+  /**
+   * POST /api/knowledge/sparql: read-only SPARQL over HTTP.
+   *
+   * Body: `{ "query": string }`. Only SELECT and ASK are accepted. The query is
+   * parsed strictly (no fallback): a parse error, any other query form, or a
+   * SERVICE clause anywhere yields 400. Every triple pattern must lie inside a
+   * GRAPH pattern, unless the query has a FROM clause that defines the default
+   * graph; otherwise 400 (some backends expose the union of all graphs as the
+   * default graph). A GRAPH pattern with a variable name, or any graph IRI
+   * (GRAPH, FROM, FROM NAMED) that is not on the allowlist of
+   * `httpReadableGraphs`, yields 403. The allowlist holds only graphs the agent
+   * shows to every user anyway; the agent-wide graphs that carry other users'
+   * data (claims, evidence, conflicts, episodic and the other cog graphs) and all
+   * user, inferred-user and session graphs are refused, whoever the caller is.
+   * The only credential is the gateway bearer token (see index.ts), which does
+   * not identify a user, so no per-caller widening exists.
+   *
+   * SELECT results are capped at 1000 rows (the query is rewritten to LIMIT
+   * min(user limit, 1001); a 1001st row only sets `truncated`).
+   *
+   * Response 200:
+   * - ASK:    `{ "type": "boolean", "boolean": true }`
+   * - SELECT: `{ "type": "bindings", "variables": ["s"], "bindings": [{ "s": { "type": "uri", "value": "..." } }], "truncated": false }`
+   *   Terms are `{ type: "uri" | "literal" | "bnode", value, datatype?, language? }`.
+   *   `variables` is taken from the first row and is empty when there are no rows.
+   *
+   * Deadline: `memory.sparqlTimeoutMs` (default 5000, clamped to 100..60000).
+   * With the Oxigraph backend the query runs in a worker thread that is
+   * terminated at the deadline (a fresh worker serves the next query), so a
+   * runaway query yields 504 `{ "error": "Query exceeded the time limit of N ms" }`
+   * and never blocks the event loop. The worker queries a replica of the
+   * persisted dataset, reloaded whenever the data file changes; queries run one
+   * at a time and the deadline starts when evaluation starts. Other backends
+   * run in process: no real timeout is possible there (Fuseki aborts its HTTP
+   * request after 30 s).
+   *
+   * Errors: `{ "error": string }` with status 400, 403, 500 or 504.
+   */
+  fastify.post('/api/knowledge/sparql', async (request: FastifyRequest<{ Body: { query?: unknown } }>, reply) => {
+    const query = request.body?.query;
+    if (typeof query !== 'string' || query.trim() === '') {
+      return reply.code(400).send({ error: 'Body must be a JSON object with a non-empty "query" string' });
+    }
+
+    let parsed: SparqlQuery;
+    try {
+      parsed = new Parser().parse(query);
+    } catch (e) {
+      return reply.code(400).send({ error: 'SPARQL parse error: ' + (e as Error).message });
+    }
+
+    if (parsed.type !== 'query' || (parsed.queryType !== 'SELECT' && parsed.queryType !== 'ASK')) {
+      return reply.code(400).send({ error: 'Only SELECT and ASK queries are allowed' });
+    }
+
+    // Closed allowlist, rebuilt per request so agents added later are covered.
+    const allowedGraphs = httpReadableGraphs([PRIMARY_AGENT_ID, ...(agents ? agents.keys() : [])]);
+    const violation = checkQueryAst(parsed, allowedGraphs);
+    if (violation) {
+      return reply.code(violation.status).send({ error: violation.message });
+    }
+
+    let toRun: string;
+    try {
+      if (parsed.queryType === 'SELECT') {
+        parsed.limit = Math.min(parsed.limit ?? SPARQL_MAX_ROWS + 1, SPARQL_MAX_ROWS + 1);
+      }
+      toRun = new Generator().stringify(parsed);
+    } catch (e) {
+      return reply.code(400).send({ error: 'Query could not be normalized: ' + (e as Error).message });
+    }
+
+    try {
+      const result = await sparqlExecutor.execute(toRun, sparqlDeadlineMs);
+      if (result.type === 'boolean') {
+        return { type: 'boolean', boolean: result.boolean === true };
+      }
+      if (result.type !== 'bindings') {
+        return reply.code(500).send({ error: 'Unexpected result type from the triplestore' });
+      }
+      const rows = result.bindings ?? [];
+      const truncated = rows.length > SPARQL_MAX_ROWS;
+      return {
+        type: 'bindings',
+        variables: result.variables ?? [],
+        bindings: truncated ? rows.slice(0, SPARQL_MAX_ROWS) : rows,
+        truncated,
+      };
+    } catch (e) {
+      if (e instanceof QueryTimeoutError) {
+        return reply.code(504).send({ error: `Query exceeded the time limit of ${sparqlDeadlineMs} ms` });
+      }
+      logger.error('SPARQL query failed: ' + (e as Error).message);
+      return reply.code(500).send({ error: 'Query execution failed: ' + (e as Error).message });
     }
   });
 

@@ -219,7 +219,9 @@ export const configSchema = z.object({
       trackConfidence: true,
       trackSource: true
     }),
-    sparqlExposed: z.boolean().default(false)
+    sparqlExposed: z.boolean().default(false),
+    /** Deadline for queries sent to POST /api/knowledge/sparql (clamped to 100..60000 ms by the gateway). */
+    sparqlTimeoutMs: z.number().int().default(5000)
   }).default({
     backend: 'oxigraph',
     triplestore: {
@@ -249,7 +251,8 @@ export const configSchema = z.object({
       trackConfidence: true,
       trackSource: true
     },
-    sparqlExposed: false
+    sparqlExposed: false,
+    sparqlTimeoutMs: 5000
   }),
   provider: z.object({
     name: z.string().default('mock'),
