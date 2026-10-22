@@ -99,7 +99,8 @@ At 17 quads/fact this maps to:
    reasoner from O(N) to O(degree). Materialised closure can be rebuilt
    periodically rather than on the hot path.
 
-3. **Per-graph reasoning gate.** Skip materialisation if
+3. **Per-graph reasoning gate** (implemented, off by default; see
+   `docs/reasoning-gate.md` and section H). Skip materialisation if
    `aboxBytes > threshold` (e.g. 5 MB) — log it so an offline job can
    reconstruct the inferred graph later. Crucial for chat latency.
 
@@ -124,3 +125,46 @@ Each level spins up its own temp Oxigraph store under
 `%TEMP%\ontofelia-bench-*`, runs the bulk load + measurements, then
 tears the directory down. The running gateway is not touched (data file
 is independent).
+
+## H. Reasoning gate: per-fact store latency, gate off vs on (2026-10-19)
+
+Measured with `bench/inproc_bench.mjs` on Linux 6.8, AMD EPYC-Milan (8 vCPU),
+Node 22, Oxigraph 0.5.8, native reasoner 0.4.1. Same synthetic layout as
+section A. One level per process, each process capped at 6 GB with
+`systemd-run --user --scope -p MemoryMax=6G`, so the peak RSS is per size.
+
+- **Gate off** is the default and today's behaviour: every `storeFact` runs the
+  synchronous materialization (two reasoner passes over the whole ABox).
+- **Gate on** is `--async-threshold=1000`: the bench writes the setup key
+  `reasoning/asyncThreshold = 1000` (ABox triples). Every level is above it, so
+  `storeFact` skips the materialization and marks the inferred graphs stale.
+  The catch-up column is one `catchUpInferredGraphs` run afterwards, which
+  rebuilds all inferred graphs and clears the marker.
+- Per-store latency is the mean of five consecutive `storeFact` calls after one
+  warm-up call; one run per cell, so expect a few percent of noise (a second
+  run of the 10 000 gate-on level gave 431 ms and 11.4 s catch-up).
+
+| Facts | Triples | Store, gate off | Store, gate on | Catch-up (gate on) | Peak RSS, gate off | Peak RSS, gate on (before catch-up) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500    | 10 110  | 102 ms   | 33 ms  | 0.4 s  | 204 MB   | 205 MB (149 MB)   |
+| 2 000  | 37 110  | 459 ms   | 101 ms | 1.2 s  | 530 MB   | 417 MB (231 MB)   |
+| 5 000  | 91 115  | 1 676 ms | 204 ms | 4.1 s  | 1 442 MB | 1 323 MB (313 MB) |
+| 10 000 | 181 190 | 4 872 ms | 426 ms | 11.0 s | 4 458 MB | 4 075 MB (516 MB) |
+| 12 000 | 217 220 | 7 182 ms | 472 ms | 14.5 s | 6 168 MB | 5 812 MB (469 MB) |
+
+12 000 facts is the largest size measured: the gate-off run already sits at the
+6 GB cap (peak RSS counts the whole process including the bulk load). Larger
+sizes were not run and are not extrapolated.
+
+Reading the table:
+
+- The gate removes most of the per-store cost, not all of it. What remains at
+  10 000 facts (about 0.4 s) is the claim and evidence writes and the durable
+  flush of the dataset (section F, items 4 and 5).
+- The catch-up costs about as much as one or two synchronous materializations
+  and, because it reasons over the whole graph at once, needs about as much
+  memory as one gate-off store at the same size (the "peak RSS" jump from the
+  value in brackets). It runs in the background at most once per interval and
+  only when something was skipped, instead of once per fact.
+- Between a skipped store and the next catch-up, inferred triples for the new
+  facts are not yet in the `inferred` graphs.

@@ -309,6 +309,14 @@ List detected knowledge conflicts for the primary agent.
 
 Trigger a memory reflection run.
 
+#### `GET /api/reasoning/gate` / `PUT /api/reasoning/gate`
+
+Show or set the [reasoning gate](reasoning-gate.md). `GET` returns `{ "asyncThreshold": 0, "staleSince": null, "catchUpRunning": false }` (`0` = off, the default). `PUT` takes `{ "asyncThreshold": 20000 }` (ABox triples above which a stored fact skips the synchronous materialization) or `{ "asyncThreshold": null }` to turn it off, and returns the same object.
+
+#### `POST /api/reasoning/catchup`
+
+Rebuild the inferred graphs now if the gate left them stale (the same call the `reasoning.catchup` cron job makes). `?force=true` rebuilds even when nothing is marked stale. Response: `{ "status": "ran" | "not-stale" | "busy" | "unavailable" | "failed", "shared": 123, "perUser": { "bob": 7 }, "stillStale": false, "staleSince": null }`.
+
 #### Cognitive architecture (observability)
 
 `GET /api/cog/health` reports per-graph counts and cycle-latency stats. The read-only debug projections `GET /api/cog/inspect/cycles|cycle|goals|episodes|explain` (query params: `agentId`, `sessionId`, `cycleId`, `entity`, `limit` as applicable) return `403` until the debug panel is enabled with the in-chat command `/cog debug on`.
@@ -341,11 +349,13 @@ Remove / manually trigger a job.
 
 #### `GET /api/webhooks` / `POST /api/webhooks` / `DELETE /api/webhooks/:id`
 
-Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", ... }`).
+Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", "allowHostTools", ... }`). `allowHostTools` is optional and must be a boolean (default `false`); see below.
 
 #### `POST /webhooks/:path`
 
 Inbound webhook receiver (outside `/api/*`; authenticated per webhook via HMAC-SHA256 or Bearer secret, with payload-size and replay protection). The payload is handed to the configured agent as a prompt.
+
+A webhook turn gets no host tools (`exec`, `fs_*`, `cron_manage`, `hostOnly` tools): the payload often comes from third parties and the answer goes back to the caller. Set `"allowHostTools": true` on the webhook definition to re-enable them for that webhook. The flag is read only from the stored definition; a field of that name in a request payload or header has no effect. See [Tools & Security](tools-and-security.md#who-gets-host-tools).
 
 ---
 

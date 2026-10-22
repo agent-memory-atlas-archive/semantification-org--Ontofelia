@@ -19,6 +19,7 @@ import * as os from 'os';
 import { fileURLToPath } from 'url';
 
 import { initTriplestore } from './services/triplestore.js';
+import { REASONING_CATCHUP_JOB, REASONING_CATCHUP_DEFAULT, runReasoningCatchupJob } from './services/reasoningCatchup.js';
 import { initToolRegistry } from './services/tools.js';
 import { initChannels } from './services/channels.js';
 import { initPluginsAndSkills } from './services/plugins.js';
@@ -346,6 +347,12 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   defaultAgent.setConflictDetector(conflictDetector);
 
   scheduler.onJob(async (job) => {
+    // Reasoning catch-up: a direct engine call, no agent session. A no-op
+    // unless the reasoning gate left the inferred graphs stale.
+    if (job.name === REASONING_CATCHUP_JOB) {
+      await runReasoningCatchupJob(knowledgeEngine, resolveAgentId(job.agentId), logger);
+      return;
+    }
     // Initiative wakes are routed to the InitiativeService, which enforces the
     // kill switch and runaway guards before running any cycle.
     if (job.name.startsWith(INITIATIVE_JOB_PREFIX)) {
@@ -402,6 +409,15 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     { name: 'cog.metacog-scan', cron: '0 4 * * 0', prompt: '/cog scan' },
   ];
   const existingCogNames = new Set(scheduler.listCronJobs().map((j) => j.name));
+  // Reasoning catch-up (off in effect until the owner sets reasoning/asyncThreshold).
+  if (!existingCogNames.has(REASONING_CATCHUP_DEFAULT.name)) {
+    try {
+      await scheduler.addCronJob({ ...REASONING_CATCHUP_DEFAULT, agentId: PRIMARY_AGENT_ID, enabled: true });
+      logger.info(`Registered background job: ${REASONING_CATCHUP_DEFAULT.name} (${REASONING_CATCHUP_DEFAULT.cron})`);
+    } catch (e) {
+      logger.error(`Failed to register ${REASONING_CATCHUP_DEFAULT.name}: ${(e as Error).message}`);
+    }
+  }
   for (const def of cogJobDefaults) {
     if (existingCogNames.has(def.name)) continue;
     try {
