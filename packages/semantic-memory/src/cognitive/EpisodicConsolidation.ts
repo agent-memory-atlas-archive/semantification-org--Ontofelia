@@ -14,7 +14,8 @@
  *  - an episode of the user that stored a claim (`cogt:hasClaim`);
  *  - the claim is still `accepted` (a retracted claim no longer exists, a
  *    superseded or rejected one is not accepted), was asserted in the
- *    worldview or the user's own graph, and is not itself a consolidation;
+ *    worldview or the user's own graph, and is not itself a consolidation
+ *    (neither a pattern 1 nor a pattern 3 one);
  *  - the episode is not secret-classed and neither it nor its session is
  *    flagged `cogt:sessionUntrusted`.
  * A (user, s, p, o) is promoted when it has at least K distinct episodes
@@ -135,11 +136,22 @@ export function consolidationClaimHash(
  * names a message, not a session), else the session id. Every message of one
  * session on one day therefore falls into one group.
  */
-function groupOf(ep: ClaimEpisode): string {
+export function evidenceGroupOf(ep: { occurredAt: string; transcriptRef?: string; sessionId?: string }): string {
   const t = Date.parse(ep.occurredAt);
   const day = Number.isNaN(t) ? 'unknown-day' : new Date(t).toISOString().slice(0, 10);
   const session = ep.transcriptRef?.replace(/:line_\d+$/, '') ?? ep.sessionId ?? 'no-session';
   return `${session}|${day}`;
+}
+
+/** A key that can form a safe user-graph IRI and is not reserved. */
+export function isUsableUserKey(agentId: string, userKey: string): boolean {
+  if (userKey === '' || userKey === 'all') return false;
+  try {
+    sparqlIri(GraphUriResolver.getUserGraph(agentId, userKey));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export class EpisodicConsolidation {
@@ -175,13 +187,7 @@ export class EpisodicConsolidation {
 
   /** A key that cannot form a safe user-graph IRI, or is reserved, is skipped. */
   private usableUserKey(userKey: string): boolean {
-    if (userKey === '' || userKey === 'all') return false;
-    try {
-      sparqlIri(GraphUriResolver.getUserGraph(this.agentId, userKey));
-      return true;
-    } catch {
-      return false;
-    }
+    return isUsableUserKey(this.agentId, userKey);
   }
 
   private async runUser(
@@ -269,7 +275,7 @@ export class EpisodicConsolidation {
     report.triplesSeen += candidates.size;
 
     const qualified = [...candidates.values()].filter(
-      (c) => c.episodes.size >= k && new Set([...c.episodes.values()].map(groupOf)).size >= q,
+      (c) => c.episodes.size >= k && new Set([...c.episodes.values()].map(evidenceGroupOf)).size >= q,
     );
     report.qualified += qualified.length;
     if (qualified.length === 0) return 0;
@@ -379,7 +385,7 @@ export class EpisodicConsolidation {
         }`);
       for (const r of res.bindings ?? []) {
         if (r.g.value !== worldview && r.g.value !== userGraph) continue;
-        if (r.kind?.value === 'consolidation-episodic' || r.privacy?.value === 'secret') continue;
+        if (r.kind?.value === 'consolidation-episodic' || r.kind?.value === 'consolidation-preference' || r.privacy?.value === 'secret') continue;
         const o = r.o;
         let object: { kind: 'iri' | 'literal'; value: string };
         if (o.type === 'uri') {

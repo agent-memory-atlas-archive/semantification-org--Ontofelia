@@ -92,7 +92,10 @@ guard). With the flag off, a wake returns `flag-off` and nothing else happens:
 no episode, no counter change, no dispatch.
 
 **Related cognitive flags.** These are separate flags in the same setup
-resource, all default OFF (the design note in
+resource. `flagCycleManager`, `flagGoalStack` and `flagDebugPanel` are on in a
+new install and off in an existing one until `/cog defaults apply`; only
+`flagRetention`, `flagInitiative` and `flagPreferenceConsolidation` stay off
+in a new install as well (the design note in
 `docs/cognitive-architecture/09-integration-and-migration.md` shows the
 triples):
 

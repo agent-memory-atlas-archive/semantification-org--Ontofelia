@@ -111,6 +111,12 @@ onto:hasPreference rdf:type owl:DatatypeProperty ;
     rdfs:range xsd:string ;
     rdfs:label "has preference" .
 
+core:preference rdf:type owl:DatatypeProperty ;
+    rdfs:domain onto:Person ;
+    rdfs:range xsd:string ;
+    rdfs:label "preference" ;
+    rdfs:comment "A choice a user repeated over the same alternatives, promoted by the preference consolidation (episodic memory, pattern 3) into that user's own graph. The value names the chosen option and the alternatives it was chosen over. Never functional: preferences over different alternatives coexist." .
+
 onto:hasBirthday rdf:type owl:DatatypeProperty, owl:FunctionalProperty ;
     rdfs:domain onto:Person ;
     rdfs:range xsd:date ;
@@ -588,8 +594,9 @@ cogt:actorIsOwner rdf:type owl:DatatypeProperty ;
 cogt:about rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:label "about entity" .
 
-cogt:goalType rdf:type owl:DatatypeProperty ;
-    rdfs:domain cogt:Goal ; rdfs:range xsd:string ; rdfs:label "goal type" .
+cogt:goalType rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Goal ; rdfs:label "goal type" ;
+    rdfs:comment "The IRI of a subclass of cogt:GoalType. No rdfs:range: the value is a class, not an instance." .
 cogt:statement rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:string ; rdfs:label "statement" .
 cogt:priority rdf:type owl:DatatypeProperty ;

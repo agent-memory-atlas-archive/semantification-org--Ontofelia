@@ -87,6 +87,7 @@ export const COGNITIVE_FLAGS: readonly CognitiveFlagInfo[] = [
   { name: 'flagWorkingMemoryPrompt', key: 'workingMemoryPrompt', description: 'Build the cognitive prompt blocks (self, goal, recalled, skills, note) from working memory instead of the legacy strings.' },
   { name: 'flagInitiative', key: 'initiative', description: 'Allow self-started goal wakes (kill switch for unattended work).' },
   { name: 'flagEpisodicConsolidation', key: 'episodicConsolidation', description: 'Daily, promote facts a user asserted in several independent episodes into that user\'s own graph (never the worldview).' },
+  { name: 'flagPreferenceConsolidation', key: 'preferenceConsolidation', description: 'Daily, promote a button choice a user repeated over the same alternatives into that user\'s own graph as a preference (never the worldview, never Guardian approvals).' },
 ];
 
 /**
@@ -280,7 +281,7 @@ export class CognitiveConfig {
 
   /**
    * Argument-redaction rules of the procedural traces: the built-in rules plus
-   * the JSON literal `cog:argRedactionRules` on the config subject, when set
+   * the JSON literal `cogt:argRedactionRules` on the config subject, when set
    * (see ArgRedaction.ts). A missing, broken or unreadable value gives the
    * built-in rules; configured rules can only add to them.
    */

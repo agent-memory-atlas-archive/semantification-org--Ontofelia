@@ -357,7 +357,8 @@ unparseable or out-of-range value falls back to the default.
 | `recalledTokenCap` | hard cap of the `[Recalled]` block, estimated tokens | 600 |
 | `promptTokenCap` | cap of all cognitive blocks together | 1200 |
 
-Two flags choose the mode per message (both default off): `flagPromptShadow`
+Two flags choose the mode per message (both are on in a new install and off in
+an existing one until `/cog defaults apply`): `flagPromptShadow`
 runs the assembler beside the normal prompt and records its output and a block
 diff in the cycle graph (`cogt:PromptShadow`); `flagWorkingMemoryPrompt` builds
 the cognitive blocks from the assembler instead of the legacy strings. Live wins

@@ -585,7 +585,7 @@ describe('renderExplanation', () => {
 });
 
 describe('docs 09 section 7 lists every flag with its default', () => {
-  it('matches COGNITIVE_FLAGS: all thirteen, all off', async () => {
+  it('matches COGNITIVE_FLAGS: all fourteen, all off', async () => {
     const doc = await fs.readFile(new URL('../../../../docs/cognitive-architecture/09-integration-and-migration.md', import.meta.url), 'utf8');
     const table = [...doc.matchAll(/^\| `(flag[A-Za-z]+)` \| `([a-zA-Z]+)` \| (\w+) \|/gm)].map((m) => ({ name: m[1], key: m[2], dflt: m[3] }));
     expect(table.map((r) => r.name).sort()).toEqual(COGNITIVE_FLAGS.map((f) => f.name).sort());
@@ -594,6 +594,6 @@ describe('docs 09 section 7 lists every flag with its default', () => {
       expect(row.key).toBe(f.key);
       expect(row.dflt).toBe('off');
     }
-    expect(COGNITIVE_FLAGS).toHaveLength(13);
+    expect(COGNITIVE_FLAGS).toHaveLength(14);
   });
 });

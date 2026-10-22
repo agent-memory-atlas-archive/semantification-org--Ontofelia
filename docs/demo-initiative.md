@@ -13,12 +13,17 @@ on (mandate, guards, allow-list, notification).
 
 ## What you must know before you start
 
-- **Three switches, all off by default, all owner-only:**
+- **Three switches, all owner-only:**
   `/cog cycle on` (the cycle manager records your messages as episodes, which is
   the only thing a goal mandate may point to), `/initiative on` (the kill switch
-  for self-initiated cycles) and, for the web panel only, `/cog debug on`. No
-  other flag is needed: `flagGoalStack` is not required by `arm_goal`, by the
-  wake path or by the initiative cycle.
+  for self-initiated cycles) and, for the web panel only, `/cog debug on`. On a
+  new install the cycle manager and the debug panel are already on and only
+  `flagInitiative` is off; on an existing install that has not run
+  `/cog defaults apply`, all three start off. One more flag is needed: the
+  episodes of the cycle are written only while `flagEpisodicMemory` is on, and
+  `arm_goal` refuses without it (`arm_goal needs episodic memory`). It is on in a
+  new install; otherwise send `/cog flag episodicmemory on`. `flagGoalStack` is
+  not required by `arm_goal`, by the wake path or by the initiative cycle.
 - **Whether the model calls `arm_goal` depends on the language model.** The
   system prompt tells it to use the tool only when you explicitly ask for work
   later or regularly. A weak model may answer in prose instead. Step 3 gives an
@@ -66,8 +71,10 @@ Open the web chat at `http://127.0.0.1:18780` (see
 /cog cycle on
 ```
 
-Expected: `Cycle manager enabled (flagCycleManager = true).` followed by a line
-saying that owner messages are now recorded as episodes.
+Expected: `Cycle manager enabled (flagCycleManager = true).` followed, on
+`/cog cycle on` only, by the line `Only the cycle flag was set. Episodes (and so
+the arm_goal mandate) also need /cog flag episodicmemory on.` The line is printed
+whether or not episodic memory is already on.
 
 ```
 /initiative on

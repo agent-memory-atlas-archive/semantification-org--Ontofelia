@@ -7,8 +7,8 @@ import { ToolPolicyEngine } from '@ontofelia/security';
 import { ToolExecutor } from './executor/ToolExecutor.js';
 import { SkillRegistry, SkillExecutor } from '@ontofelia/skills';
 import { PluginRegistry } from '@ontofelia/plugins';
-import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, EpisodicConsolidation, GraphUriResolver } from '@ontofelia/semantic-memory';
-import type { SemanticParseResult, ConsolidationReport, EpisodicConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
+import { EntityMatcher, KnowledgeEngine, SemanticParser, OntologyContextProvider, SemanticIngestionService, GraphCatalog, ProceduralMemory, SelfModel, EpisodicMemory, EpisodicConsolidation, PreferenceConsolidation, ChoiceCapture, GraphUriResolver, sparqlIri } from '@ontofelia/semantic-memory';
+import type { SemanticParseResult, ConsolidationReport, EpisodicConsolidationReport, PreferenceConsolidationReport, SeedCapability, SeedConstraint, RetentionReport } from '@ontofelia/semantic-memory';
 import { GoalStack } from './cognitive/GoalStack.js';
 import { fileKeySource } from './cognitive/ArgDigestKey.js';
 import { seedDerivedSelfModel, collectSelfModelSources } from './cognitive/SelfModelSources.js';
@@ -25,6 +25,7 @@ import { updateGoalStep, type UpdateGoalStepRequest, type UpdateGoalStepResult }
 import { armGoal, type ArmGoalRequest, type ArmGoalResult } from './cognitive/armGoal.js';
 import { CognitiveConfig, COGNITIVE_FLAGS, resolveCognitiveFlag, type PromptMode, type PromptSettings } from './cognitive/CognitiveConfig.js';
 import { neutraliseLine } from './cognitive/untrustedText.js';
+import { looksLikeSecret } from './cognitive/privacyClass.js';
 import { Metacognition, type MetacogReport } from './cognitive/Metacognition.js';
 import { CogHealth, type CogHealthReport, type SoakMetrics } from './cognitive/CogHealth.js';
 import { defaultsReport, applyDefaults, defaultOnFlags, DEFAULT_OFF_FLAGS, COGNITIVE_DEFAULTS_VERSION } from './cognitive/CognitiveDefaults.js';
@@ -1453,6 +1454,126 @@ Users can use these commands:
   private episodicConsolidationInFlight?: Promise<EpisodicConsolidationReport>;
 
   /**
+   * Preference consolidation (doc 05 §6.5, pattern 3): a button choice a user
+   * repeated over the same alternatives becomes a `core:preference` fact in that
+   * user's own graph. Off unless `cog.flagPreferenceConsolidation` is on: with
+   * the flag off nothing is read or written and `enabled` is false. Same K and Q
+   * as pattern 1. One run at a time.
+   */
+  async runPreferenceConsolidation(now: Date = new Date()): Promise<{ enabled: boolean; report?: PreferenceConsolidationReport }> {
+    if (!this.knowledgeEngine || !this.cognitiveConfig) return { enabled: false };
+    if (!(await this.cognitiveConfig.isFlagEnabledByName('flagPreferenceConsolidation'))) return { enabled: false };
+    if (this.preferenceConsolidationInFlight) return { enabled: true, report: await this.preferenceConsolidationInFlight };
+    const run = (async () => {
+      const settings = await this.cognitiveConfig!.consolidationSettings();
+      const report = await new PreferenceConsolidation(
+        this.knowledgeEngine!['triplestore'],
+        this.agentId,
+        this.knowledgeEngine!,
+      ).run(settings, now);
+      this.logger.info(
+        { job: 'cog.consolidate-episodes', pattern: 'preference', ...report },
+        `cog consolidate-episodes (preferences): promoted ${report.promoted} of ${report.qualified} qualified`,
+      );
+      return report;
+    })();
+    this.preferenceConsolidationInFlight = run;
+    try {
+      return { enabled: true, report: await run };
+    } finally {
+      this.preferenceConsolidationInFlight = undefined;
+    }
+  }
+
+  private preferenceConsolidationInFlight?: Promise<PreferenceConsolidationReport>;
+
+  private choiceCapture?: ChoiceCapture;
+
+  /** The capture of button offers and presses, or undefined without episodic memory wiring. */
+  private async choiceCaptureIfEnabled(): Promise<ChoiceCapture | undefined> {
+    if (!this.knowledgeEngine || !this.cognitiveConfig) return undefined;
+    // The same flag gate as the other episode writes.
+    if (!(await this.cognitiveConfig.isEpisodicMemoryEnabled().catch(() => false))) return undefined;
+    if (!this.choiceCapture) this.choiceCapture = new ChoiceCapture(this.knowledgeEngine['triplestore'], this.agentId);
+    return this.choiceCapture;
+  }
+
+  /** `{ factGraph }` for the sender's own facts, or nothing when the sender has no usable id. */
+  private factGraphOfSender(sender: MessageEnvelope['sender'] | undefined): { factGraph?: string } {
+    const id = sender?.id;
+    if (typeof id !== 'string' || id === '') return {};
+    try {
+      const graph = GraphUriResolver.getUserGraph(this.agentId, id);
+      sparqlIri(graph);
+      return { factGraph: graph };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Record that a response with inline buttons was SENT to `sender`
+   * (`choice-offered`, doc 05 §6.5). `offerRef` is the channel's reference to the
+   * sent message (e.g. `telegram:<chat>:<message>`); the press is matched to the
+   * offer by it. Only while `cog.flagEpisodicMemory` is on; Guardian approval
+   * buttons (`g:`) are never part of an offer. Best effort: a failure is logged
+   * and never reaches the reply. Returns whether an episode was written.
+   */
+  async recordChoiceOffered(p: {
+    sender: MessageEnvelope['sender'];
+    channel?: string;
+    sessionId?: string;
+    offerRef: string;
+    buttons: Array<{ text: string; callbackData: string }> | undefined;
+  }): Promise<boolean> {
+    try {
+      if (!p.buttons || p.buttons.length === 0) return false;
+      const capture = await this.choiceCaptureIfEnabled();
+      if (!capture) return false;
+      const secret = p.buttons.some((b) => looksLikeSecret(b.callbackData) || looksLikeSecret(b.text));
+      const res = await capture.recordOffer({
+        forUser: cogUserKey(p.sender),
+        ...this.factGraphOfSender(p.sender),
+        ...(p.sessionId ? { sessionId: p.sessionId } : {}),
+        ...(p.channel ? { channel: p.channel } : {}),
+        offerRef: p.offerRef,
+        buttons: p.buttons,
+        ...(secret ? { secret: true } : {}),
+      });
+      return res.recorded;
+    } catch (e) {
+      this.logger.warn({ err: e }, 'choice-offered write failed');
+      return false;
+    }
+  }
+
+  /**
+   * Record that `sender` pressed the button `callbackData` of the offer
+   * `offerRef` (`choice-made`). Writes nothing unless the offer went to the same
+   * user, listed the value, and was not answered yet; a Guardian approval press
+   * (`g:`) never counts. Only while `cog.flagEpisodicMemory` is on. Best effort.
+   */
+  async recordChoiceMade(p: {
+    sender: MessageEnvelope['sender'];
+    offerRef: string;
+    callbackData: string;
+  }): Promise<boolean> {
+    try {
+      const capture = await this.choiceCaptureIfEnabled();
+      if (!capture) return false;
+      const res = await capture.recordChoice({
+        forUser: cogUserKey(p.sender),
+        offerRef: p.offerRef,
+        callbackData: p.callbackData,
+      });
+      return res.recorded;
+    } catch (e) {
+      this.logger.warn({ err: e }, 'choice-made write failed');
+      return false;
+    }
+  }
+
+  /**
    * Daily hygiene of the per-cycle cognitive graphs: drops working-memory graphs
    * 7 days after their last write and cycle graphs 30 days after theirs. Only
    * graphs the registry classifies as cog working/cycles of this agent are
@@ -2705,12 +2826,22 @@ Users can use these commands:
         return { text: `🧩 Consolidation: ${r.tracesScanned} traces, ${r.skillsUpserted} skills, ${r.sequenceSkillsCreated} new sequences.`, sessionId: session.sessionId };
       }
       if (sub === 'consolidate-episodes') {
+        // Pattern 1 (facts) and pattern 3 (preferences) each follow their own flag.
         const r = await this.runEpisodicConsolidation();
-        if (!r.enabled || !r.report) {
+        const pref = await this.runPreferenceConsolidation();
+        if ((!r.enabled || !r.report) && (!pref.enabled || !pref.report)) {
           return { text: 'Episodic consolidation is off (flagEpisodicConsolidation). Nothing was read or changed. Enable with /cog flag episodicconsolidation on.', sessionId: session.sessionId };
         }
-        const x = r.report;
-        return { text: `🧩 Episodic consolidation: ${x.episodesScanned} episodes of ${x.users} user(s), ${x.qualified} qualified, ${x.promoted} promoted, ${x.alreadyPresent + x.alreadyKnown + x.alreadyPromoted} already known, ${x.conflicts} in conflict.`, sessionId: session.sessionId };
+        const lines: string[] = [];
+        if (r.enabled && r.report) {
+          const x = r.report;
+          lines.push(`🧩 Episodic consolidation: ${x.episodesScanned} episodes of ${x.users} user(s), ${x.qualified} qualified, ${x.promoted} promoted, ${x.alreadyPresent + x.alreadyKnown + x.alreadyPromoted} already known, ${x.conflicts} in conflict.`);
+        }
+        if (pref.enabled && pref.report) {
+          const y = pref.report;
+          lines.push(`🧩 Preference consolidation: ${y.choicesScanned} choices of ${y.users} user(s), ${y.qualified} qualified, ${y.promoted} promoted, ${y.alreadyPresent + y.alreadyPromoted} already known, ${y.contradicted} contradicted, ${y.superseded} superseded.`);
+        }
+        return { text: lines.join('\n'), sessionId: session.sessionId };
       }
       if (sub === 'cleanup') {
         const r = await this.runCogCleanup();

@@ -15,11 +15,14 @@
  *   5 Response        ┘
  *   6 Reflection      — a ReflectiveMarker into cog:meta (B6)
  *
- * Every cognitive write is wrapped so it can NEVER alter or fail the user
- * response: the cycle returns exactly what `core()` returned. Because nothing
- * reads these graphs yet in Phase B, the records are written *after* the core
- * call (when the session id is known); later phases will move perception ahead
- * of the LLM call.
+ * Every cognitive write is wrapped so a failing write can NEVER fail the user
+ * response: the cycle returns exactly what `core()` returned. The core calls
+ * the cycle's hooks before the LLM call: perception (in memory only),
+ * comprehension (read-only recall), the goal-management decision (it may push,
+ * resolve or abandon goals and returns the `[Active goal]` prompt section) and
+ * the inbound `message-received` episode. The remaining records (perception
+ * record, working-memory entries, tool and outbound episodes, reflection
+ * marker) are written by the queued persist *after* the core call.
  */
 
 import {

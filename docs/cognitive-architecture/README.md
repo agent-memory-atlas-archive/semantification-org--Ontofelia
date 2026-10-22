@@ -7,7 +7,9 @@
 > default for new installs since the staged default-on rollout (2026-10-15);
 > existing installs keep their flags and opt in with `/cog defaults apply`;
 > retention stays off** (so does the initiative flag, the one flag whose feature
-> makes model calls of its own). Implemented behind
+> makes model calls of its own, and so does the preference consolidation: it
+> writes a derived preference about a user into that user's graph, so the owner
+> opts in on purpose). Implemented behind
 > flags: the cycle with its six phase records, working memory (with carry-over
 > and attention), episodic memory with recall and a consolidation job, the goal
 > stack, procedural memory, metacognition with its impasse episodes, the
