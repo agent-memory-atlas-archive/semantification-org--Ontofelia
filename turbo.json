@@ -5,6 +5,10 @@
       "dependsOn": ["^build"],
       "outputs": ["dist/**"]
     },
+    "@ontofelia/semantic-memory#build": {
+      "dependsOn": ["^build", "@ontofelia/reasoner#build"],
+      "outputs": ["dist/**"]
+    },
     "test": {
       "dependsOn": ["build"]
     },
