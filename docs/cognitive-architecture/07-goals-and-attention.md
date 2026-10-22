@@ -28,11 +28,11 @@ Making goals first-class RDF resources solves all three.
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:goal_<utc-iso>_<seq> a cogt:Goal ;
-    cogt:goalId        "goal_2026-05-31T20-49-00Z_001"   ;     # required
+cog:goal:<uuid> a cogt:Goal ;
+    cogt:goalId        "goal_2026-05-31T20-49-00-000Z_0001" ;  # required
     cogt:goalType      cogt:WriteConceptDoc               ;     # required, URI in vocab
     cogt:goalLabel     "Write cognitive architecture concept docs" ; # required, human-readable
-    cogt:status        "active"                           ;     # required, see §3
+    cogt:goalStatus    "active"                           ;     # required, see §3
     cogt:priority      "0.95"^^xsd:decimal                ;     # required, [0,1]
     cogt:createdAt     "2026-05-31T20:49:00Z"^^xsd:dateTime ;
     cogt:updatedAt     "2026-05-31T20:55:14Z"^^xsd:dateTime ;
@@ -40,21 +40,22 @@ cog:goal_<utc-iso>_<seq> a cogt:Goal ;
     cogt:abandonedAt   ""                                 ;     # set when status → abandoned
 
     cogt:successCriterion "MD files in docs/cognitive-architecture/ pass owner review" ;
-    cogt:successMetric    "cogt:OwnerReviewApproved"     ;     # optional, machine-checkable
-    cogt:deadline         "2026-06-02T00:00:00Z"^^xsd:dateTime ; # optional
+    cogt:successMetric    "cogt:OwnerReviewApproved"     ;     # not implemented (never written)
+    cogt:dueAt            "2026-06-02T00:00:00Z"^^xsd:dateTime ; # optional
 
-    cogt:parentGoal       cog:goal_meta_session           ;     # optional, parent in stack
-    cogt:rootGoal         cog:goal_meta_session           ;     # convenience, walk-cache
+    cogt:parentGoal       cog:goal:0f3a8d66               ;     # optional, parent in stack
+    cogt:rootGoal         cog:goal:0f3a8d66               ;     # not implemented (never written)
 
-    cogt:triggeredByEpisode cog:ep_2026-05-31T20-49-00Z_001 ;
+    cogt:triggeredByEpisode cog:ep:5d18e0b2 ;
     cogt:triggeredByUser    <urn:entity:Alice>          ;
 
     cogt:plannedSteps "Outline → Draft modules → Worked example → Review" ;
     cogt:currentStep   "Draft modules" ;
     cogt:stepProgress  "5/8" ;
 
-    cogt:owner         <urn:entity:Alice>               ;     # who cares about this
-    cogt:assignee      <urn:ontofelia:self#Ontofelia>     ;     # who is acting
+    cogt:forUser       "owner"                          ;     # who owns the goal (a user key, plain literal)
+    cogt:owner         <urn:entity:Alice>               ;     # not implemented (never written); ownership is cogt:forUser
+    cogt:assignee      <urn:ontofelia:self#ontofelia>     ;     # not implemented (never written)
 
     cogt:tags          "documentation", "architecture", "concept" .
 ```
@@ -78,7 +79,7 @@ cog:goal_<utc-iso>_<seq> a cogt:Goal ;
 | `cogt:DebugIssue` | Error context | Bias toward fs_read + curl |
 | `cogt:CompletePlan` | User approves a previously proposed plan | Stepwise |
 | `cogt:OnboardUser` | New session, missing user profile | Gap-driven |
-| `cogt:ResolveConflict` | `urn:<agent>:conflicts` non-empty | Triggered by metacog |
+| `cogt:ResolveConflict` | A conflict surfaced in the sender's own data during the turn | Created by the cycle manager (see §10) |
 | `cogt:ConsolidateMemory` | Background only | Not user-triggered |
 
 The taxonomy is meant to grow; every new goal type is a triple in
@@ -126,7 +127,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?priority ?created WHERE {
   GRAPH ?g {
     ?goal a cogt:Goal ;
-          cogt:status   "active" ;
+          cogt:goalStatus   "active" ;
           cogt:priority ?priority ;
           cogt:createdAt ?created .
   }
@@ -172,18 +173,18 @@ When a goal has `plannedSteps` populated, the goal manager can push one
 child goal per step (with status `proposed`) and activate them sequentially:
 
 ```turtle
-cog:goal_concept_overview a cogt:Goal ;
+cog:goal:2d7f4b10 a cogt:Goal ;
     cogt:goalType    cogt:WriteConceptSection ;
-    cogt:parentGoal  cog:goal_20260531_204900_concept ;
+    cogt:parentGoal  cog:goal:c9a1e5d2 ;
     cogt:goalLabel   "Write 00-overview.md" ;
-    cogt:status      "resolved" ;
+    cogt:goalStatus  "resolved" ;
     cogt:resolvedAt  "2026-05-31T20:55:00Z"^^xsd:dateTime .
 
-cog:goal_concept_model a cogt:Goal ;
+cog:goal:8a60e3f5 a cogt:Goal ;
     cogt:goalType    cogt:WriteConceptSection ;
-    cogt:parentGoal  cog:goal_20260531_204900_concept ;
+    cogt:parentGoal  cog:goal:c9a1e5d2 ;
     cogt:goalLabel   "Write 01-reference-model.md" ;
-    cogt:status      "active" .
+    cogt:goalStatus  "active" .
 
 # parent goal status is derived: resolved iff all children resolved,
 # blocked iff any child blocked, etc.
@@ -240,7 +241,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?label ?priority ?step WHERE {
   GRAPH ?g {
     ?goal a cogt:Goal ;
-          cogt:status      "active" ;
+          cogt:goalStatus      "active" ;
           cogt:goalLabel   ?label ;
           cogt:priority    ?priority .
     OPTIONAL { ?goal cogt:currentStep ?step . }
@@ -258,7 +259,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?label ?reason WHERE {
   GRAPH ?g {
     ?goal a cogt:Goal ;
-          cogt:status      "blocked" ;
+          cogt:goalStatus      "blocked" ;
           cogt:goalLabel   ?label .
     OPTIONAL { ?goal cogt:blockedReason ?reason . }
   }
@@ -274,7 +275,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?label ?resolved WHERE {
   GRAPH <urn:ontofelia:cog:goals:longterm> {
     ?goal a cogt:Goal ;
-          cogt:status      "resolved" ;
+          cogt:goalStatus      "resolved" ;
           cogt:goalLabel   ?label ;
           cogt:resolvedAt  ?resolved .
     FILTER(?resolved >= "2026-05-31T00:00:00Z"^^xsd:dateTime)
@@ -291,7 +292,7 @@ SELECT ?goal ?status ?resolved WHERE {
   GRAPH ?g {
     ?goal a cogt:Goal ;
           cogt:goalType cogt:WriteConceptDoc ;
-          cogt:status   ?status ;
+          cogt:goalStatus   ?status ;
           cogt:resolvedAt ?resolved .
   }
   FILTER(?g IN (<urn:ontofelia:cog:goals:longterm>,
@@ -334,13 +335,13 @@ export interface GoalInput {
   goalLabel: string;
   priority: number;            // [0,1]
   successCriterion?: string;
-  successMetric?: string;
-  deadline?: Date;
+  successMetric?: string;      // not implemented
+  deadline?: Date;             // stored as cogt:dueAt
   parentGoal?: GoalId;
   triggeredByEpisode?: string; // URI
   triggeredByUser?: string;    // URI
-  owner?: string;              // URI
-  assignee?: string;           // URI
+  owner?: string;              // not implemented; ownership is forUser (a user key)
+  assignee?: string;           // not implemented
   tags?: string[];
   plannedSteps?: string;
   longTerm?: boolean;
@@ -368,8 +369,11 @@ is read or written.
 
 **Goal types.** Registered in the TBox as subclasses of `cogt:GoalType`:
 `RespondToUser` (implicit), `AnswerQuestion`, `ExecuteCommand`, `HandleRequest`,
-`AnswerInTopic`, `OwnerRequestedWork`, plus the reserved `ResolveConflict` and
-`CompletePlan` (never created yet).
+`AnswerInTopic`, `OwnerRequestedWork`, `ResolveConflict` and the reserved
+`CompletePlan` (never created yet). `ResolveConflict` is created by the cycle
+manager, not by the intent table below: one goal for each conflict the turn
+surfaced in the sender's own data (at most three per turn, priority 0.5, never
+twice for the same conflict).
 
 | Perception intent | Goal created |
 |---|---|

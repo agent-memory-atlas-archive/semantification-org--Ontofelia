@@ -31,10 +31,10 @@ goal of the self-model is to make every assertion the agent might make about
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 PREFIX core: <urn:shared:ontology#>
-PREFIX onto: <urn:ontofelia:>
+PREFIX onto: <urn:ontofelia:core#>
 
 GRAPH <urn:ontofelia:self> {
-  onto:self#Ontofelia a core:Agent ;
+  <urn:ontofelia:self#ontofelia> a core:Agent ;
       rdfs:label             "Ontofelia" ;
       core:language          "en" ;
       core:personality       "empathetic, curious, analytical" ;
@@ -45,15 +45,15 @@ GRAPH <urn:ontofelia:self> {
       cogt:operatesIn        <urn:env:semantification.org> ;
 
       # Capabilities — what the agent CAN do
-      cogt:hasCapability     cog:cap_code_analysis,
-                             cog:cap_doc_writing,
-                             cog:cap_sparql_query,
-                             cog:cap_telegram_chat ;
+      cogt:hasCapability     cogt:cap_code_analysis,
+                             cogt:cap_doc_writing,
+                             cogt:cap_sparql_query,
+                             cogt:cap_telegram_chat ;
 
       # Constraints — what the agent MUST or MUST NOT do
-      cogt:hasConstraint     cog:cons_no_destructive_without_approval,
-                             cog:cons_no_external_data_without_consent,
-                             cog:cons_no_secret_in_memory ;
+      cogt:hasConstraint     cogt:cons_no_destructive_without_approval,
+                             cogt:cons_no_external_data_without_consent,
+                             cogt:cons_no_secret_in_memory ;
 
       # Authority — who can override what
       cogt:authorityOver     <urn:tool:fs_read>,
@@ -63,23 +63,23 @@ GRAPH <urn:ontofelia:self> {
 }
 
 # Capability records
-cog:cap_code_analysis a cogt:Capability ;
+cogt:cap_code_analysis a cogt:Capability ;
     rdfs:label   "Code analysis" ;
     cogt:requires "fs_read", "memory_store" ;
     cogt:relevantToGoalType cogt:CodeAnalysisGoal .
 
-cog:cap_doc_writing a cogt:Capability ;
+cogt:cap_doc_writing a cogt:Capability ;
     rdfs:label   "Concept and architecture document writing" ;
     cogt:requires "fs_read", "fs_write" ;
     cogt:relevantToGoalType cogt:WriteConceptDoc .
 
 # Constraint records
-cog:cons_no_destructive_without_approval a cogt:Constraint ;
+cogt:cons_no_destructive_without_approval a cogt:Constraint ;
     rdfs:label "Destructive operations require explicit owner approval" ;
     cogt:enforcedBy "GuardianPolicy" ;
     cogt:applies   "exec", "fs_write[overwrite]", "memory_retract" .
 
-cog:cons_no_secret_in_memory a cogt:Constraint ;
+cogt:cons_no_secret_in_memory a cogt:Constraint ;
     rdfs:label "Never persist secrets in auto-memory or LTM" ;
     cogt:enforcedBy "MemorySkill" ;
     cogt:applies   "memory_store", "memory_reflect" .
@@ -95,7 +95,7 @@ these:
 PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?cap ?label WHERE {
   GRAPH <urn:ontofelia:self> {
-    onto:self#Ontofelia cogt:hasCapability ?cap .
+    <urn:ontofelia:self#ontofelia> cogt:hasCapability ?cap .
     ?cap rdfs:label              ?label ;
          cogt:relevantToGoalType cogt:WriteConceptDoc .
   }
@@ -107,7 +107,7 @@ SELECT ?cap ?label WHERE {
 PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?tool WHERE {
   GRAPH <urn:ontofelia:self> {
-    onto:self#Ontofelia cogt:requiresApproval ?tool .
+    <urn:ontofelia:self#ontofelia> cogt:requiresApproval ?tool .
   }
 }
 ```
@@ -129,7 +129,8 @@ a string, it's a graph it can interrogate.
 
 ### 2.3 As built: derived capabilities and constraints
 
-Behind `cog.flagSelfModelQuery` (default off) the capability and constraint
+Behind `cog.flagSelfModelQuery` (on in a new install, off in an existing one
+until `/cog defaults apply`) the capability and constraint
 records are **derived**, not written by hand. Seeding runs at boot and at
 `/reseed-persona`, and when the flag is switched on with `/cog flag`; with the
 flag off nothing is derived and the prompt does not change. Sources:
@@ -267,8 +268,8 @@ Each signal is one boolean or numeric attribute on the cycle's
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:meta_<cycleId> a cogt:ReflectiveMarker ;
-    cogt:reflectsOn   cog:cycle_<cycleId>              ;
+cog:marker:<id> a cogt:ReflectiveMarker ;
+    cogt:reflectsOn   cog:cycle:<cycleId>              ;
     cogt:createdAt    "..."^^xsd:dateTime              ;
     cogt:cycleStatus  "completed" ;                          # completed | impasse-resolved | aborted
 
@@ -283,8 +284,8 @@ cog:meta_<cycleId> a cogt:ReflectiveMarker ;
     cogt:toolChurn     false ;
     cogt:constraintPressure 0 ;
 
-    cogt:flaggedImpasse cog:impasse_<id> ;                  # 0..N
-    cogt:resolvedImpasse cog:impasse_<id> ;                 # 0..N
+    cogt:flaggedImpasse cog:impasse:<id> ;                  # 0..N
+    cogt:resolvedImpasse cog:impasse:<id> ;                 # 0..N
 
     cogt:noted        "Procedural skill 'concept_doc_writing' applied successfully." ;
     cogt:carryForward true .
@@ -301,9 +302,9 @@ A **`cogt:Impasse`** is an explicit RDF resource raised when a phase cannot
 complete normally.
 
 ```turtle
-cog:impasse_<cycleId>_<n> a cogt:Impasse ;
+cog:impasse:<id> a cogt:Impasse ;
     cogt:impasseKind   "action-selection-empty" ;
-    cogt:flaggedInPhase cog:phase_<phaseId> ;
+    cogt:flaggedInPhase cog:cycle:<cycleId>_<n> ;
     cogt:flaggedAt     "..."^^xsd:dateTime ;
     cogt:context       "LLM returned empty after primary + 2 fallback models" ;
     cogt:resolution    "asked-user" ;                       # set when resolved
@@ -398,9 +399,9 @@ zero relevant facts AND the intent is `question`, the agent SHOULD say so
 explicitly rather than guess. This is enforceable from the metaBuffer:
 
 ```turtle
-cog:wm_meta_001 a cogt:WorkingMemoryEntry ;
-    cogt:writtenTo cogt:metaBuffer ;
-    cogt:entryKind "reflection" ;
+cog:wm:<id> a cogt:WorkingMemoryEntry ;
+    cogt:writtenTo "metaBuffer" ;
+    cogt:entryKind "unknown-nudge" ;
     cogt:salience  1.0 ;
     cogt:payload   "Retrieval was empty for entity in question. " +
                    "Acceptable answers: 'I don't know', 'never seen X', " +

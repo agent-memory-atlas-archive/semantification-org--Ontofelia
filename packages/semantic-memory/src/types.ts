@@ -11,7 +11,7 @@ export interface FactInput {
   // Provenance & Claim fields
   confidenceNumeric?: number; // e.g. 0.95
   confidenceLabel?: 'high' | 'medium' | 'low';
-  sourceKind?: 'user' | 'agent' | 'tool' | 'consolidation' | 'consolidation-episodic';
+  sourceKind?: 'user' | 'agent' | 'tool' | 'consolidation' | 'consolidation-episodic' | 'consolidation-preference';
   sourceMessageId?: string;
   sourceSpan?: string;
   sourceUri?: string;

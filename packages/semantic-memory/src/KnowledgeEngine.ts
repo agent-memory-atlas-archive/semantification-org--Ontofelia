@@ -11,6 +11,11 @@ import { sparqlTripleLine } from './utils/TripleSyntax.js';
 import { FactInput, FactContext, FactPreview, StoreResult } from './types.js';
 
 const ENTITY_NS = 'urn:ontofelia:entity:';
+
+/** The canonical entity node of a user (the subject of facts about them), by the id of their user graph. */
+export function userEntityUri(userId: string): string {
+  return `${ENTITY_NS}user:${encodeURIComponent(userId)}`;
+}
 const CORE_NS = 'urn:ontofelia:core#';
 const COGT_NS = 'urn:shared:ontology#cog/';
 const TBOX_GRAPH = 'urn:shared:ontology';
@@ -1122,7 +1127,7 @@ export class KnowledgeEngine {
    * one node so their facts do not scatter across duplicate entities.
    */
   private userEntityUri(userId: string): string {
-    return `${ENTITY_NS}user:${encodeURIComponent(userId)}`;
+    return userEntityUri(userId);
   }
 
   /**
@@ -1862,8 +1867,9 @@ export class KnowledgeEngine {
    *  - its subject, predicate and object are the terms the duplicate check used;
    *  - its status is `accepted`;
    *  - it is not `core:privacyClass "secret"`;
-   *  - it is not a consolidation (`sourceKind` `consolidation-episodic`), which
-   *    is a derived copy and not something a user stated.
+   *  - it is not a consolidation (`sourceKind` `consolidation-episodic` or
+   *    `consolidation-preference`), which is a derived copy and not something a
+   *    user stated.
    * If several qualify, the oldest (`learnedAt`, then IRI) is used. Returns its
    * IRI, or `undefined` when nothing qualifies (then nothing is written).
    * Best effort: a failure here never turns a duplicate into an error.
@@ -1885,6 +1891,7 @@ export class KnowledgeEngine {
           OPTIONAL { ?c <${ONT}learnedAt> ?learned . }
           FILTER NOT EXISTS { ?c <${ONT}privacyClass> "secret" }
           FILTER NOT EXISTS { ?c <${ONT}sourceKind> "consolidation-episodic" }
+          FILTER NOT EXISTS { ?c <${ONT}sourceKind> "consolidation-preference" }
         } } ORDER BY ?learned ?c LIMIT 1`);
       const claimUri = res.bindings?.[0]?.c?.value;
       if (!claimUri) return undefined;
@@ -2048,6 +2055,13 @@ export class KnowledgeEngine {
     /** Deterministic hash of the promotion; stored as the claim's ingestion run. */
     claimHash: string;
     confidenceNumeric?: number;
+    /**
+     * Which consolidation promotes: `consolidation-episodic` (pattern 1, the
+     * default) or `consolidation-preference` (pattern 3). Nothing else is accepted.
+     */
+    sourceKind?: 'consolidation-episodic' | 'consolidation-preference';
+    /** Text of the evidence; defaults to the pattern 1 wording. */
+    sourceSpan?: string;
   }): Promise<{ outcome: 'promoted' | 'already-present' | 'already-known' | 'conflict'; claimUri?: string; targetGraph: string }> {
     if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
       throw new Error('promoteToUserGraph: a concrete user key is required');
@@ -2103,11 +2117,11 @@ export class KnowledgeEngine {
       predicate: p.predicateUri,
       object: p.object.value,
       objectType: p.object.kind === 'iri' ? 'Concept' : 'literal',
-      sourceKind: 'consolidation-episodic',
+      sourceKind: p.sourceKind === 'consolidation-preference' ? 'consolidation-preference' : 'consolidation-episodic',
       evidenceType: 'consolidation',
       confidenceLabel: 'medium',
       confidenceNumeric: p.confidenceNumeric,
-      sourceSpan: `Consolidated from ${p.sourceEpisodes.length} episodes of one user.`,
+      sourceSpan: p.sourceSpan ?? `Consolidated from ${p.sourceEpisodes.length} episodes of one user.`,
     };
     const context: FactContext = {
       agentId: p.agentId,
@@ -2127,6 +2141,90 @@ export class KnowledgeEngine {
       evidenceLinks: { episodes: p.sourceEpisodes, claims: p.supportClaims },
     });
     return { outcome: 'promoted', claimUri: committed.claimUri, targetGraph };
+  }
+
+  /**
+   * Withdraw preferences the preference consolidation (pattern 3) promoted
+   * earlier, because a different value now supersedes them: each is retired
+   * through the belief-revision path ({@link retireSupersededClaim}), so the
+   * claim stays in the claims graph with status "superseded" and a forward link
+   * to the superseding claim, the base triple leaves the user graph, derived
+   * triples are retracted and a Conflict record is written.
+   *
+   * What counts as pattern 3's own: an ACCEPTED claim with `sourceKind
+   * "consolidation-preference"` and `ingestionRunId "consolidation:<hash>"` for
+   * one of the given promotion hashes, asserted in the given user's graph on
+   * the given subject and predicate. Nothing else is touched: a triple written
+   * by another source has no such claim, and a claim of another source for the
+   * very same text keeps the triple (the old claim is then left alone). The
+   * target is fixed by `userKey`; no parameter selects another graph.
+   *
+   * @returns the claims that were withdrawn, with the object they carried.
+   */
+  async withdrawConsolidatedPreferences(p: {
+    agentId: string;
+    userKey: string;
+    subjectUri: string;
+    predicateUri: string;
+    /** Promotion hashes (64 hex digits) of the values to withdraw. */
+    claimHashes: string[];
+    /** The claim that supersedes them. */
+    supersedingClaimUri: string;
+  }): Promise<Array<{ claimHash: string; claimUri: string; object: string }>> {
+    if (typeof p.userKey !== 'string' || p.userKey === '' || p.userKey === 'all') {
+      throw new Error('withdrawConsolidatedPreferences: a concrete user key is required');
+    }
+    const targetGraph = this.assertGraph(GraphUriResolver.getUserGraph(p.agentId, p.userKey));
+    const claimsGraph = GraphUriResolver.getClaimsGraph(p.agentId);
+    const ONT = 'urn:shared:ontology#';
+    const subjectIri = sparqlIri(p.subjectUri);
+    const predicateIri = sparqlIri(p.predicateUri);
+    sparqlIri(p.supersedingClaimUri);
+    const out: Array<{ claimHash: string; claimUri: string; object: string }> = [];
+    for (const claimHash of [...new Set(p.claimHashes)]) {
+      if (!/^[0-9a-f]{64}$/.test(claimHash)) continue;
+      const found = await this.triplestore.query(`
+        SELECT ?c ?o WHERE { GRAPH ${sparqlIri(claimsGraph)} {
+          ?c a <${ONT}Claim> ;
+             <${ONT}claimSubject> ${subjectIri} ;
+             <${ONT}claimPredicate> ${predicateIri} ;
+             <${ONT}claimObject> ?o ;
+             <${ONT}assertedInGraph> ${sparqlIri(targetGraph)} ;
+             <${ONT}sourceKind> "consolidation-preference" ;
+             <${ONT}ingestionRunId> ${sparqlStringLiteral(`consolidation:${claimHash}`)} ;
+             <${ONT}status> "accepted" .
+        } }`);
+      for (const b of found.bindings ?? []) {
+        const claimUri = b['c']?.value;
+        const oTerm = b['o'];
+        if (!claimUri || !oTerm || claimUri === p.supersedingClaimUri) continue;
+        let objectTriple: string;
+        try {
+          sparqlIri(claimUri);
+          objectTriple = oTerm.type === 'uri' ? sparqlIri(oTerm.value) : sparqlStringLiteral(oTerm.value);
+        } catch {
+          continue;
+        }
+        // Another source holds an accepted claim for exactly this triple: the
+        // triple is not pattern 3's alone, so it is left in place.
+        const shared = await this.triplestore.ask(`
+          ASK { GRAPH ${sparqlIri(claimsGraph)} {
+            ?other a <${ONT}Claim> ;
+                   <${ONT}claimSubject> ${subjectIri} ;
+                   <${ONT}claimPredicate> ${predicateIri} ;
+                   <${ONT}claimObject> ${objectTriple} ;
+                   <${ONT}assertedInGraph> ${sparqlIri(targetGraph)} ;
+                   <${ONT}status> "accepted" .
+            FILTER (?other != ${sparqlIri(claimUri)})
+          } }`);
+        if (shared) continue;
+        const done = await this.retireSupersededClaim(
+          { claimUri, objectTriple, assertedInGraph: targetGraph }, p.agentId, p.supersedingClaimUri,
+        );
+        if (done) out.push({ claimHash, claimUri, object: oTerm.value });
+      }
+    }
+    return out;
   }
 
   /**

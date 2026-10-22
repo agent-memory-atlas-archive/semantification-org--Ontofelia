@@ -10,7 +10,11 @@
  *     episodes); an open decision, so it stays off;
  *   - `flagInitiative`: the one flag whose feature makes model calls of its own
  *     (a self-started wake runs a full model turn with no user message), so it
- *     stays off. Every other flag works with SPARQL and rules only.
+ *     stays off;
+ *   - `flagPreferenceConsolidation`: derives a preference about the user from
+ *     their button presses and writes it into their graph; the owner opts in
+ *     on purpose, on new and existing installs alike.
+ *     Every other flag works with SPARQL and rules only.
  *
  * Setup keys (`unknownNudgeAllUsers`, thresholds, caps) are never written here;
  * they keep their documented defaults.
@@ -39,6 +43,7 @@ export const COGNITIVE_DEFAULTS_VERSION = 1;
 export const DEFAULT_OFF_FLAGS: Readonly<Record<string, string>> = {
   flagRetention: 'destructive tiering: it deletes payloads and collapses episodes',
   flagInitiative: 'self-started wakes make model calls of their own',
+  flagPreferenceConsolidation: 'writes a derived preference about the user into their graph; the owner opts in on purpose',
 };
 
 /** The flags the defaults turn on, in display order. */

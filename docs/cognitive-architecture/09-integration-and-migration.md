@@ -274,8 +274,10 @@ behaviour when off: the legacy path runs and nothing is written.
 The *Default* column is what a flag is when it has no triple (always off). The
 *New install* column is what the boot step of §7.1 writes on a new install.
 
-The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
-`CognitiveConfig.ts`; the test `CogDocsSync` keeps this table in step with it):
+The fourteen feature flags (the allowlist `COGNITIVE_FLAGS` in
+`CognitiveConfig.ts`; the test `describe('default-on set')` in
+`CognitiveDefaults.test.ts` keeps this table in step with it: it compares the
+rows and the *Default* and *New install* columns with `COGNITIVE_FLAGS`):
 
 | Flag | Short key | Default | New install | What it switches on |
 |---|---|---|---|---|
@@ -292,6 +294,7 @@ The thirteen feature flags (the allowlist `COGNITIVE_FLAGS` in
 | `flagWorkingMemoryPrompt` | `workingMemoryPrompt` | off | on | Build the cognitive prompt blocks from working memory instead of the legacy strings (wins over the shadow flag). |
 | `flagInitiative` | `initiative` | off | off | Allow self-started goal wakes (kill switch for unattended work). |
 | `flagEpisodicConsolidation` | `episodicConsolidation` | off | on | Daily, promote facts a user asserted in several independent episodes into that user's own graph (never the worldview). |
+| `flagPreferenceConsolidation` | `preferenceConsolidation` | off | off | Daily, promote a button choice a user repeated over the same alternatives into that user's own graph as a `core:preference` fact (never the worldview, never Guardian approvals). Not part of `/cog defaults`: the owner opts in on purpose. |
 
 In live mode (`flagWorkingMemoryPrompt`) every cognitive block depends only on its
 own flag and the live flag: `[Self]` on the self-model flag, `[Skills that
@@ -312,13 +315,13 @@ Setup keys that are **not** feature flags (same config subject, same graph):
 | `promptTokenCap` | integer | `1200` | Cap of all cognitive prompt blocks together. |
 | `workingMemoryCapacity` | integer 1..10000 | `200` | Entries per cycle graph. |
 | `goalSupersedeAfterTurns` | integer 1..1000 | `10` | With the goal stack on: turns after which a competition loser that was neither chosen nor touched is abandoned. |
-| `consolidationMinEpisodes` | integer 1..100 | `3` | Episodes needed to promote a fact. |
-| `consolidationMinGroups` | integer 1..100 | `2` | Independent groups needed to promote a fact. |
+| `consolidationMinEpisodes` | integer 1..100 | `3` | Episodes needed to promote a fact, or choices needed to promote a preference. |
+| `consolidationMinGroups` | integer 1..100 | `2` | Independent groups needed to promote a fact or a preference. |
 
 ### 7.1 Default-on for new installs
 
 The cognitive layer is **on by default for new installs**; existing installs
-are not changed. The default-on set is every flag in the table above except two:
+are not changed. The default-on set is every flag in the table above except three:
 
 - `flagRetention` stays off: it tiers episodes destructively (it deletes
   payloads and collapses episodes), and whether it should ever default on is an
@@ -327,6 +330,11 @@ are not changed. The default-on set is every flag in the table above except two:
   calls of its own (a self-started wake runs a full model turn with no user
   message). Every other flag works with SPARQL and rules only, so the default-on
   set adds no model call per message.
+- `flagPreferenceConsolidation` stays off: it derives a preference about a user
+  from their button presses and writes it into their graph, so the owner opts in
+  on purpose (`/cog flag preferenceconsolidation on`), on a new install as on an
+  existing one. `/cog defaults` lists it under the flags that stay off and
+  `/cog defaults apply` never turns it on.
 
 The setup keys keep their defaults: `unknownNudgeAllUsers` stays `false` (the
 "I don't know" nudge remains an owner-only canary), and all thresholds and caps
@@ -356,7 +364,7 @@ owner turn for `apply`):
   would change. It writes nothing.
 - `/cog defaults apply` turns on every default-on flag that is currently
   missing or off (that includes a flag the owner had switched off on purpose),
-  never turns on `flagRetention` or `flagInitiative`, never touches a setup key,
+  never turns on `flagRetention`, `flagInitiative` or `flagPreferenceConsolidation`, never touches a setup key,
   writes the marker, and lists every flag it changed in the reply.
 
 ### 7.2 Rollback
@@ -364,7 +372,7 @@ owner turn for `apply`):
 Every step back is one owner command and needs no restart (flags are read per
 message):
 
-- `/cog flag <name> off` turns one flag off, any of the thirteen.
+- `/cog flag <name> off` turns one flag off, any of the fourteen.
 - `/cog cycle off` turns the whole layer off for messages: they run on the
   legacy path again, and no new cycle, episode, skill-trace, working-memory or
   reflective record is written by a message. The other flags may stay on; they

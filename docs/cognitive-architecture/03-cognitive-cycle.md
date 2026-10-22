@@ -190,7 +190,8 @@ perception, only with the cycle flag on):
   150 ms; otherwise they are skipped for recall and resolved in the persist as
   before. The phase targets 500 ms (p95, 10 000 episodes) and ends hard at
   1.5 s, after which the answer goes ahead without recall.
-- `cog.flagEpisodicRecall` (default off) only marks that a later step may inject
+- `cog.flagEpisodicRecall` (on in a new install, off in an existing one until
+  `/cog defaults apply`) only marks that a later step may inject
   the recalled entries into the prompt. The recall itself follows the cycle flag;
   the prompt is unchanged by this phase.
 

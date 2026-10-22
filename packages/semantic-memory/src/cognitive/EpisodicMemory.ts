@@ -15,7 +15,7 @@
  *    which the embedded Oxigraph WASM build cannot evaluate.
  */
 
-import { ALL_USERS_SCOPE, OWNER_USER_KEY, type TriplestoreAdapter } from '@ontofelia/core';
+import { ALL_USERS_SCOPE, OWNER_USER_KEY, compareIso, type TriplestoreAdapter } from '@ontofelia/core';
 import { GraphUriResolver } from '../utils/GraphUriResolver.js';
 import { escapeSparqlStringContent, sparqlIri, sparqlStringLiteral } from '../utils/SparqlSyntax.js';
 
@@ -47,6 +47,9 @@ export type EpisodeType =
   | 'impasse-flagged'
   | 'meta-reflected'
   | 'consolidation-promoted'
+  | 'consolidation-superseded'
+  | 'choice-offered'
+  | 'choice-made'
   | (string & {});
 
 export type EpisodeId = string;
@@ -162,6 +165,55 @@ export interface ClaimEpisode {
 /** Tag prefix of a `consolidation-promoted` episode: the promotion's claim hash. */
 export const CLAIM_HASH_TAG = 'claim-hash:';
 
+/**
+ * Tag prefix of a `consolidation-superseded` episode: the claim hash of the
+ * promotion that was withdrawn (the ledger entry it releases).
+ */
+export const SUPERSEDED_HASH_TAG = 'superseded-hash:';
+
+/** Tag prefix of a `consolidation-superseded` episode: the withdrawn value. */
+export const OLD_VALUE_TAG = 'old-value:';
+/** Tag prefix of a `consolidation-superseded` episode: the value that replaced it. */
+export const NEW_VALUE_TAG = 'new-value:';
+
+/** Tag prefix of a `choice-offered` episode: one alternative, as JSON `[callbackData, label]`. */
+export const CHOICE_ALT_TAG = 'alt:';
+/** Tag prefix of a `choice-offered` episode: the channel's reference to the offer message. */
+export const CHOICE_OFFER_REF_TAG = 'offer-ref:';
+/** Tag prefix of a `choice-made` episode: the chosen value (the pressed button's callback data). */
+export const CHOICE_CHOSEN_TAG = 'chosen:';
+
+/** A `choice-offered` episode, slim: the alternatives of one button offer. */
+export interface ChoiceOfferRecord {
+  uri: EpisodeId;
+  occurredAt: string;
+  forUser?: string;
+  sessionId?: string;
+  channel?: string;
+  factGraph?: string;
+  offerRef?: string;
+  /** The alternatives in offer order: callback data and label. */
+  alternatives: Array<{ value: string; label: string }>;
+  secret: boolean;
+  untrusted: boolean;
+}
+
+/** A `choice-made` episode, slim, for the preference consolidation. */
+export interface ChoiceMadeRecord {
+  uri: EpisodeId;
+  occurredAt: string;
+  forUser?: string;
+  sessionId?: string;
+  transcriptRef?: string;
+  factGraph?: string;
+  /** The offer this choice answers (`cogt:precededBy`). */
+  offer?: EpisodeId;
+  /** The chosen value; absent when the episode carries none. */
+  chosen?: string;
+  secret: boolean;
+  untrusted: boolean;
+}
+
 /** Fail closed on a missing scope (JS callers, casts): never read unscoped. */
 function assertScope(userScope: UserScope): void {
   if (typeof userScope !== 'string' || userScope === '') {
@@ -243,6 +295,8 @@ const DEFAULT_SALIENCE: Record<string, number> = {
   'tool-completed': 0.5,
   'goal-pushed': 0.7,
   'goal-resolved': 0.7,
+  'choice-offered': 0.3,
+  'choice-made': 0.5,
 };
 
 function clamp01(n: number): number {
@@ -990,15 +1044,207 @@ export class EpisodicMemory {
         episodes.push(rec);
       }
     }
+    return { episodes, untrustedSessions: await this.untrustedSessionIds() };
+  }
+
+  /** Session ids flagged `cogt:sessionUntrusted` by any episode. */
+  private async untrustedSessionIds(): Promise<Set<string>> {
     const marks = await this.triplestore.query(`
       SELECT DISTINCT ?sessionId WHERE {
-        GRAPH <${graph}> {
+        GRAPH <${this.graphUri()}> {
           ?ep <${COGT}sessionUntrusted> "true"^^<${XSD}boolean> ;
               <${COGT}sessionId> ?sessionId .
         }
       }`);
-    const untrustedSessions = new Set((marks.bindings ?? []).map((r) => r.sessionId.value));
-    return { episodes, untrustedSessions };
+    return new Set((marks.bindings ?? []).map((r) => r.sessionId.value));
+  }
+
+  /**
+   * The user keys that have `choice-made` episodes, at most `limit`. Only the
+   * keys are returned. A choice episode always carries `forUser`; one without is
+   * not counted.
+   */
+  async usersWithChoiceEpisodes(limit = 200): Promise<string[]> {
+    const res = await this.triplestore.query(`
+      SELECT DISTINCT ?u WHERE {
+        GRAPH <${this.graphUri()}> {
+          ?ep a <${COGT}Episode> ;
+              <${COGT}episodeType> "choice-made" ;
+              <${COGT}forUser> ?u .
+        }
+      }`);
+    const keys = new Set<string>();
+    for (const r of res.bindings ?? []) keys.add(r.u.value);
+    return [...keys].sort().slice(0, Math.max(0, Math.trunc(limit)));
+  }
+
+  /**
+   * The newest `limit` `choice-made` episodes of one user, with the fields the
+   * preference consolidation needs and no free text. `userScope` must be a
+   * concrete user key: the all-users scope is refused, so a read here can never
+   * mix users, and the scope is applied again to the values read back.
+   * Also returns the sessions flagged untrusted by any episode.
+   */
+  async choiceMadeEpisodes(
+    userScope: UserScope,
+    limit: number,
+  ): Promise<{ choices: ChoiceMadeRecord[]; untrustedSessions: Set<string> }> {
+    assertScope(userScope);
+    if (userScope === ALL_USERS_SCOPE) {
+      throw new Error('EpisodicMemory.choiceMadeEpisodes: a concrete user key is required');
+    }
+    const n = Math.max(0, Math.trunc(limit));
+    const graph = this.graphUri();
+    const key = sparqlStringLiteral(userScope);
+    const picked = await this.triplestore.query(`
+      SELECT DISTINCT ?ep ?when WHERE {
+        GRAPH <${graph}> {
+          ?ep a <${COGT}Episode> ;
+              <${COGT}episodeType> "choice-made" ;
+              <${COGT}occurredAt> ?when ;
+              <${COGT}forUser> ${key} .
+        }
+      } ORDER BY DESC(?when) ?ep LIMIT ${n}`);
+    const list = [...new Set((picked.bindings ?? []).map((r) => r.ep.value))];
+    const choices: ChoiceMadeRecord[] = [];
+    for (let i = 0; i < list.length; i += MULTI_VALUE_CHUNK) {
+      const slice = list.slice(i, i + MULTI_VALUE_CHUNK);
+      const res = await this.triplestore.query(`
+        SELECT ?ep ?when ?forUser ?sessionId ?transcriptRef ?privacy ?untrusted ?factGraph ?offer WHERE {
+          GRAPH <${graph}> {
+            VALUES ?ep { ${slice.map((u) => sparqlIri(u)).join(' ')} }
+            ?ep <${COGT}occurredAt> ?when .
+            OPTIONAL { ?ep <${COGT}forUser> ?forUser . }
+            OPTIONAL { ?ep <${COGT}sessionId> ?sessionId . }
+            OPTIONAL { ?ep <${COGT}transcriptRef> ?transcriptRef . }
+            OPTIONAL { ?ep <${CORE}privacyClass> ?privacy . }
+            OPTIONAL { ?ep <${COGT}sessionUntrusted> ?untrusted . }
+            OPTIONAL { ?ep <${COGT}factGraph> ?factGraph . }
+            OPTIONAL { ?ep <${COGT}precededBy> ?offer . }
+          }
+        }`);
+      const tags = await this.multiValued(`<${COGT}tags>`, slice);
+      const seen = new Set<string>();
+      for (const r of res.bindings ?? []) {
+        const uri = r.ep.value;
+        // Re-check the scope on the values read back, as runSelect does.
+        if (r.forUser?.value !== userScope) continue;
+        if (seen.has(uri)) continue;
+        seen.add(uri);
+        const chosen = (tags.get(uri) ?? []).filter((t) => t.startsWith(CHOICE_CHOSEN_TAG));
+        const rec: ChoiceMadeRecord = {
+          uri,
+          occurredAt: r.when.value,
+          forUser: r.forUser.value,
+          secret: r.privacy?.value === 'secret',
+          untrusted: r.untrusted?.value === 'true',
+        };
+        if (r.sessionId) rec.sessionId = r.sessionId.value;
+        if (r.transcriptRef) rec.transcriptRef = r.transcriptRef.value;
+        if (r.factGraph) rec.factGraph = r.factGraph.value;
+        if (r.offer) rec.offer = r.offer.value;
+        // Exactly one chosen value or none: an ambiguous record is not read.
+        if (chosen.length === 1) rec.chosen = chosen[0].slice(CHOICE_CHOSEN_TAG.length);
+        choices.push(rec);
+      }
+    }
+    return { choices, untrustedSessions: await this.untrustedSessionIds() };
+  }
+
+  /**
+   * The `choice-offered` episodes among `uris`, by IRI, unscoped: the caller
+   * checks `forUser` itself. An IRI that is not a `choice-offered` episode is
+   * absent from the result.
+   */
+  async choiceOffers(uris: string[]): Promise<Map<EpisodeId, ChoiceOfferRecord>> {
+    const safe: string[] = [];
+    for (const u of new Set(uris)) {
+      try {
+        sparqlIri(u);
+        safe.push(u);
+      } catch {
+        /* not an IRI: no such offer */
+      }
+    }
+    const out = new Map<EpisodeId, ChoiceOfferRecord>();
+    const graph = this.graphUri();
+    for (let i = 0; i < safe.length; i += MULTI_VALUE_CHUNK) {
+      const slice = safe.slice(i, i + MULTI_VALUE_CHUNK);
+      const res = await this.triplestore.query(`
+        SELECT ?ep ?when ?forUser ?sessionId ?channel ?privacy ?untrusted ?factGraph WHERE {
+          GRAPH <${graph}> {
+            VALUES ?ep { ${slice.map((u) => sparqlIri(u)).join(' ')} }
+            ?ep a <${COGT}Episode> ;
+                <${COGT}episodeType> "choice-offered" ;
+                <${COGT}occurredAt> ?when .
+            OPTIONAL { ?ep <${COGT}forUser> ?forUser . }
+            OPTIONAL { ?ep <${COGT}sessionId> ?sessionId . }
+            OPTIONAL { ?ep <${COGT}channel> ?channel . }
+            OPTIONAL { ?ep <${CORE}privacyClass> ?privacy . }
+            OPTIONAL { ?ep <${COGT}sessionUntrusted> ?untrusted . }
+            OPTIONAL { ?ep <${COGT}factGraph> ?factGraph . }
+          }
+        }`);
+      const tags = await this.multiValued(`<${COGT}tags>`, slice);
+      for (const r of res.bindings ?? []) {
+        const uri = r.ep.value;
+        if (out.has(uri)) continue;
+        const own = tags.get(uri) ?? [];
+        const alternatives: Array<{ value: string; label: string }> = [];
+        for (const t of own) {
+          if (!t.startsWith(CHOICE_ALT_TAG)) continue;
+          try {
+            const [value, label] = JSON.parse(t.slice(CHOICE_ALT_TAG.length)) as [unknown, unknown];
+            if (typeof value === 'string' && value !== '') {
+              alternatives.push({ value, label: typeof label === 'string' ? label : value });
+            }
+          } catch {
+            /* a malformed alternative is not read */
+          }
+        }
+        alternatives.sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
+        const ref = own.find((t) => t.startsWith(CHOICE_OFFER_REF_TAG));
+        const rec: ChoiceOfferRecord = {
+          uri,
+          occurredAt: r.when.value,
+          alternatives,
+          secret: r.privacy?.value === 'secret',
+          untrusted: r.untrusted?.value === 'true',
+        };
+        if (r.forUser) rec.forUser = r.forUser.value;
+        if (r.sessionId) rec.sessionId = r.sessionId.value;
+        if (r.channel) rec.channel = r.channel.value;
+        if (r.factGraph) rec.factGraph = r.factGraph.value;
+        if (ref) rec.offerRef = ref.slice(CHOICE_OFFER_REF_TAG.length);
+        out.set(uri, rec);
+      }
+    }
+    return out;
+  }
+
+  /** The newest `choice-offered` episode carrying the channel reference `offerRef`, if any. */
+  async findChoiceOfferByRef(offerRef: string): Promise<ChoiceOfferRecord | undefined> {
+    const res = await this.triplestore.query(`
+      SELECT ?ep ?when WHERE {
+        GRAPH <${this.graphUri()}> {
+          ?ep a <${COGT}Episode> ;
+              <${COGT}episodeType> "choice-offered" ;
+              <${COGT}occurredAt> ?when ;
+              <${COGT}tags> ${sparqlStringLiteral(CHOICE_OFFER_REF_TAG + offerRef)} .
+        }
+      } ORDER BY DESC(?when) ?ep LIMIT 1`);
+    const uri = res.bindings?.[0]?.ep?.value;
+    if (!uri) return undefined;
+    return (await this.choiceOffers([uri])).get(uri);
+  }
+
+  /** Whether a `choice-made` episode already answers the offer. */
+  async hasChoiceMadeFor(offerUri: EpisodeId): Promise<boolean> {
+    return this.triplestore.ask(`
+      ASK { GRAPH <${this.graphUri()}> {
+        ?ep <${COGT}episodeType> "choice-made" ;
+            <${COGT}precededBy> ${sparqlIri(offerUri)} .
+      } }`);
   }
 
   /**
@@ -1012,6 +1258,44 @@ export class EpisodicMemory {
     const out = new Set<string>();
     for (const h of hits) {
       for (const t of h.tags) if (t.startsWith(CLAIM_HASH_TAG)) out.add(t.slice(CLAIM_HASH_TAG.length));
+    }
+    return out;
+  }
+
+  /**
+   * The claim hashes of one user's promotions that stand NOW: a hash promoted
+   * (`consolidation-promoted`, tag `claim-hash:`) and not withdrawn since by the
+   * system (`consolidation-superseded`, tag `superseded-hash:`). A withdrawal
+   * counts only while no later promotion of the same hash exists, so a value the
+   * consolidation withdrew and later promoted again is back in the ledger. A tie
+   * in time counts as withdrawn (the safe side: a repeated promotion finds the
+   * triple already present). Scoped to the user's own episodes; a hand
+   * retraction leaves no episode, so such a hash stays in the ledger.
+   */
+  async activePromotedHashes(userScope: UserScope): Promise<Set<string>> {
+    assertScope(userScope);
+    const latest = (hits: EpisodeHit[], prefix: string): Map<string, string> => {
+      const m = new Map<string, string>();
+      for (const h of hits) {
+        for (const t of h.tags) {
+          if (!t.startsWith(prefix)) continue;
+          const hash = t.slice(prefix.length);
+          const seen = m.get(hash);
+          if (seen === undefined || compareIso(h.occurredAt, seen) > 0) m.set(hash, h.occurredAt);
+        }
+      }
+      return m;
+    };
+    const promoted = latest(
+      await this.runSelect(`?ep <${COGT}episodeType> "consolidation-promoted" .`, userScope), CLAIM_HASH_TAG,
+    );
+    const withdrawn = latest(
+      await this.runSelect(`?ep <${COGT}episodeType> "consolidation-superseded" .`, userScope), SUPERSEDED_HASH_TAG,
+    );
+    const out = new Set<string>();
+    for (const [hash, when] of promoted) {
+      const w = withdrawn.get(hash);
+      if (w === undefined || compareIso(when, w) > 0) out.add(hash);
     }
     return out;
   }

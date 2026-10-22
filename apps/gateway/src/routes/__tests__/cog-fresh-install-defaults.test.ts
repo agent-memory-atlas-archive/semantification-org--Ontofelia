@@ -7,8 +7,8 @@ import * as os from 'os';
 import * as path from 'path';
 
 // A new install (a fresh HOME: the self graph is seeded in this boot and
-// nothing else is there) starts with the cognitive layer on, except retention
-// and initiative. The existing-install side is covered by the three sibling
+// nothing else is there) starts with the cognitive layer on, except retention,
+// initiative and the preference consolidation. The existing-install side is covered by the three sibling
 // tests that seed data first and then see every flag off.
 
 describe('gateway boot on a fresh install', () => {
@@ -33,13 +33,13 @@ describe('gateway boot on a fresh install', () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it('turns the default-on set on and leaves retention and initiative off', async () => {
+  it('turns the default-on set on and leaves retention, initiative and the preference consolidation off', async () => {
     const res = await fastify.inject({ method: 'GET', url: '/api/cog/health', headers: { authorization: 'Bearer test-secret' } });
     expect(res.statusCode).toBe(200);
     const flags = res.json().flags as Record<string, boolean>;
-    expect(Object.keys(flags)).toHaveLength(13);
+    expect(Object.keys(flags)).toHaveLength(14);
     for (const [key, on] of Object.entries(flags)) {
-      expect(on, key).toBe(key !== 'retention' && key !== 'initiative');
+      expect(on, key).toBe(key !== 'retention' && key !== 'initiative' && key !== 'preferenceConsolidation');
     }
   });
 });
