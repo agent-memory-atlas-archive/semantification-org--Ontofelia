@@ -5,11 +5,13 @@ import * as os from 'os';
 import { getDefaultConfig, validateConfig, saveConfig, loadConfig } from '../index.js';
 
 describe('config package', () => {
-  const tempDir = path.join(os.tmpdir(), 'ontofelia-test-config');
-  const tempConfigFile = path.join(tempDir, 'ontofelia.json5');
+  let tempDir: string;
+  let tempConfigFile: string;
 
   beforeEach(async () => {
-    await fs.mkdir(tempDir, { recursive: true });
+    // each test gets its own fresh directory so a stale/foreign-owned dir of a fixed name can't break other tests
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ontofelia-test-config-'));
+    tempConfigFile = path.join(tempDir, 'ontofelia.json5');
   });
 
   afterEach(async () => {

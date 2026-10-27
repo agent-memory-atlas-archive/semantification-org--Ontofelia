@@ -1,11 +1,18 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { CronManageTool } from '../cron.js';
 import * as cp from 'child_process';
 import * as fs from 'fs/promises';
-import * as os from 'os';
 import * as path from 'path';
 
-const TEST_HOME = path.join(os.tmpdir(), 'ontofelia-cron-test');
+// Unique per-run directory (not a fixed name in os.tmpdir()) so two users/runs never
+// collide over ownership. Computed in vi.hoisted() since vi.mock(...) below is hoisted
+// above this module's own top-level code; uses the real os.tmpdir(), not the mock.
+const TEST_HOME = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return mkdtempSync(join(tmpdir(), 'ontofelia-cron-'));
+});
 
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
@@ -36,6 +43,10 @@ describe('CronManageTool', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  afterAll(async () => {
+    await fs.rm(TEST_HOME, { recursive: true, force: true });
   });
 
   it('rejects invalid labels', async () => {
