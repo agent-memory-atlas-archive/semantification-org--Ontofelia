@@ -1,4 +1,5 @@
 @prefix onto: <urn:ontofelia:core#> .
+@prefix core: <urn:shared:ontology#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
@@ -110,6 +111,12 @@ onto:hasPreference rdf:type owl:DatatypeProperty ;
     rdfs:range xsd:string ;
     rdfs:label "has preference" .
 
+core:preference rdf:type owl:DatatypeProperty ;
+    rdfs:domain onto:Person ;
+    rdfs:range xsd:string ;
+    rdfs:label "preference" ;
+    rdfs:comment "A choice a user repeated over the same alternatives, promoted by the preference consolidation (episodic memory, pattern 3) into that user's own graph. The value names the chosen option and the alternatives it was chosen over. Never functional: preferences over different alternatives coexist." .
+
 onto:hasBirthday rdf:type owl:DatatypeProperty, owl:FunctionalProperty ;
     rdfs:domain onto:Person ;
     rdfs:range xsd:date ;
@@ -168,6 +175,79 @@ onto:sessionId rdf:type owl:DatatypeProperty ;
 onto:createdAt rdf:type owl:DatatypeProperty ;
     rdfs:domain onto:Provenance ;
     rdfs:range xsd:dateTime .
+
+# === Claim Model (urn:shared:ontology#) ===
+# Bookkeeping vocabulary of truth maintenance: claims live in the agent claims
+# graph, evidence in the evidence graph, conflicts in the conflicts graph. These
+# terms describe the memory itself, not the world, so they are kept out of the
+# entity-type and property lists offered to the fact parser.
+core:Claim rdf:type owl:Class ;
+    rdfs:label "Claim" ;
+    rdfs:comment "A recorded assertion of one fact (subject, predicate, object) with its status and provenance" .
+
+core:Evidence rdf:type owl:Class ;
+    rdfs:label "Evidence" ;
+    rdfs:comment "The source a claim rests on, such as a message span, tool result or document" .
+
+core:Conflict rdf:type owl:Class ;
+    rdfs:label "Conflict" ;
+    rdfs:comment "An audit record of a contradiction or supersession between claims" .
+
+core:claimSubject rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Claim ;
+    rdfs:label "claim subject" ;
+    rdfs:comment "The subject entity of the claimed triple" .
+
+core:claimPredicate rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Claim ;
+    rdfs:label "claim predicate" ;
+    rdfs:comment "The predicate of the claimed triple" .
+
+core:claimObject rdf:type rdf:Property ;
+    rdfs:domain core:Claim ;
+    rdfs:label "claim object" ;
+    rdfs:comment "The object of the claimed triple, an entity or a literal" .
+
+core:status rdf:type owl:DatatypeProperty ;
+    rdfs:label "status" ;
+    rdfs:comment "Lifecycle state: accepted, rejected or superseded for a claim; resolved for a conflict" .
+
+core:assertedInGraph rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Claim ;
+    rdfs:label "asserted in graph" ;
+    rdfs:comment "The named graph that holds the accepted triple of this claim" .
+
+core:supersededBy rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Claim ;
+    rdfs:range core:Claim ;
+    rdfs:label "superseded by" ;
+    rdfs:comment "The later claim that replaced this one under belief revision" .
+
+core:supersededAt rdf:type owl:DatatypeProperty ;
+    rdfs:domain core:Claim ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "superseded at" ;
+    rdfs:comment "When this claim was replaced by a later one" .
+
+core:supersededClaim rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Conflict ;
+    rdfs:range core:Claim ;
+    rdfs:label "superseded claim" ;
+    rdfs:comment "The claim that a supersession retired" .
+
+core:supersedingClaim rdf:type owl:ObjectProperty ;
+    rdfs:domain core:Conflict ;
+    rdfs:range core:Claim ;
+    rdfs:label "superseding claim" ;
+    rdfs:comment "The claim that replaced the superseded one" .
+
+core:conflictType rdf:type owl:DatatypeProperty ;
+    rdfs:domain core:Conflict ;
+    rdfs:label "conflict type" .
+
+core:detectedAt rdf:type owl:DatatypeProperty ;
+    rdfs:domain core:Conflict ;
+    rdfs:label "detected at" .
 
 # === Reasoning Markers ===
 onto:inferredBy rdf:type owl:AnnotationProperty ;
@@ -263,6 +343,58 @@ cogt:Goal rdf:type owl:Class ;
     rdfs:label "Goal" ;
     rdfs:comment "An explicit intention on the goal stack." .
 
+cogt:GoalType rdf:type owl:Class ;
+    rdfs:label "Goal Type" ;
+    rdfs:comment "Marker superclass of the goal types; a goal's cogt:goalType is one of its subclasses (doc 07 §2.2)." .
+
+cogt:RespondToUser rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Respond To User" ;
+    rdfs:comment "Implicit safety-net goal of a cycle; resolved when the cycle ends." .
+
+cogt:AnswerQuestion rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Answer Question" ;
+    rdfs:comment "Created from a message with intent question." .
+
+cogt:ExecuteCommand rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Execute Command" ;
+    rdfs:comment "Created from a message with intent command." .
+
+cogt:HandleRequest rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Handle Request" ;
+    rdfs:comment "Created from a message with intent request." .
+
+cogt:AnswerInTopic rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Answer In Topic" ;
+    rdfs:comment "Created from a message with intent topic-reference." .
+
+cogt:OwnerRequestedWork rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Owner Requested Work" ;
+    rdfs:comment "A goal the owner armed for initiative." .
+
+cogt:ResolveConflict rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Resolve Conflict" ;
+    rdfs:comment "A goal raised by metacognition when a turn surfaced a conflict in the sender's own data (a fact the sender changed)." .
+
+cogt:CompletePlan rdfs:subClassOf cogt:GoalType ;
+    rdfs:label "Complete Plan" ;
+    rdfs:comment "Reserved: stepwise execution of an approved plan. Not created yet." .
+
+cogt:ChooseGoal rdf:type owl:Class ;
+    rdfs:label "Choose Goal" ;
+    rdfs:comment "Record of a competition between goals in one cycle: the winner (most recent intent) and the losers." .
+
+cogt:winner rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range cogt:Goal ; rdfs:label "winning goal" .
+
+cogt:loser rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range cogt:Goal ; rdfs:label "losing goal" .
+
+cogt:chosenBecause rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:ChooseGoal ; rdfs:range xsd:string ; rdfs:label "tie-break rule" .
+
+cogt:aboutEntity rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Goal ; rdfs:label "about entity (from the perception that created the goal)" .
+
 cogt:SkillTrace rdf:type owl:Class ;
     rdfs:label "Skill Trace" ;
     rdfs:comment "A single procedural-memory record of one tool invocation." .
@@ -308,9 +440,11 @@ cogt:hasConstraint rdf:type owl:ObjectProperty ;
 cogt:relevantToGoalType rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Capability ; rdfs:label "relevant to goal type" .
 cogt:requiresApproval rdf:type owl:ObjectProperty ;
-    rdfs:label "requires approval" .
+    rdfs:label "requires approval" ;
+    rdfs:comment "A tool (urn:tool:<name>) that is denied-by-default or gated by the guardian until the owner approves. Derived; asserted on the derived profile." .
 cogt:authorityOver rdf:type owl:ObjectProperty ;
-    rdfs:label "authority over" .
+    rdfs:label "authority over" ;
+    rdfs:comment "A tool (urn:tool:<name>) the agent may use without asking. Derived; asserted on the derived profile." .
 cogt:owner rdf:type owl:ObjectProperty ;
     rdfs:label "owner" .
 cogt:operatesIn rdf:type owl:ObjectProperty ;
@@ -323,6 +457,50 @@ cogt:enforcedBy rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Constraint ; rdfs:range xsd:string ; rdfs:label "enforced by" .
 cogt:ownerRelation rdf:type owl:DatatypeProperty ;
     rdfs:range xsd:string ; rdfs:label "owner relation" .
+
+# Derived self-model: capabilities and constraints computed from the tool
+# registry, the tool policy, the guardian policy and the behavior directives
+# (SelfModel.reseedDerived). Everything below lives on nodes under
+# urn:<agent>:self#derived/ or on the self-model subject; none of it is written
+# on the bootstrap persona subject.
+cogt:DerivedSelfProfile rdf:type owl:Class ;
+    rdfs:label "Derived self profile" ;
+    rdfs:comment "One node per agent holding the derived autonomy level, owner relation and the approval / authority tool sets. Replaced wholesale on every re-derivation." .
+
+cogt:Principal rdf:type owl:Class ;
+    rdfs:label "Principal" ;
+    rdfs:comment "A party the agent answers to, e.g. the owner who approves gated tools. Carries no personal data." .
+
+cogt:hasDerivedProfile rdf:type owl:ObjectProperty ;
+    rdfs:range cogt:DerivedSelfProfile ; rdfs:label "has derived profile" .
+
+cogt:autonomyLevel rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:DerivedSelfProfile ; rdfs:range xsd:string ; rdfs:label "autonomy level" ;
+    rdfs:comment "restricted (no tool usable without approval) | semi-autonomous (some tool needs approval) | autonomous (no tool needs approval). Computed from the tool verdicts, not configured." .
+
+cogt:policyStatus rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Capability ; rdfs:range xsd:string ; rdfs:label "policy status" ;
+    rdfs:comment "allowed | needs-approval | denied. The verdict of the tool policy combined with the guardian for a tool, as seen by the owner. It says what the policy lets the agent attempt, not that the agent is good at it." .
+
+cogt:derivedFrom rdf:type owl:DatatypeProperty ;
+    rdfs:range xsd:string ; rdfs:label "derived from" ;
+    rdfs:comment "tool-registry | tool-policy | guardian-policy | behavior-directive. Present only on derived nodes; learned nodes never carry it." .
+
+cogt:constraintScope rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Constraint ; rdfs:range xsd:string ; rdfs:label "constraint scope" ;
+    rdfs:comment "For a constraint derived from a behavior directive: the directive's scope." .
+
+cogt:derivedLabel rdf:type owl:DatatypeProperty ;
+    rdfs:range xsd:string ; rdfs:label "derived label" ;
+    rdfs:comment "Human-readable name of a derived node. Deliberately not rdfs:label, so derived nodes never take part in entity resolution by label." .
+
+cogt:derivedNote rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Capability ; rdfs:range xsd:string ; rdfs:label "derived note" ;
+    rdfs:comment "One neutralised line taken from the tool description at derivation time. Stored for queries; never rendered into a prompt." .
+
+cogt:basedOn rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Constraint ; rdfs:label "based on" ;
+    rdfs:comment "The behavior directive a derived constraint was derived from. Only ever the object of a triple: the directive itself stays owned by the bootstrap persona." .
 
 # === Structural object properties ===
 cogt:partOfCycle rdf:type owl:ObjectProperty ;
@@ -410,11 +588,15 @@ cogt:tags rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Episode ; rdfs:range xsd:string ; rdfs:label "tag" .
 cogt:actor rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:label "actor" .
+cogt:actorIsOwner rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:Episode ; rdfs:range xsd:boolean ;
+    rdfs:label "actor is owner (written only when true, on inbound owner turns)" .
 cogt:about rdf:type owl:ObjectProperty ;
     rdfs:domain cogt:Episode ; rdfs:label "about entity" .
 
-cogt:goalType rdf:type owl:DatatypeProperty ;
-    rdfs:domain cogt:Goal ; rdfs:range xsd:string ; rdfs:label "goal type" .
+cogt:goalType rdf:type owl:ObjectProperty ;
+    rdfs:domain cogt:Goal ; rdfs:label "goal type" ;
+    rdfs:comment "The IRI of a subclass of cogt:GoalType. No rdfs:range: the value is a class, not an instance." .
 cogt:statement rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:Goal ; rdfs:range xsd:string ; rdfs:label "statement" .
 cogt:priority rdf:type owl:DatatypeProperty ;
@@ -542,6 +724,9 @@ cogt:emptyRetrieval rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "empty retrieval" .
 cogt:goalDrift rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "goal drift" .
+cogt:conflictSurfaced rdf:type owl:DatatypeProperty ;
+    rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:integer ; rdfs:label "conflict surfaced" ;
+    rdfs:comment "Number of conflicts in the sender's own data that this turn surfaced." .
 cogt:toolChurn rdf:type owl:DatatypeProperty ;
     rdfs:domain cogt:ReflectiveMarker ; rdfs:range xsd:boolean ; rdfs:label "tool churn" .
 cogt:constraintPressure rdf:type owl:DatatypeProperty ;

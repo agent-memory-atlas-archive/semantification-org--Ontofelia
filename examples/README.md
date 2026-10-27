@@ -77,7 +77,11 @@ cd examples/01-why-do-you-believe-that
 The scripts only do two kinds of things:
 
 - `POST /api/chat` — send a chat message to the agent (same as typing in the Web UI)
-- `GET /api/knowledge/graphs` / `GET /api/reasoning/conflicts` — *read* the knowledge graph
+- `POST /api/knowledge/sparql` / `GET /api/knowledge/graphs` / `GET /api/reasoning/conflicts` — *read* the knowledge graph.
+  Recipe 01 reads the worldview triples with a SPARQL query on the read-only
+  endpoint (the `sparql` helper in `common.sh`; that endpoint refuses the
+  claims, evidence and other graphs that hold private data); it and recipes 02
+  and 03 dump those graphs with `GET /api/knowledge/graphs`.
 
 They never delete or modify anything directly. The facts they teach are about
 clearly fictional people (Ada Marlowe, Ben Okafor, Carla Reyes), so they won't

@@ -35,6 +35,22 @@ describe('Config Schema', () => {
     expect(parsed.channels.telegram?.token).toBe('123');
   });
 
+  it('telegram ownerId: string kept, number normalised, unset stays unset', () => {
+    const tg = (v: Record<string, unknown>) => configSchema.parse({ channels: { telegram: v } }).channels.telegram;
+    expect(tg({ enabled: true, ownerId: '123456789' })?.ownerId).toBe('123456789');
+    expect(tg({ enabled: true, ownerId: 123456789 })?.ownerId).toBe('123456789');
+    expect(tg({ enabled: true })?.ownerId).toBeUndefined();
+  });
+
+  it('telegram ownerId: rejects non-digit values', () => {
+    const tg = (v: unknown) => configSchema.safeParse({ channels: { telegram: { enabled: true, ownerId: v } } }).success;
+    expect(tg('@someone')).toBe(false);
+    expect(tg('12 34')).toBe(false);
+    expect(tg('')).toBe(false);
+    expect(tg(-5)).toBe(false);
+    expect(tg(1.5)).toBe(false);
+  });
+
   it('strips unknown channel types', () => {
     const parsed = configSchema.parse({
       channels: {
@@ -44,10 +60,11 @@ describe('Config Schema', () => {
     expect((parsed.channels as Record<string, unknown>).unknown_app).toBeUndefined();
   });
 
-  it('rejects invalid session scope', () => {
-    expect(() => {
-      configSchema.parse({ session: { scope: 'invalid' } });
-    }).toThrow(/Invalid option/);
+  it('loads an old config carrying the removed notifications.approvalMaxPerDay key', () => {
+    const parsed = configSchema.parse({ notifications: { maxPerDay: 3, approvalMaxPerDay: 7 } });
+    expect(parsed.notifications.maxPerDay).toBe(3);
+    expect('approvalMaxPerDay' in parsed.notifications).toBe(false);
+    expect('approvalMaxPerDay' in configSchema.parse({}).notifications).toBe(false);
   });
 
   // H1/L3 — notification policy validation at config load.

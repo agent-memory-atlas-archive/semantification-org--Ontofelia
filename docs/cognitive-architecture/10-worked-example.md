@@ -27,8 +27,8 @@ This is what happens.
 |---|---|
 | Agent | `ontofelia` |
 | Session | `sess_2026-05-31_18-04` |
-| Cycle | `cycle_2026-05-31T18-04-32Z_001` |
-| WM graph | `urn:ontofelia:cog:working:sess_2026-05-31_18-04:cycle_2026-05-31T18-04-32Z_001` |
+| Cycle | `cyc-0001` (the runtime mints `cyc-<uuid>`), resource `urn:ontofelia:cog:cycle:cyc-0001` |
+| WM graph | `urn:ontofelia:cog:working:sess_2026-05-31_18-04:cyc-0001` |
 | Cycle metadata graph | `urn:ontofelia:cog:cycles:sess_2026-05-31_18-04` |
 | Goals (session) | `urn:ontofelia:cog:goals:sess_2026-05-31_18-04` |
 | Goals (long-term) | `urn:ontofelia:cog:goals:longterm` |
@@ -45,42 +45,55 @@ Prefix declarations (omitted in code blocks for brevity):
 @prefix cog:  <urn:ontofelia:cog:> .
 @prefix cogt: <urn:shared:ontology#cog/> .
 @prefix core: <urn:shared:ontology#> .
-@prefix onto: <urn:ontofelia:> .
+@prefix onto: <urn:ontofelia:core#> .
 @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
 ```
 
 ---
 
-## 3. Cycle bootstrap
+## 3. Cycle record
 
-`CycleManager.runCycle(envelope)` first writes the cycle skeleton:
+`CycleManager.runCycle(envelope)` runs the turn and writes the cycle resource
+and its six phase records in **one update after the turn**. Nothing is written
+when the cycle starts, and no phase is ever stored as `pending` or `running`:
+a phase is `completed`, or `aborted` when the delegated core failed. The record
+as it stands once the cycle is closed:
 
 ```turtle
 GRAPH <urn:ontofelia:cog:cycles:sess_2026-05-31_18-04> {
-  cog:cycle_2026-05-31T18-04-32Z_001 a cogt:Cycle ;
-      cogt:cycleId      "cycle_2026-05-31T18-04-32Z_001" ;
+  cog:cycle:cyc-0001 a cogt:Cycle ;
+      cogt:cycleId      "cyc-0001" ;
       cogt:sessionId    "sess_2026-05-31_18-04" ;
+      cogt:cycleStatus  "completed" ;
       cogt:startedAt    "2026-05-31T18:04:32.401Z"^^xsd:dateTime ;
-      cogt:status       "running" ;
-      cogt:hasPhase     cog:phase_001_1, cog:phase_001_2,
-                        cog:phase_001_3, cog:phase_001_4,
-                        cog:phase_001_5, cog:phase_001_6 .
+      cogt:endedAt      "2026-05-31T18:04:35.130Z"^^xsd:dateTime ;
+      cogt:forUser      "owner" ;
+      cogt:hasPhase     cog:cycle:cyc-0001_1, cog:cycle:cyc-0001_2,
+                        cog:cycle:cyc-0001_3, cog:cycle:cyc-0001_4,
+                        cog:cycle:cyc-0001_5, cog:cycle:cyc-0001_6 .
 
-  cog:phase_001_1 a cogt:Phase ; cogt:phaseIndex 1 ; cogt:phaseKind "perception"       ; cogt:phaseStatus "pending" .
-  cog:phase_001_2 a cogt:Phase ; cogt:phaseIndex 2 ; cogt:phaseKind "comprehension"    ; cogt:phaseStatus "pending" .
-  cog:phase_001_3 a cogt:Phase ; cogt:phaseIndex 3 ; cogt:phaseKind "goal-management"  ; cogt:phaseStatus "pending" .
-  cog:phase_001_4 a cogt:Phase ; cogt:phaseIndex 4 ; cogt:phaseKind "action-selection" ; cogt:phaseStatus "pending" .
-  cog:phase_001_5 a cogt:Phase ; cogt:phaseIndex 5 ; cogt:phaseKind "execution"        ; cogt:phaseStatus "pending" .
-  cog:phase_001_6 a cogt:Phase ; cogt:phaseIndex 6 ; cogt:phaseKind "learning"         ; cogt:phaseStatus "pending" .
+  # Every phase also carries startedAt and endedAt; only phase 1 shows them here.
+  cog:cycle:cyc-0001_1 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ;
+      cogt:phaseIndex 1 ; cogt:phaseKind "perception" ; cogt:phaseStatus "completed" ;
+      cogt:startedAt "2026-05-31T18:04:32.412Z"^^xsd:dateTime ;
+      cogt:endedAt   "2026-05-31T18:04:32.488Z"^^xsd:dateTime .
+  cog:cycle:cyc-0001_2 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ; cogt:phaseIndex 2 ; cogt:phaseKind "comprehension"   ; cogt:phaseStatus "completed" .
+  cog:cycle:cyc-0001_3 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ; cogt:phaseIndex 3 ; cogt:phaseKind "goal-management" ; cogt:phaseStatus "completed" .
+  cog:cycle:cyc-0001_4 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ; cogt:phaseIndex 4 ; cogt:phaseKind "action"          ; cogt:phaseStatus "completed" .
+  cog:cycle:cyc-0001_5 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ; cogt:phaseIndex 5 ; cogt:phaseKind "response"        ; cogt:phaseStatus "completed" .
+  cog:cycle:cyc-0001_6 a cogt:Phase ; cogt:partOfCycle cog:cycle:cyc-0001 ; cogt:phaseIndex 6 ; cogt:phaseKind "reflection"      ; cogt:phaseStatus "completed" .
 }
 ```
+
+The phase boundaries are instants the cycle manager measures in memory while
+the turn runs; the phase records are built from them at the end.
 
 ---
 
 ## 4. Phase 1 — Perception
 
-`CycleManager` updates `cog:phase_001_1.phaseStatus = "running"` and
-records `startedAt`.
+`CycleManager` notes the instant Phase 1 starts in memory; the phase record
+(§3) is written after the turn.
 
 ### 4.1 Parse, NER, intent
 
@@ -95,15 +108,15 @@ records `startedAt`.
 
 ```turtle
 GRAPH <urn:ontofelia:cog:episodic> {
-  cog:ep_2026-05-31T18-04-32Z_001 a cogt:Episode ;
+  cog:ep:3b9c7a41 a cogt:Episode ;
       cogt:episodeType   "message-received" ;
       cogt:occurredAt    "2026-05-31T18:04:32.412Z"^^xsd:dateTime ;
-      cogt:cycleId       "cycle_2026-05-31T18-04-32Z_001" ;
+      cogt:cycleId       "cyc-0001" ;
       cogt:sessionId     "sess_2026-05-31_18-04" ;
       cogt:channel       "webchat" ;
-      cogt:actor         <urn:entity:Alice> ;
+      cogt:actor         <urn:entity:agent-sender:alice> ;   # urn:entity:agent-sender:<URI-encoded sender id>
       cogt:about         <urn:entity:OntofeliaProject> ;
-      cogt:rawText       "ontofelia" ;
+      cogt:payload       "ontofelia" ;
       cogt:salience      "0.6"^^xsd:decimal ;
       cogt:tags          "topic-reference", "minimal-input" ;
       cogt:transcriptRef "sess_2026-05-31_18-04.jsonl:offset_8412" .
@@ -116,31 +129,31 @@ A `core:Claim` is also written through the existing provenance pipeline
 ### 4.3 Working-memory writes
 
 ```turtle
-GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cycle_2026-05-31T18-04-32Z_001> {
-  cog:wm_001 a cogt:WorkingMemoryEntry ;
-      cogt:writtenTo cogt:perceptionBuffer ; cogt:writtenBy cog:phase_001_1 ;
+GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cyc-0001> {
+  cog:wm:001 a cogt:WorkingMemoryEntry ;
+      cogt:writtenTo "perceptionBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_1 ;
       cogt:salience "1.0"^^xsd:decimal ; cogt:entryKind "message-text" ;
       cogt:payload "ontofelia" ; cogt:writtenAt "2026-05-31T18:04:32.412Z"^^xsd:dateTime .
 
-  cog:wm_002 a cogt:WorkingMemoryEntry ;
-      cogt:writtenTo cogt:perceptionBuffer ; cogt:writtenBy cog:phase_001_1 ;
+  cog:wm:002 a cogt:WorkingMemoryEntry ;
+      cogt:writtenTo "perceptionBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_1 ;
       cogt:salience "1.0"^^xsd:decimal ; cogt:entryKind "sender-id" ;
       cogt:payload "Alice (owner)" ; cogt:refersTo <urn:entity:Alice> .
 
-  cog:wm_003 a cogt:WorkingMemoryEntry ;
-      cogt:writtenTo cogt:perceptionBuffer ; cogt:writtenBy cog:phase_001_1 ;
+  cog:wm:003 a cogt:WorkingMemoryEntry ;
+      cogt:writtenTo "perceptionBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_1 ;
       cogt:salience "0.7"^^xsd:decimal ; cogt:entryKind "ner-result" ;
       cogt:payload "entity=OntofeliaProject" ; cogt:refersTo <urn:entity:OntofeliaProject> .
 
-  cog:wm_004 a cogt:WorkingMemoryEntry ;
-      cogt:writtenTo cogt:perceptionBuffer ; cogt:writtenBy cog:phase_001_1 ;
+  cog:wm:004 a cogt:WorkingMemoryEntry ;
+      cogt:writtenTo "perceptionBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_1 ;
       cogt:salience "0.8"^^xsd:decimal ; cogt:entryKind "intent" ;
       cogt:payload "intent=topic-reference" .
 }
 ```
 
-Phase 1 ends. `cog:phase_001_1.phaseStatus = "completed"`,
-`endedAt = "2026-05-31T18:04:32.488Z"^^xsd:dateTime`, duration **76 ms**.
+Phase 1 ends. Its phase record (§3) has `phaseStatus "completed"` and
+`endedAt "2026-05-31T18:04:32.488Z"^^xsd:dateTime`, duration **76 ms**.
 
 ---
 
@@ -173,7 +186,7 @@ SELECT ?ep ?when ?text ?type WHERE {
     ?ep cogt:about      <urn:entity:OntofeliaProject> ;
         cogt:occurredAt ?when ;
         cogt:episodeType ?type ;
-        cogt:rawText    ?text .
+        cogt:payload    ?text .
   }
 } ORDER BY DESC(?when) LIMIT 5
 ```
@@ -183,7 +196,7 @@ prior request *"clone it and analyze the code"* and Ontofelia's analysis
 response. Top result (relevance 0.92):
 
 ```turtle
-cog:ep_prev_201 cogt:rawText "Snapshot Ontofelia (OpenProject) ..." ;
+cog:ep:7e40c2d9 cogt:payload "Snapshot Ontofelia (OpenProject) ..." ;
                 cogt:episodeType "response-sent" ;
                 cogt:occurredAt "2026-05-31T20:55:14Z"^^xsd:dateTime .
 ```
@@ -192,26 +205,26 @@ cog:ep_prev_201 cogt:rawText "Snapshot Ontofelia (OpenProject) ..." ;
 
 ```turtle
 GRAPH <... working ...> {
-  cog:wm_010 cogt:writtenTo cogt:retrievalBuffer ; cogt:writtenBy cog:phase_001_2 ;
+  cog:wm:010 cogt:writtenTo "retrievalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_2 ;
              cogt:entryKind "fact" ;
              cogt:salience  "0.85"^^xsd:decimal ;
              cogt:retrievalScore "0.85"^^xsd:decimal ;
-             cogt:sourceGraph <urn:ontofelia:worldview> ;
+             cogt:sourceGraph "urn:ontofelia:worldview" ;
              cogt:refersTo <urn:entity:OntofeliaProject> ;
              cogt:payload "techStack: TypeScript, Oxigraph, Reasonable, Turbo" .
 
-  cog:wm_011 cogt:writtenTo cogt:retrievalBuffer ; cogt:writtenBy cog:phase_001_2 ;
+  cog:wm:011 cogt:writtenTo "retrievalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_2 ;
              cogt:entryKind "episode-ref" ;
              cogt:salience  "0.92"^^xsd:decimal ;
              cogt:retrievalScore "0.92"^^xsd:decimal ;
-             cogt:sourceGraph <urn:ontofelia:cog:episodic> ;
-             cogt:refersTo cog:ep_prev_201 ;
+             cogt:sourceGraph "urn:ontofelia:cog:episodic" ;
+             cogt:refersTo cog:ep:7e40c2d9 ;
              cogt:payload "Previously delivered snapshot of OPRO project + 0 work packages + structure analysis." .
 
-  cog:wm_012 cogt:writtenTo cogt:retrievalBuffer ; cogt:writtenBy cog:phase_001_2 ;
+  cog:wm:012 cogt:writtenTo "retrievalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_2 ;
              cogt:entryKind "fact" ;
              cogt:salience  "0.74"^^xsd:decimal ;
-             cogt:sourceGraph <urn:ontofelia:worldview> ;
+             cogt:sourceGraph "urn:ontofelia:worldview" ;
              cogt:payload "Project graphs: self, skills, worldview, schema, conflicts, claims, evidence" .
 }
 ```
@@ -227,7 +240,7 @@ Current goal-stack snapshot (read):
 ```sparql
 SELECT ?goal ?label ?priority ?status FROM <urn:ontofelia:cog:goals:longterm>
 WHERE { ?goal a cogt:Goal ; cogt:goalLabel ?label ; cogt:priority ?priority ;
-                            cogt:status ?status . FILTER(?status != "resolved") }
+                            cogt:goalStatus ?status . FILTER(?status != "resolved") }
 ORDER BY DESC(?priority)
 ```
 
@@ -235,8 +248,8 @@ Returns:
 
 | URI | label | priority | status |
 |---|---|---|---|
-| `cog:goal_20260531_204900_concept` | Write cognitive architecture concept docs | 0.95 | active |
-| `cog:goal_20260531_180432_analyze` | Analyse Ontofelia repo for the user | 0.6 | resolved |
+| `cog:goal:c9a1e5d2` | Write cognitive architecture concept docs | 0.95 | active |
+| `cog:goal:41be7a03` | Analyse Ontofelia repo for the user | 0.6 | resolved |
 
 (The analyse-repo goal resolved in cycle 20 with the snapshot.)
 
@@ -253,15 +266,15 @@ want a context-refresh:
 
 ```turtle
 GRAPH <urn:ontofelia:cog:goals:sess_2026-05-31_18-04> {
-  cog:goal_2026-05-31T18-04-32Z_001 a cogt:Goal ;
+  cog:goal:6d2e9f80 a cogt:Goal ;
       cogt:goalType        cogt:RefreshContextOnTopic ;
       cogt:goalLabel       "Refresh context on Ontofelia for the user" ;
-      cogt:status          "active" ;
+      cogt:goalStatus      "active" ;
       cogt:priority        "0.8"^^xsd:decimal ;
       cogt:createdAt       "2026-05-31T18:04:32.612Z"^^xsd:dateTime ;
-      cogt:parentGoal      cog:goal_20260531_204900_concept ;
+      cogt:parentGoal      cog:goal:c9a1e5d2 ;
       cogt:successCriterion "User received a concise snapshot tied to current concept work" ;
-      cogt:triggeredByEpisode cog:ep_2026-05-31T18-04-32Z_001 .
+      cogt:triggeredByEpisode cog:ep:3b9c7a41 .
 }
 ```
 
@@ -275,7 +288,7 @@ These get written into the retrieval buffer:
 
 ```turtle
 GRAPH <... working ...> {
-  cog:wm_020 cogt:writtenTo cogt:retrievalBuffer ; cogt:writtenBy cog:phase_001_3 ;
+  cog:wm:020 cogt:writtenTo "retrievalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_3 ;
              cogt:entryKind "skill-suggestion" ;
              cogt:salience  "0.6"^^xsd:decimal ;
              cogt:payload "Top skill for WriteConceptDoc: fs_read (92% sat)" .
@@ -286,16 +299,16 @@ GRAPH <... working ...> {
 
 ```turtle
 GRAPH <... working ...> {
-  cog:wm_030 cogt:writtenTo cogt:goalBuffer ; cogt:writtenBy cog:phase_001_3 ;
+  cog:wm:030 cogt:writtenTo "goalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_3 ;
              cogt:entryKind "goal-active" ;
              cogt:salience  "1.0"^^xsd:decimal ;
-             cogt:forGoal   cog:goal_2026-05-31T18-04-32Z_001 ;
+             cogt:forGoal   cog:goal:6d2e9f80 ;
              cogt:payload   "Refresh context on Ontofelia (priority 0.80, parent: WriteConceptDoc 0.95)" .
 
-  cog:wm_031 cogt:writtenTo cogt:goalBuffer ; cogt:writtenBy cog:phase_001_3 ;
+  cog:wm:031 cogt:writtenTo "goalBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_3 ;
              cogt:entryKind "goal-parent" ;
              cogt:salience  "0.7"^^xsd:decimal ;
-             cogt:forGoal   cog:goal_20260531_204900_concept ;
+             cogt:forGoal   cog:goal:c9a1e5d2 ;
              cogt:payload   "Parent: Write cognitive architecture concept docs (priority 0.95)" .
 }
 ```
@@ -311,11 +324,11 @@ Phase 3 ends. Duration **8 ms**.
 ```sparql
 SELECT ?cap ?cons FROM <urn:ontofelia:self> WHERE {
   OPTIONAL {
-    onto:self#Ontofelia cogt:hasCapability ?cap .
+    <urn:ontofelia:self#ontofelia> cogt:hasCapability ?cap .
     ?cap cogt:relevantToGoalType cogt:WriteConceptDoc .
   }
   OPTIONAL {
-    onto:self#Ontofelia cogt:hasConstraint ?cons .
+    <urn:ontofelia:self#ontofelia> cogt:hasConstraint ?cons .
     ?cons cogt:applies "fs_read", "fs_write" .
   }
 }
@@ -324,16 +337,16 @@ SELECT ?cap ?cons FROM <urn:ontofelia:self> WHERE {
 Returns one capability (`cap_doc_writing`) and one constraint
 (`cons_no_destructive_without_approval`).
 
-Written to `cog:selfBuffer`:
+Written to the `selfBuffer`:
 
 ```turtle
 GRAPH <... working ...> {
-  cog:wm_040 cogt:writtenTo cogt:selfBuffer ; cogt:writtenBy cog:phase_001_4 ;
+  cog:wm:040 cogt:writtenTo "selfBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_4 ;
              cogt:entryKind "capability" ;
              cogt:salience  "0.6"^^xsd:decimal ;
              cogt:payload "cap_doc_writing — concept/architecture docs" .
 
-  cog:wm_041 cogt:writtenTo cogt:selfBuffer ; cogt:writtenBy cog:phase_001_4 ;
+  cog:wm:041 cogt:writtenTo "selfBuffer" ; cogt:writtenBy cog:cycle:cyc-0001_4 ;
              cogt:entryKind "constraint" ;
              cogt:salience  "0.9"^^xsd:decimal ;
              cogt:payload "no destructive ops without owner approval" .
@@ -372,19 +385,11 @@ Message: "ontofelia"
 ### 7.3 LLM tool loop
 
 The LLM is the existing provider; given the prompt it decides not to call
-a tool — it produces a textual response continuing the concept work. The
-proposal:
-
-```turtle
-GRAPH <... working ...> {
-  cog:wm_050 cogt:writtenTo cogt:actionBuffer ; cogt:writtenBy cog:phase_001_4 ;
-             cogt:entryKind "action-proposal" ;
-             cogt:salience  "1.0"^^xsd:decimal ;
-             cogt:actionType "text-response" ;
-             cogt:forGoal    cog:goal_2026-05-31T18-04-32Z_001 ;
-             cogt:payload    "Snapshot Ontofelia (OpenProject, via v0.3.0 MCP):\n- id: 19 ..." .
-}
-```
+a tool — it produces a textual response continuing the concept work. A turn
+without a tool call writes **no** `actionBuffer` entry: only tool calls become
+`action-proposal` and `action-result` entries (one pair per call, tied by
+`callId`). The reply itself is recorded as the `response-sent` episode of
+Phase 5 (§8).
 
 Phase 4 ends. Duration **2.3 s** (LLM-bound).
 
@@ -399,28 +404,23 @@ Episode written:
 
 ```turtle
 GRAPH <urn:ontofelia:cog:episodic> {
-  cog:ep_2026-05-31T18-04-35Z_001 a cogt:Episode ;
+  cog:ep:9c05b1ee a cogt:Episode ;
       cogt:episodeType "response-sent" ;
       cogt:occurredAt  "2026-05-31T18:04:35.118Z"^^xsd:dateTime ;
-      cogt:precededBy  cog:ep_2026-05-31T18-04-32Z_001 ;
-      cogt:cycleId     "cycle_2026-05-31T18-04-32Z_001" ;
+      cogt:precededBy  cog:ep:3b9c7a41 ;
+      cogt:cycleId     "cyc-0001" ;
       cogt:channel     "webchat" ;
-      cogt:actor       <urn:ontofelia:self#Ontofelia> ;
+      cogt:actor       <urn:ontofelia:self#ontofelia> ;
       cogt:about       <urn:entity:OntofeliaProject> ;
-      cogt:rawText     "Snapshot Ontofelia (OpenProject, …)" ;
-      cogt:partOfGoal  cog:goal_2026-05-31T18-04-32Z_001 ;
+      cogt:payload     "Snapshot Ontofelia (OpenProject, …)" ;
+      cogt:partOfGoal  cog:goal:6d2e9f80 ;
       cogt:transcriptRef "sess_2026-05-31_18-04.jsonl:offset_8419" .
 }
 ```
 
-ActionBuffer result update:
-
-```turtle
-GRAPH <... working ...> {
-  cog:wm_050 cogt:resultOutcome "delivered" ;
-             cogt:resultAt      "2026-05-31T18:04:35.121Z"^^xsd:dateTime .
-}
-```
+There is no action result to record: a tool call would add an `action-result`
+entry (with `outcome`, `durationMs`) to the `actionBuffer`; working-memory
+entries are never updated in place.
 
 Phase 5 ends. Duration **2.7 s** (mostly stream).
 
@@ -433,9 +433,9 @@ Phase 5 ends. Duration **2.7 s** (mostly stream).
 ```sparql
 PREFIX cogt: <urn:shared:ontology#cog/>
 WITH <urn:ontofelia:cog:goals:sess_2026-05-31_18-04>
-DELETE { cog:goal_2026-05-31T18-04-32Z_001 cogt:status "active" }
-INSERT { cog:goal_2026-05-31T18-04-32Z_001 cogt:status     "resolved" ;
-                                           cogt:resolvedAt "2026-05-31T18:04:35.122Z"^^xsd:dateTime }
+DELETE { cog:goal:6d2e9f80 cogt:goalStatus "active" }
+INSERT { cog:goal:6d2e9f80 cogt:goalStatus "resolved" ;
+                           cogt:resolvedAt "2026-05-31T18:04:35.122Z"^^xsd:dateTime }
 WHERE  {}
 ```
 
@@ -443,8 +443,8 @@ WHERE  {}
 
 ```turtle
 GRAPH <urn:ontofelia:cog:meta> {
-  cog:meta_2026-05-31T18-04-35Z_001 a cogt:ReflectiveMarker ;
-      cogt:reflectsOn   cog:cycle_2026-05-31T18-04-32Z_001 ;
+  cog:marker:2f7c4a19 a cogt:ReflectiveMarker ;
+      cogt:reflectsOn   cog:cycle:cyc-0001 ;
       cogt:createdAt    "2026-05-31T18:04:35.125Z"^^xsd:dateTime ;
       cogt:cycleStatus  "completed" ;
       cogt:goalProgress "RefreshContextOnTopic resolved within cycle; parent WriteConceptDoc still active" ;
@@ -460,33 +460,37 @@ GRAPH <urn:ontofelia:cog:meta> {
 
 ### 9.3 Carry-over to next cycle
 
-Carried entries (decay factor 0.7):
+Carried entries (decay factor 0.7). The carry runs when the next turn of the
+session and user is processed: it reads this cycle's entries, copies them into
+the next cycle's graph and marks this graph closed (§9.4).
 
 | Entry | From | To | salience(after) |
 |---|---|---|---|
-| `wm_040` (capability) | cog:selfBuffer | next cycle's selfBuffer | 0.42 |
-| `wm_041` (constraint) | cog:selfBuffer | next cycle's selfBuffer | 0.63 |
-| `wm_031` (parent goal) | cog:goalBuffer | next cycle's goalBuffer | 0.49 |
-| `wm_meta_001` (no carry on this one since not carryForward) | drop | — | — |
+| `wm:040` (capability) | selfBuffer | next cycle's selfBuffer | 0.42 |
+| `wm:041` (constraint) | selfBuffer | next cycle's selfBuffer | 0.63 |
+| `wm:031` (parent goal) | goalBuffer | next cycle's goalBuffer | 0.49 |
+| `wm:meta-001` (no carry on this one since not carryForward) | drop | — | — |
 
 ### 9.4 Cycle close
 
+The cycle record of §3 is written now, in one update, with
+`cogt:cycleStatus "completed"` and `cogt:endedAt "2026-05-31T18:04:35.130Z"`.
+There is no stored total: the duration is `endedAt` minus `startedAt`.
+
+The per-cycle WM graph is **not dropped**. When the next turn of the session
+copies the carry-over, it marks this graph closed with one triple on the graph
+resource, and nothing is deleted:
+
 ```turtle
-GRAPH <urn:ontofelia:cog:cycles:sess_2026-05-31_18-04> {
-  cog:cycle_2026-05-31T18-04-32Z_001 cogt:status   "completed" ;
-                                     cogt:endedAt  "2026-05-31T18:04:35.130Z"^^xsd:dateTime ;
-                                     cogt:totalMs  5083 .
+GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cyc-0001> {
+  <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cyc-0001>
+      cogt:closedAt "2026-05-31T18:04:51.220Z"^^xsd:dateTime .
 }
 ```
 
-The per-cycle WM graph is **dropped** after carry-over copies are made:
-
-```sparql
-DROP GRAPH <urn:ontofelia:cog:working:sess_2026-05-31_18-04:cycle_2026-05-31T18-04-32Z_001>
-```
-
-(Carried-forward entries already live in the *next* cycle's WM graph, so
-nothing is lost.)
+The age-based sweep (`/cog cleanup`) drops the graph 7 days after its last
+write; the closing triple counts as a write. Carried-forward entries already
+live in the *next* cycle's WM graph, so nothing is lost.
 
 Phase 6 ends. Duration **47 ms**.
 
@@ -518,12 +522,11 @@ answers it.
 PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?goal ?goalLabel ?fact ?factSource ?episode ?episodeText WHERE {
 
-  # The action that was delivered:
-  GRAPH ?wmGraph {
-    ?action cogt:writtenTo cogt:actionBuffer ;
-            cogt:actionType "text-response" ;
-            cogt:forGoal    ?goal ;
-            cogt:resultOutcome "delivered" .
+  # The response that was delivered, the goal it served and the cycle it ran in:
+  GRAPH <urn:ontofelia:cog:episodic> {
+    ?response cogt:episodeType "response-sent" ;
+              cogt:cycleId     ?cycleId ;
+              cogt:partOfGoal  ?goal .
   }
 
   # The goal that motivated it:
@@ -533,7 +536,7 @@ SELECT ?goal ?goalLabel ?fact ?factSource ?episode ?episodeText WHERE {
 
   # Facts that were above-threshold in WM at the time:
   GRAPH ?wmGraph {
-    ?factEntry cogt:writtenTo cogt:retrievalBuffer ;
+    ?factEntry cogt:writtenTo "retrievalBuffer" ;
                cogt:entryKind "fact" ;
                cogt:payload   ?fact ;
                cogt:sourceGraph ?factSource ;
@@ -544,16 +547,17 @@ SELECT ?goal ?goalLabel ?fact ?factSource ?episode ?episodeText WHERE {
   # Optional: episodes brought into retrievalBuffer:
   OPTIONAL {
     GRAPH ?wmGraph {
-      ?epEntry cogt:writtenTo cogt:retrievalBuffer ;
+      ?epEntry cogt:writtenTo "retrievalBuffer" ;
                cogt:entryKind "episode-ref" ;
                cogt:refersTo  ?episode .
     }
     GRAPH <urn:ontofelia:cog:episodic> {
-      ?episode cogt:rawText ?episodeText .
+      ?episode cogt:payload ?episodeText .
     }
   }
 
   FILTER(STRSTARTS(STR(?wmGraph),    "urn:ontofelia:cog:working:"))
+  FILTER(STRENDS(STR(?wmGraph), CONCAT(":", ?cycleId)))
   FILTER(STRSTARTS(STR(?goalsGraph), "urn:ontofelia:cog:goals:"))
 }
 ```
@@ -583,7 +587,7 @@ verified during implementation:
 - The `cogt:SkillTrace` writes — none in this cycle because no tool was
   called.
 - The full Phase 4 LLM provider call (request/response bodies).
-- The `cog:phase_001_*` `cogt:phaseInput` / `cogt:phaseOutput` triples;
+- The `cog:cycle:cyc-0001_*` `cogt:phaseInput` / `cogt:phaseOutput` triples;
   conceptually they link to the WM entry IDs above.
 - The procedural-suggestion adherence flag (omitted because no tool was
   called).

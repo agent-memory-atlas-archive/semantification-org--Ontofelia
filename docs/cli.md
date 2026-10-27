@@ -125,11 +125,22 @@ Manage channel pairing requests (Telegram/Discord user approval).
 ```bash
 ontofelia pairing list                     # Show pending requests
 ontofelia pairing list telegram            # Filter by channel
-ontofelia pairing approve <code>           # Approve a user
+ontofelia pairing approve <code> [--yes]   # Approve a user (asks for confirmation unless --yes)
 ontofelia pairing reject <code>            # Reject a user
 ```
 
 When a new Telegram/Discord user messages the bot, they get a pairing code. The admin must approve it via this command before the user can chat.
+
+What approval grants depends on `channels.telegram.ownerId` in `ontofelia.json5`:
+
+- **`ownerId` set** (your Telegram user id): only that account is the owner. Every other approved Telegram user gets their own identity (`telegram:<id>`) and a private memory, without owner rights: no owner commands (`/goals`, `/initiative`, `/reseed-persona`), no host tools (`exec`, `fs_read`, `fs_write`, `fs_list`, `cron_manage` and the other host-only tools are neither offered nor run, even if they are on `tools.allow`), no owner-only tools such as `notify_owner`, no access to the owner's memory, and they cannot press the Guardian approval buttons.
+- **`ownerId` not set** (legacy mode, and a warning is logged when the gateway starts): every approved Telegram account is treated as the owner. That person gets the same rights as you: shell access on the host through the agent (the `exec` tool), owner commands, and access to the owner's private memory. Only approve accounts that belong to you.
+
+Discord users are never treated as the owner.
+
+To find your Telegram user id, message the bot with `/pair` from your own account and run `ontofelia pairing list telegram`: the number in parentheses is the sender id. A bot such as @userinfobot also shows it. Then set `channels.telegram.ownerId` to that value (a string of digits; a bare number is accepted too) and restart the gateway. Your own account must still be approved.
+
+`pairing approve` prints the warning that matches the current configuration and asks for confirmation. Use `--yes` to skip the prompt; without a terminal (for example in scripts) the command refuses unless `--yes` is given.
 
 ---
 
@@ -206,7 +217,7 @@ ontofelia cron remove <id>
 ontofelia cron run <id>                    # Trigger a job manually
 
 ontofelia webhooks list
-ontofelia webhooks create                  # Interactive: name, path, auth method, secret
+ontofelia webhooks create                  # Interactive: name, path, auth method, secret, host tools (default off)
 ontofelia webhooks delete <id>
 ```
 
@@ -236,6 +247,10 @@ ontofelia ontology rollback <version>      # Roll back to a version (e.g. v001)
 
 ontofelia reasoning conflicts              # Show detected knowledge conflicts
 ontofelia reasoning reflect                # Trigger a memory reflection manually
+ontofelia reasoning gate                   # Show the reasoning gate setting (off by default)
+ontofelia reasoning gate --threshold 20000 # Skip synchronous reasoning above 20 000 ABox triples
+ontofelia reasoning gate --off             # Turn the gate off again
+ontofelia reasoning catchup [--force]      # Rebuild the inferred graphs now if the gate left them stale
 ```
 
 ---
@@ -279,7 +294,7 @@ ontofelia daemon uninstall
 ```bash
 ontofelia data-reset [--yes]               # Delete conversations + knowledge graph; keep LLM/Telegram settings
 ontofelia reset [--yes] [--keep-config]    # Factory reset: all data, re-seeds from bootstrap
-ontofelia rebuild [--no-restart]           # Recompile all packages and restart the gateway
+ontofelia rebuild [--no-restart]           # Install changed dependencies, recompile all packages, restart the gateway
 ontofelia uninstall [--yes] [--keep-data]  # Remove Ontofelia from this system
 ```
 
@@ -303,7 +318,9 @@ These commands are available inside any chat session (Web UI, Telegram):
 | `/skills` | List installed skills |
 | `/skill <name> [input]` | Execute a skill |
 | `/plugins` | List installed plugins |
-| `/cog [health\|retain\|consolidate\|scan\|migrate\|debug on\|debug off\|cycles\|explain <cycleId>]` | Cognitive-architecture maintenance and inspection |
+| `/cog [health\|defaults [apply]\|flags\|flag <name> on\|off\|retain\|consolidate\|consolidate-episodes\|cleanup\|scan\|migrate\|debug on\|debug off\|cycle on\|cycle off\|cycles\|explain [cycleId]]` | Cognitive-architecture maintenance and inspection; owner-only. `migrate`, `debug on\|off`, `flags`, `flag <name> on\|off`, `defaults apply` and `cycle on\|off` change settings and need a live owner turn (`cycle on\|off` switches the cycle manager, needed by `arm_goal`). The others (`health`, `defaults`, `retain`, `consolidate`, `consolidate-episodes`, `cleanup`, `scan`, `cycles`, `explain`) also run from a scheduler envelope, as the daily jobs do |
+| `/goals` | List the agent's goals (owner-only) |
+| `/initiative [on\|off\|help]` | Self-initiated cycles: report, or switch on/off (owner-only) |
 | `/stop` | Stop the agent |
 | `/help` | Show available commands |
 

@@ -15,6 +15,12 @@ export interface WebhookConfig {
   maxPayloadBytes: number; // Default: 1MB
   createdAt: string;
   replayWindowMs: number;  // Default: 300000 (5 Min)
+  /**
+   * Opt-in: lets the agent use host tools (files, shell) when handling this
+   * webhook. Absent or false means none. Read only from this stored record,
+   * never from a request.
+   */
+  allowHostTools?: boolean;
 }
 
 export class WebhookRegistry {
@@ -58,6 +64,9 @@ export class WebhookRegistry {
   }
 
   async create(config: Omit<WebhookConfig, 'id' | 'createdAt'>): Promise<WebhookConfig> {
+    if (config.allowHostTools !== undefined && typeof config.allowHostTools !== 'boolean') {
+      throw new Error('allowHostTools must be a boolean');
+    }
     const id = crypto.randomUUID();
     const newWebhook: WebhookConfig = {
       ...config,

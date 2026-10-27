@@ -1,4 +1,6 @@
 import { ToolDefinition, ToolPermission, ToolContext, ToolResult } from '@ontofelia/core';
+import * as fs from 'fs';
+import * as path from 'path';
 import { SandboxAdapter } from '@ontofelia/sandbox';
 
 export class ExecTool implements ToolDefinition {
@@ -54,6 +56,100 @@ export class ExecTool implements ToolDefinition {
     return null;
   }
 
+  // Install/build-like commands. Two overlapping runs on the same workspace
+  // corrupt each other (node_modules, dist, target) and stack up on retries.
+  //
+  // This is a narrow, explicit heuristic, not a shell parser. It looks at each
+  // segment of a command chained with `&&`, `||`, `;`, `|` or a newline, after
+  // optional leading `VAR=value` assignments. Between the package manager and
+  // the verb it accepts any number of option tokens (`-r`, `--long`,
+  // `--long=value`) and the value-taking options `--filter`/`-F`, `--dir`/`-C`,
+  // `--prefix`, `--cwd`, `-w`, `--workspace` followed by one value; for yarn also
+  // `workspace <pkg>`. A value-taking option is first read as taking a value
+  // and, if that leaves no verb, as a plain flag (so `pnpm -w install` still
+  // matches). Consequence: a package literally named like a verb, as in
+  // `pnpm --filter build test`, is read as a plain flag followed by the verb
+  // `build` and is refused as a build. That false refusal is accepted; the
+  // opposite error (letting a real build through) is not.
+  // It does NOT see through subshells, `bash -c "..."`, wrapper scripts, flags
+  // between `run` and `build` (`pnpm run --filter x build`), `make`,
+  // `docker build` and the like: those are simply not guarded. Arbitrary other
+  // commands are never affected.
+  private static readonly BUILD_SEGMENT_PATTERNS: RegExp[] = (() => {
+    const env = String.raw`^(?:\w+=\S*\s+)*`;
+    const end = String.raw`(?=\s|$)`;
+    const valueOpt = String.raw`(?:--filter|-F|--dir|-C|--prefix|--cwd|-w|--workspace)\s+\S+`;
+    const opts = String.raw`(?:\s+(?:${valueOpt}|-\S+))*`;
+    const verb = String.raw`\s+(?:install|i|ci|add|build|rebuild|run\s+build)${end}`;
+    return [
+      new RegExp(`${env}(?:pnpm|npm|yarn)${opts}${verb}`),
+      new RegExp(`${env}yarn${opts}\\s+workspace\\s+\\S+\\s+(?:install|add|build|rebuild|run\\s+build)${end}`),
+      new RegExp(`${env}turbo\\s+(?:run\\s+)?build${end}`),
+      new RegExp(`${env}cargo\\s+build${end}`),
+      new RegExp(`${env}npx\\s+tsc\\s+-b${end}`),
+    ];
+  })();
+
+  /** True if any chained part of the command is an install/build-like run. */
+  static isBuildLike(command: string): boolean {
+    return command
+      .split(/&&|\|\||[;|\n]/)
+      .map((seg) => seg.trim())
+      .some((seg) => ExecTool.BUILD_SEGMENT_PATTERNS.some((re) => re.test(seg)));
+  }
+
+  // Lock keys (workspace or repo roots) that currently have an install/build
+  // running. Module level state, shared by every ExecTool instance in this
+  // process. It guards only within one process: a CLI run beside the gateway
+  // is not covered.
+  private static readonly activeBuilds = new Set<string>();
+
+  /** True if `dir` is a workspace or repo root marker location. */
+  private static isRootMarkerDir(dir: string): boolean {
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return true;
+    // `.git` is a directory in a clone and a file in a git worktree.
+    if (fs.existsSync(path.join(dir, '.git'))) return true;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as unknown;
+      if (pkg && typeof pkg === 'object' && 'workspaces' in pkg) {
+        const ws = (pkg as { workspaces?: unknown }).workspaces;
+        if (ws && typeof ws === 'object') return true;
+      }
+    } catch {
+      // missing, unreadable or invalid package.json: not a marker
+    }
+    return false;
+  }
+
+  /**
+   * Lock key: the workspace or repo root of the working directory. The cwd is
+   * resolved (symlinks included) and the walk goes up to the first directory
+   * holding pnpm-workspace.yaml, a package.json with a `workspaces` field, or
+   * .git (directory or file). Without any marker the key is the cwd itself.
+   *
+   * Two runs from the root and from a package directory of one workspace touch
+   * the same node_modules and lockfile, so they must share one key. The
+   * consequence is conservative: two separate projects inside one git repo
+   * also share a lock. Over-locking is the accepted direction. Synchronous on
+   * purpose: the caller checks and acquires without an await in between.
+   */
+  static buildLockKey(cwd: string): string {
+    const abs = path.resolve(cwd);
+    let start = abs;
+    try {
+      start = fs.realpathSync(abs);
+    } catch {
+      // cwd does not exist (yet): fall back to the resolved path
+    }
+    let dir = start;
+    for (;;) {
+      if (ExecTool.isRootMarkerDir(dir)) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) return start;
+      dir = parent;
+    }
+  }
+
   inputSchema = {
     type: 'object',
     properties: {
@@ -92,6 +188,47 @@ export class ExecTool implements ToolDefinition {
       };
     }
 
+    // Same cwd the command will run in (see the sandbox.exec call below).
+    const runCwd = data.cwd || context.workspacePath || process.cwd();
+    let lockKey: string | null = null;
+    if (ExecTool.isBuildLike(data.command ?? '')) {
+      const key = ExecTool.buildLockKey(runCwd);
+      if (ExecTool.activeBuilds.has(key)) {
+        const message =
+          `A build or install is already running in ${key}; ` +
+          'wait for it to finish instead of starting another.';
+        return {
+          success: false,
+          output: { exitCode: 126, stdout: '', stderr: message, timedOut: false, durationMs: 0 },
+          auditEntry: {
+            toolName: this.name,
+            timestamp: new Date().toISOString(),
+            duration: 0,
+            input,
+            output: { exitCode: 126, blocked: true, reason: 'build-in-progress' },
+            success: false,
+            permissions: this.permissions,
+          },
+        };
+      }
+      // Check and acquire without an await in between, so it is atomic.
+      ExecTool.activeBuilds.add(key);
+      lockKey = key;
+    }
+
+    try {
+      return await this.runCommand(data, input, context, runCwd);
+    } finally {
+      if (lockKey !== null) ExecTool.activeBuilds.delete(lockKey);
+    }
+  }
+
+  private async runCommand(
+    data: { command: string; cwd?: string; timeout?: number },
+    input: unknown,
+    context: ToolContext,
+    runCwd: string,
+  ): Promise<ToolResult> {
     const sandboxConfig = context.sandboxConfig || { scope: 'off' as const, workspaceAccess: 'rw' as const };
     const instance = await this.sandbox.getOrCreate(
       context.agentId,
@@ -116,7 +253,7 @@ export class ExecTool implements ToolDefinition {
       // Default to the agent's real workspace (which exists); fall back to the
       // process cwd. The previous hard-coded '/workspace' does not exist outside
       // a Docker-sandbox mount and caused `spawn /bin/sh ENOENT`.
-      cwd: data.cwd || context.workspacePath || process.cwd(),
+      cwd: runCwd,
       timeoutMs: effectiveTimeout,
       // Forward the executor's cancellation signal so a tool-timeout actually
       // kills the child process (whole tree) instead of leaving it running.

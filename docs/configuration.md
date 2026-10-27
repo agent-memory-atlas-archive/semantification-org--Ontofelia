@@ -61,18 +61,18 @@ All values shown are the defaults.
     list: []                        // Additional agent definitions
   },
 
-  // Message routing (reserved)
-  routing: {
-    agents: {}
-  },
-
   // Channels (all optional; webchat is always available and needs no config)
   channels: {
     telegram: {
       enabled: false,
       token: "",                    // Bot token from @BotFather
       allowedChats: [],             // Allowed Telegram chat IDs
-      // ownerChatId: "..."
+      // ownerChatId: "...",
+      // Telegram user id of the owner (digits). Only this account is the owner;
+      // other approved users get their own identity without owner rights.
+      // If unset, every approved Telegram user is the owner (a warning is
+      // logged at start). See docs/channels.md.
+      // ownerId: "123456789"
     },
     discord: {
       enabled: false,
@@ -86,28 +86,16 @@ All values shown are the defaults.
     }
   },
 
-  // Message context handling
-  messages: {
-    maxContext: 20,                 // Max messages sent to the LLM
-    truncateAt: 4000                // Truncate individual messages at N characters
-  },
-
   // Session policy
   session: {
     maxHistory: 50,
-    pruneAfterDays: 90,
-    scope: "per-channel-peer"       // "main" | "per-channel-peer"
-  },
-
-  // Chat command handling
-  commands: {
-    prefix: "/",
-    allowAdminOnly: false
+    pruneAfterDays: 90
   },
 
   // Tool and security policy
   tools: {
     allow: [],                      // Explicitly allowed host-only tools, e.g. ["exec"]
+                                    // (never for a non-owner person on a chat channel)
     deny: []                        // Explicitly denied tools
   },
   plugins: {
@@ -115,7 +103,6 @@ All values shown are the defaults.
     allowUntrusted: false           // Development-only escape hatch
   },
   security: {
-    requireGuardian: true,          // Require operator approval for guarded tool calls
     guardianTimeoutMs: 60000
   },
 
@@ -168,7 +155,7 @@ All values shown are the defaults.
 }
 ```
 
-> **Note:** A few sections are accepted by the schema but not yet honored by the runtime: `messages`, `routing`, `commands`, and `session.scope` currently run on their built-in defaults regardless of what you configure. They validate fine; they just have no effect yet.
+Keys the schema does not know are ignored when the file is loaded, so a config file that still contains removed options (`messages`, `routing`, `commands`, `session.scope`, `security.requireGuardian`) keeps loading; those options never had any effect and are dropped.
 
 ## Environment Variables
 

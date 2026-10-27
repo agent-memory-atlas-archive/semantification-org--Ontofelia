@@ -72,15 +72,20 @@ export const configSchema = z.object({
     },
     list: []
   }),
-  routing: z.object({
-    agents: z.record(z.string(), z.unknown()).default({})
-  }).default({ agents: {} }),
   channels: z.object({
     telegram: z.object({
       enabled: z.boolean().default(false),
       token: z.string().optional(),
       allowedChats: z.array(z.string()).default([]),
       ownerChatId: z.string().optional(),
+      // Telegram user id of the owner (digits). Only this account is treated as
+      // the owner; every other approved account gets its own identity without
+      // owner rights. A bare number in JSON5 is accepted and normalised to a
+      // string. When unset, every approved account is the owner (legacy mode).
+      ownerId: z.union([
+        z.string().regex(/^[0-9]+$/, 'must be a Telegram user id (digits only)'),
+        z.number().int().positive().transform((n) => String(n)),
+      ]).optional(),
       // Show a live "thinking"/progress status message that updates along the
       // agent's processing phases (in addition to the always-on typing
       // indicator). Defaults to on when unset; set false to keep the chat
@@ -99,19 +104,10 @@ export const configSchema = z.object({
       accessToken: z.string().optional(),
     }).optional(),
   }).default({}),
-  messages: z.object({
-    maxContext: z.number().default(20),
-    truncateAt: z.number().default(4000)
-  }).default({ maxContext: 20, truncateAt: 4000 }),
   session: z.object({
     maxHistory: z.number().default(50),
     pruneAfterDays: z.number().default(90),
-    scope: z.enum(['main', 'per-channel-peer']).default('per-channel-peer'),
-  }).default({ maxHistory: 50, pruneAfterDays: 90, scope: 'per-channel-peer' }),
-  commands: z.object({
-    prefix: z.string().default('/'),
-    allowAdminOnly: z.boolean().default(false)
-  }).default({ prefix: '/', allowAdminOnly: false }),
+  }).default({ maxHistory: 50, pruneAfterDays: 90 }),
   tools: z.object({
     allow: z.array(z.string()).default([]),
     deny: z.array(z.string()).default([])
@@ -121,7 +117,6 @@ export const configSchema = z.object({
     allowUntrusted: z.boolean().default(false)
   }).default({ trusted: [], allowUntrusted: false }),
   security: z.object({
-    requireGuardian: z.boolean().default(true),
     guardianTimeoutMs: z.number().default(60000),
     // Directories the agent must never mutate (self-source-write / self-git
     // protection). Empty = protect the directory the gateway runs from
@@ -130,7 +125,7 @@ export const configSchema = z.object({
     // OWNER escape hatch: disables the self-source-write and self-git hard
     // blocks. Logged as a startup warning when enabled.
     allowSelfSourceWrites: z.boolean().default(false)
-  }).default({ requireGuardian: true, guardianTimeoutMs: 60000, protectedRoots: [], allowSelfSourceWrites: false }),
+  }).default({ guardianTimeoutMs: 60000, protectedRoots: [], allowSelfSourceWrites: false }),
   // Owner-notification policy (docs/initiative-architecture.md §7). All fields
   // are governed by the NotificationService, not the LLM: the service evaluates
   // the daily cap and quiet hours BEFORE any send and queues suppressed items as
@@ -151,7 +146,6 @@ export const configSchema = z.object({
     target: z.string().optional(),
     // Separate, higher budget reserved for the (future) approval-request path
     // so approval prompts are not starved by ordinary notifications (§8).
-    approvalMaxPerDay: z.number().int().min(0).default(10),
   }).superRefine((n, ctx) => {
     // Fail config load early with a clear message rather than throwing deep in
     // the notification path (H1) or silently disabling quiet hours (L3).
@@ -173,7 +167,7 @@ export const configSchema = z.object({
         }
       }
     }
-  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high', approvalMaxPerDay: 10 }),
+  }).default({ maxPerDay: 5, minPriorityDuringQuietHours: 'high' }),
   memory: z.object({
     backend: z.enum(['fuseki', 'oxigraph', 'memory']).default('oxigraph'),
     triplestore: z.object({
@@ -225,7 +219,9 @@ export const configSchema = z.object({
       trackConfidence: true,
       trackSource: true
     }),
-    sparqlExposed: z.boolean().default(false)
+    sparqlExposed: z.boolean().default(false),
+    /** Deadline for queries sent to POST /api/knowledge/sparql (clamped to 100..60000 ms by the gateway). */
+    sparqlTimeoutMs: z.number().int().default(5000)
   }).default({
     backend: 'oxigraph',
     triplestore: {
@@ -255,7 +251,8 @@ export const configSchema = z.object({
       trackConfidence: true,
       trackSource: true
     },
-    sparqlExposed: false
+    sparqlExposed: false,
+    sparqlTimeoutMs: 5000
   }),
   provider: z.object({
     name: z.string().default('mock'),
@@ -263,6 +260,7 @@ export const configSchema = z.object({
     baseUrl: z.string().optional(),
     defaultModel: z.string().default('mock'),
     aliases: z.record(z.string(), z.string()).default({}),
+    models: z.array(z.string()).optional(),
     maxTokens: z.number().optional(),
     temperature: z.number().optional(),
     timeout: z.number().optional(),

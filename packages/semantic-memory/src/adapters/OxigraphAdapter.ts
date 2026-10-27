@@ -4,6 +4,9 @@ import * as fs from 'fs/promises';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { sparqlIri } from '../utils/SparqlSyntax.js';
+import { sparqlTripleLine } from '../utils/TripleSyntax.js';
+import { convertOxigraphResult } from './oxigraphResult.js';
 
 /**
  * Adapter for the embedded Oxigraph triplestore.
@@ -18,6 +21,15 @@ import * as os from 'os';
  * To still provide persistence we serialise the whole dataset to an
  * N-Quads file inside `dataDir` and reload it on startup. Every mutating
  * operation flushes back to that file.
+ *
+ * Persistence model: a mutating call changes the in-memory store, then awaits a
+ * flush (full N-Quads dump, temp file, atomic rename). Flushes run one at a
+ * time. Concurrent writes that arrive before a queued flush has started share
+ * that flush, so a burst of N writes costs one or two dumps instead of N. Each
+ * caller's promise still resolves only after a flush that started after its own
+ * write has completed, so durability is "after the awaited write resolves".
+ * A crash before that point loses the in-flight writes, as it always did. See
+ * `flush()` for the exact guarantee and the error behaviour.
  */
 export class OxigraphAdapter implements TriplestoreAdapter {
   readonly backend = 'oxigraph';
@@ -27,8 +39,18 @@ export class OxigraphAdapter implements TriplestoreAdapter {
   private dataDir!: string;
   private dataFile!: string;
 
+  /** Depth of nested/overlapping `batch()` calls currently in progress. */
+  private batchDepth = 0;
+  /** Set when a write happened while `batchDepth > 0` and flush was deferred. */
+  private dirty = false;
+
   /** Serialised N-Quads format string understood by oxigraph. */
   private static readonly NQUADS_MIME = 'application/n-quads';
+
+  /** Absolute path of the N-Quads file this adapter keeps in sync after every mutation. */
+  get dataFilePath(): string {
+    return this.dataFile;
+  }
 
   async initialize(config: TriplestoreConfig): Promise<void> {
     this.config = config;
@@ -62,9 +84,62 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     this.status = 'running';
   }
 
-  /** Serialise the full dataset back to disk. */
-  private async flush(): Promise<void> {
+  /** Tail of the flush queue: writers share one temp file, so flushes must not overlap. */
+  private flushTail: Promise<void> = Promise.resolve();
+
+  /**
+   * The flush that is queued but has not started yet, if any. A write that
+   * arrives while it is set joins it instead of queueing another flush.
+   */
+  private pendingFlush: Promise<void> | null = null;
+
+  /**
+   * Serialise the full dataset back to disk, coalescing concurrent requests.
+   *
+   * Guarantee (the durability contract for callers): every caller mutates the
+   * in-memory store first, synchronously, and only then calls flush(). The
+   * promise it gets back resolves only after a flush that STARTED after that
+   * mutation has COMPLETED (dump, write and rename). Why this holds:
+   *  - a flush marks itself as started (clears `pendingFlush`) immediately
+   *    before it dumps, in the same synchronous step, so every write that
+   *    joins a pending flush happened before that dump and is part of it;
+   *  - a write that comes after the dump has started finds no pending flush and
+   *    queues a new one, which runs after the current one (flushes never
+   *    overlap and share one temp file);
+   *  - the dump always reads the latest state, so the last flush to finish
+   *    leaves the latest state on disk.
+   * If a flush fails, every caller that joined it gets the rejection; the next
+   * write queues a fresh flush and tries again.
+   *
+   * Durability is "after the awaited write resolves". A crash before that
+   * loses the in-flight writes, exactly as before coalescing.
+   */
+  private flush(): Promise<void> {
+    if (this.pendingFlush) return this.pendingFlush;
+    const run = this.flushTail.then(() => {
+      this.pendingFlush = null; // started: later writes need their own flush
+      return this.flushNow();
+    });
+    this.pendingFlush = run;
+    this.flushTail = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Number of full-dataset dumps written to disk since this adapter started. */
+  private dumpsWritten = 0;
+
+  /**
+   * Read-only counter of full-dataset dumps (one per completed flush attempt,
+   * after coalescing) since this adapter started. Numbers only; used by the
+   * soak metrics to estimate dumps per turn. It is never reset.
+   */
+  get dumpCount(): number {
+    return this.dumpsWritten;
+  }
+
+  private async flushNow(): Promise<void> {
     try {
+      this.dumpsWritten++;
       const nquads = this.store.dump({ format: OxigraphAdapter.NQUADS_MIME });
       // Atomic write: write to a temp file then rename
       const tmp = `${this.dataFile}.tmp`;
@@ -72,6 +147,45 @@ export class OxigraphAdapter implements TriplestoreAdapter {
       await fs.rename(tmp, this.dataFile);
     } catch (e) {
       throw new Error(`Failed to persist Oxigraph dataset: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Persist now, unless a `batch()` is in progress — then just mark the
+   * store dirty so the outermost `batch()` flushes once on the way out.
+   */
+  private async persistOrDefer(): Promise<void> {
+    if (this.batchDepth === 0) {
+      await this.flush();
+    } else {
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * Run `fn` with all writes it performs (directly, or via nested write
+   * calls / nested `batch()` calls) coalesced into a single `flush()` once
+   * the OUTERMOST batch ends — this is what lets `KnowledgeEngine.storeFact()`
+   * persist once instead of once per internal write.
+   *
+   * Durability note: if the process crashes mid-batch, the disk is left at
+   * the state from before the batch started (no partially-written fact ever
+   * reaches disk) — the deferred flush simply never ran. If `fn` throws, the
+   * `finally` below still flushes whatever was written in memory before the
+   * throw (same as today's per-call behaviour, where a later write in a
+   * multi-write operation failing still leaves earlier writes persisted) —
+   * there is no in-memory rollback on error, mid-batch or not.
+   */
+  async batch<T>(fn: () => Promise<T>): Promise<T> {
+    this.batchDepth++;
+    try {
+      return await fn();
+    } finally {
+      this.batchDepth--;
+      if (this.batchDepth === 0 && this.dirty) {
+        this.dirty = false;
+        await this.flush();
+      }
     }
   }
 
@@ -95,64 +209,12 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     };
   }
 
-  async query(sparql: string, _namedGraph?: string): Promise<SparqlResult> {
+  async query(sparql: string, namedGraph?: string): Promise<SparqlResult> {
     try {
-      const result = this.store.query(sparql);
-
-      // oxigraph returns: boolean (ASK), Map<string,Term>[] (SELECT) or
-      // Quad[] (CONSTRUCT/DESCRIBE). Both SELECT and CONSTRUCT are arrays,
-      // so distinguish by the row type: SELECT rows are Map, CONSTRUCT rows
-      // are Quad objects (which expose a `subject` field).
-      if (typeof result === 'boolean') {
-        return { type: 'boolean', boolean: result };
-      }
-
-      const isBindings = Array.isArray(result) &&
-        (result.length === 0 || result[0] instanceof Map);
-
-      if (isBindings) {
-        const rows = result as Map<string, import('oxigraph').Term>[];
-        let variables: string[] = [];
-        if (rows.length > 0) {
-          variables = [...rows[0].keys()];
-        }
-
-        const bindings = rows.map(row => {
-          const bindingObj: Record<string, import('@ontofelia/core').RdfTerm> = {};
-          for (const [key, value] of row.entries()) {
-            if (value.termType === 'NamedNode') {
-              bindingObj[key] = { type: 'uri', value: value.value };
-            } else if (value.termType === 'Literal') {
-              bindingObj[key] = { type: 'literal', value: value.value, language: value.language, datatype: value.datatype?.value };
-            } else if (value.termType === 'BlankNode') {
-              bindingObj[key] = { type: 'bnode', value: value.value };
-            }
-          }
-          return bindingObj;
-        });
-
-        return {
-          type: 'bindings',
-          variables,
-          bindings
-        };
-      }
-      // CONSTRUCT or DESCRIBE — an array of Quads
-      {
-        // Format to Turtle
-        let graphStr = '';
-        type RdfTerm = { termType: string; value: string; language?: string; datatype?: { value: string } };
-        type RdfQuad = { subject: RdfTerm; predicate: RdfTerm; object: RdfTerm };
-        for (const quad of (result as Iterable<RdfQuad>)) {
-            const subject = quad.subject.termType === 'NamedNode' ? `<${quad.subject.value}>` : `_:${quad.subject.value}`;
-            const predicate = `<${quad.predicate.value}>`;
-            const object = quad.object.termType === 'NamedNode' ? `<${quad.object.value}>` :
-                           quad.object.termType === 'Literal' ? `"${quad.object.value.replace(/"/g, '\\"')}"` + (quad.object.language ? `@${quad.object.language}` : (quad.object.datatype && quad.object.datatype.value !== 'http://www.w3.org/2001/XMLSchema#string' ? `^^<${quad.object.datatype.value}>` : '')) :
-                           `_:${quad.object.value}`;
-            graphStr += `${subject} ${predicate} ${object} .\n`;
-        }
-        return { type: 'graph', graph: graphStr };
-      }
+      const result = namedGraph
+        ? this.store.query(sparql, { default_graph: oxigraph.namedNode(namedGraph) })
+        : this.store.query(sparql);
+      return convertOxigraphResult(result);
     } catch (e) {
       throw new Error(`SPARQL Query failed in Oxigraph: ${(e as Error).message}`);
     }
@@ -161,7 +223,7 @@ export class OxigraphAdapter implements TriplestoreAdapter {
   async update(sparql: string): Promise<void> {
     try {
       this.store.update(sparql);
-      await this.flush();
+      await this.persistOrDefer();
     } catch (e) {
       throw new Error(`SPARQL Update failed in Oxigraph: ${(e as Error).message}`);
     }
@@ -169,7 +231,7 @@ export class OxigraphAdapter implements TriplestoreAdapter {
 
   async getGraph(graphUri: string, _format: RdfFormat = 'turtle'): Promise<string> {
     // Construct query for a single graph
-    const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`;
+    const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ${sparqlIri(graphUri)} { ?s ?p ?o } }`;
     const result = await this.query(sparql);
     return result.graph || '';
   }
@@ -182,61 +244,32 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     try {
       const graphNode = oxigraph.namedNode(graphUri);
       this.store.load(data, { format: mime, to_graph_name: graphNode });
-      await this.flush();
+      await this.persistOrDefer();
     } catch (e) {
       throw new Error(`putGraph failed in Oxigraph: ${(e as Error).message}`);
     }
   }
 
   async deleteGraph(graphUri: string): Promise<void> {
-    const sparql = `CLEAR GRAPH <${graphUri}>`;
+    const sparql = `CLEAR GRAPH ${sparqlIri(graphUri)}`;
     await this.update(sparql);
-  }
-
-  private formatObject(obj: Triple['object']): string {
-    if (typeof obj === 'string') {
-      if (obj.startsWith('http://') || obj.startsWith('https://') || obj.startsWith('urn:')) {
-        return `<${obj}>`;
-      }
-      return `"${obj.replace(/"/g, '\\"')}"`;
-    }
-
-    if (obj.type === 'uri') {
-      return `<${obj.value}>`;
-    }
-
-    let literal = `"${obj.value.replace(/"/g, '\\"')}"`;
-    if (obj.language) {
-      literal += `@${obj.language}`;
-    }
-    return literal;
   }
 
   async insertTriples(graphUri: string, triples: Triple[]): Promise<void> {
     if (triples.length === 0) return;
 
-    const lines = triples.map(t => {
-      const s = t.subject.startsWith('_:') ? t.subject : `<${t.subject}>`;
-      const p = `<${t.predicate}>`;
-      const o = this.formatObject(t.object);
-      return `${s} ${p} ${o} .`;
-    }).join('\n');
+    const lines = triples.map(sparqlTripleLine).join('\n');
 
-    const sparql = `INSERT DATA { GRAPH <${graphUri}> { ${lines} } }`;
+    const sparql = `INSERT DATA { GRAPH ${sparqlIri(graphUri)} { ${lines} } }`;
     await this.update(sparql);
   }
 
   async deleteTriples(graphUri: string, triples: Triple[]): Promise<void> {
     if (triples.length === 0) return;
 
-    const lines = triples.map(t => {
-      const s = t.subject.startsWith('_:') ? t.subject : `<${t.subject}>`;
-      const p = `<${t.predicate}>`;
-      const o = this.formatObject(t.object);
-      return `${s} ${p} ${o} .`;
-    }).join('\n');
+    const lines = triples.map(sparqlTripleLine).join('\n');
 
-    const sparql = `DELETE DATA { GRAPH <${graphUri}> { ${lines} } }`;
+    const sparql = `DELETE DATA { GRAPH ${sparqlIri(graphUri)} { ${lines} } }`;
     await this.update(sparql);
   }
 
@@ -249,12 +282,19 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     return this.store.dump({ format: OxigraphAdapter.NQUADS_MIME });
   }
 
-  async importDataset(data: string, format: RdfFormat = 'turtle'): Promise<void> {
-    const mime = format === 'jsonld' ? 'application/ld+json' :
-                 format === 'ntriples' ? 'application/n-triples' :
-                 format === 'rdfxml' ? 'application/rdf+xml' : 'text/turtle';
-    this.store.load(data, { format: mime });
-    await this.flush();
+  async importDataset(data: string, format: RdfFormat = 'turtle', graphUri?: string): Promise<void> {
+    if (format === 'trig') {
+      this.store.load(data, { format: 'application/trig' });
+    } else {
+      if (!graphUri) {
+        throw new Error(`importDataset: format '${format}' carries no graph; pass a target graph URI`);
+      }
+      const mime = format === 'jsonld' ? 'application/ld+json' :
+                   format === 'ntriples' ? 'application/n-triples' :
+                   format === 'rdfxml' ? 'application/rdf+xml' : 'text/turtle';
+      this.store.load(data, { format: mime, to_graph_name: oxigraph.namedNode(graphUri) });
+    }
+    await this.persistOrDefer();
   }
 
   async backup(targetDir: string): Promise<string> {
@@ -277,18 +317,6 @@ export class OxigraphAdapter implements TriplestoreAdapter {
     if (data.trim().length > 0) {
       this.store.load(data, { format: OxigraphAdapter.NQUADS_MIME });
     }
-    await this.flush();
-  }
-
-  async getInferredTriples(_agentId: string): Promise<SparqlResult> {
-    const sparql = `
-      SELECT ?s ?p ?o WHERE {
-        ?s ?p ?o .
-        FILTER NOT EXISTS {
-          GRAPH ?g { ?s ?p ?o }
-        }
-      } LIMIT 1000
-    `;
-    return this.query(sparql);
+    await this.persistOrDefer();
   }
 }

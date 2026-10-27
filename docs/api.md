@@ -281,6 +281,23 @@ List all named graphs of the primary agent with their content.
 }
 ```
 
+#### `POST /api/knowledge/sparql`
+
+Run a read-only SPARQL query. Same bearer-token authentication as the other `/api/` routes.
+
+```json
+{ "query": "SELECT ?s WHERE { GRAPH <urn:shared:ontology> { ?s a ?t } }" }
+```
+
+- Only `SELECT` and `ASK` are accepted. The query must parse; otherwise `400`. `SERVICE` clauses are rejected with `400`.
+- Every triple pattern must be inside a `GRAPH <iri> { ... }` pattern, unless the query has a `FROM <iri>` clause that defines the default graph; otherwise `400`.
+- Only graphs on a closed allowlist may be named, in `GRAPH`, `FROM` or `FROM NAMED`; anything else is rejected with `403`, as are `GRAPH ?var` patterns. The allowlist holds the graphs the agent shows to every user anyway: `urn:shared:ontology`, `urn:shared:meta`, `urn:shared:shapes`, `urn:shared:world` and, per agent, `urn:<agent>:worldview`, `schema`, `inferred`, `self` and `skills`.
+- Refused for every caller: the graphs that collect data derived from every user's messages (`claims`, `evidence`, `conflicts`, `setup`, `urn:shared:claims`, `urn:shared:evidence`, `cog:episodic`, `cog:procedural`, `cog:meta`, `cog:goals:*`, `cog:cycles:*`, `cog:working:*`) and all per-user, per-user-inferred and per-session graphs (`urn:<agent>:user:*`, `urn:<agent>:inferred:user:*`, `urn:<agent>:session:*`). The bearer token does not identify a user, so no caller gets more.
+- `SELECT` returns at most 1000 rows; `truncated` is `true` when more matched.
+- Queries have a deadline, `memory.sparqlTimeoutMs` (default `5000`, clamped to 100..60000 ms). A query that exceeds it is stopped and answered with `504` `{ "error": "Query exceeded the time limit of N ms" }`. With the embedded Oxigraph backend the query runs in a worker thread against a replica of the persisted dataset (reloaded when the data file changes), one query at a time, so a runaway query does not block the gateway; the deadline starts when evaluation starts, not while queued. Other backends run in process and cannot be interrupted (Fuseki aborts its request after 30 s).
+
+Response for `SELECT`: `{ "type": "bindings", "variables": ["s"], "bindings": [{ "s": { "type": "uri", "value": "..." } }], "truncated": false }`. Response for `ASK`: `{ "type": "boolean", "boolean": true }`.
+
 #### `DELETE /api/knowledge?confirm=true`
 
 Clear the entire knowledge graph. Requires `confirm=true`, is rate-limited to once per hour, writes a Turtle backup to `~/.ontofelia/backups/` first, and re-seeds the core ontology. Response: `{ "deleted": true, "backupPath": "...", "timestamp": "..." }`
@@ -308,6 +325,14 @@ List detected knowledge conflicts for the primary agent.
 #### `POST /api/reasoning/reflect`
 
 Trigger a memory reflection run.
+
+#### `GET /api/reasoning/gate` / `PUT /api/reasoning/gate`
+
+Show or set the [reasoning gate](reasoning-gate.md). `GET` returns `{ "asyncThreshold": 0, "staleSince": null, "catchUpRunning": false }` (`0` = off, the default). `PUT` takes `{ "asyncThreshold": 20000 }` (ABox triples above which a stored fact skips the synchronous materialization) or `{ "asyncThreshold": null }` to turn it off, and returns the same object.
+
+#### `POST /api/reasoning/catchup`
+
+Rebuild the inferred graphs now if the gate left them stale (the same call the `reasoning.catchup` cron job makes). `?force=true` rebuilds even when nothing is marked stale. Response: `{ "status": "ran" | "not-stale" | "busy" | "unavailable" | "failed", "shared": 123, "perUser": { "bob": 7 }, "stillStale": false, "staleSince": null }`.
 
 #### Cognitive architecture (observability)
 
@@ -341,11 +366,13 @@ Remove / manually trigger a job.
 
 #### `GET /api/webhooks` / `POST /api/webhooks` / `DELETE /api/webhooks/:id`
 
-Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", ... }`).
+Manage inbound webhook definitions (`{ "name", "path", "secret", "authMethod", "agentId", "prompt", "enabled", "allowHostTools", ... }`). `allowHostTools` is optional and must be a boolean (default `false`); see below.
 
 #### `POST /webhooks/:path`
 
 Inbound webhook receiver (outside `/api/*`; authenticated per webhook via HMAC-SHA256 or Bearer secret, with payload-size and replay protection). The payload is handed to the configured agent as a prompt.
+
+A webhook turn gets no host tools (`exec`, `fs_*`, `cron_manage`, `hostOnly` tools): the payload often comes from third parties and the answer goes back to the caller. Set `"allowHostTools": true` on the webhook definition to re-enable them for that webhook. The flag is read only from the stored definition; a field of that name in a request payload or header has no effect. See [Tools & Security](tools-and-security.md#who-gets-host-tools).
 
 ---
 

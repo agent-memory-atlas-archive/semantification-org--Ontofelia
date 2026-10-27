@@ -5,9 +5,9 @@ import fastifyStatic from '@fastify/static';
 import { OntofeliaConfig } from '@ontofelia/config';
 import { createLogger, AgentConfig, ChannelType, ChannelBinding, MessageEnvelope, PRIMARY_AGENT_ID, resolveAgentId } from '@ontofelia/core';
 import { SessionStore } from '@ontofelia/session-store';
-import { AgentRuntime, InitiativeService, LoggingNotificationSink, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
-import type { InitiativeSessionPort, NotificationChannelPort, NotificationSink } from '@ontofelia/agent-runtime';
-import { NotifyOwnerTool } from '@ontofelia/tools';
+import { AgentRuntime, InitiativeService, NotificationService, INITIATIVE_JOB_PREFIX } from '@ontofelia/agent-runtime';
+import type { InitiativeSessionPort, NotificationChannelPort } from '@ontofelia/agent-runtime';
+import { NotifyOwnerTool, ListGoalsTool, ArmGoalTool, UpdateGoalStepTool } from '@ontofelia/tools';
 import type { SessionOrigin } from '@ontofelia/core';
 import { resolveOwnerTarget } from './services/notificationTarget.js';
 import { MockProvider } from '@ontofelia/testkit';
@@ -19,12 +19,51 @@ import * as os from 'os';
 import { fileURLToPath } from 'url';
 
 import { initTriplestore } from './services/triplestore.js';
+import { REASONING_CATCHUP_JOB, REASONING_CATCHUP_DEFAULT, runReasoningCatchupJob } from './services/reasoningCatchup.js';
 import { initToolRegistry } from './services/tools.js';
 import { initChannels } from './services/channels.js';
 import { initPluginsAndSkills } from './services/plugins.js';
 import type { GatewayContext } from './context.js';
+import { DEFAULT_SYSTEM_PROMPT } from './defaultSystemPrompt.js';
 
 const GATEWAY_GUARD = Symbol.for('ontofelia-gateway-started');
+
+/**
+ * Normalises a raw request URL for prefix decisions: strips the query, decodes percent-encoding
+ * the way the router does, collapses repeated slashes and lowercases. Returns null when the
+ * path cannot be decoded, so callers can fail closed.
+ */
+function normalizeRequestPath(rawUrl: string): string | null {
+  const queryAt = rawUrl.search(/[?#]/);
+  const rawPath = queryAt === -1 ? rawUrl : rawUrl.slice(0, queryAt);
+  try {
+    return decodeURIComponent(rawPath).replace(/\/{2,}/g, '/').toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isPathUnder(rawUrl: string, prefix: string): boolean {
+  const p = normalizeRequestPath(rawUrl);
+  if (p === null) return true;
+  return p === prefix || p.startsWith(prefix + '/');
+}
+
+/** True when the decoded path is the API prefix or below it; undecodable paths count as API. */
+function isApiPath(rawUrl: string): boolean {
+  return isPathUnder(rawUrl, '/api');
+}
+
+/** Serves the built web UI from `webUiDist` and falls back to index.html for non-API, non-WS paths. */
+export async function registerWebUi(fastify: FastifyInstance, webUiDist: string): Promise<void> {
+  await fastify.register(fastifyStatic, { root: webUiDist, prefix: '/' });
+  fastify.setNotFoundHandler(async (request, reply) => {
+    if (!isApiPath(request.url) && !isPathUnder(request.url, '/ws') && !isPathUnder(request.url, '/webhooks')) {
+      return reply.sendFile('index.html');
+    }
+    reply.code(404).send({ error: 'Not found' });
+  });
+}
 
 export async function startGateway(config: OntofeliaConfig): Promise<FastifyInstance> {
   // Guard against dual-package hazard (tsx may resolve this module twice)
@@ -144,13 +183,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     name: 'Ontofelia',
     model: config.agents.defaults.model,
     workspace: config.agents.defaults.workspace,
-    systemPrompt:
-      'You are Ontofelia, an autonomous AI whose long-term memory is a governed knowledge graph. ' +
-      'Use the memory_* tools for ALL memory operations — never exec/curl/shell to read or write memory. ' +
-      'To remember: memory_store. To recall: memory_query / memory_ask / memory_sparql. ' +
-      'To explain a belief: memory_explain. ' +
-      'When the user asks you to FORGET or DELETE a fact, you MUST call memory_retract with that ' +
-      "fact's subject and predicate to hard-delete it from the graph — do not merely acknowledge it.",
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
     memoryPolicy: { autoFlushBeforeCompaction: true, defaultConfidence: 'high', trustUntrustedContent: false },
     sessionPolicy: { scope: 'per-channel-peer' },
     enabledTools: [],
@@ -166,6 +199,9 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   const bootstrapDir = path.resolve(currentDir, '..', '..', '..', 'bootstrap');
   const defaultAgent = new AgentRuntime(PRIMARY_AGENT_ID, defaultAgentConfig, provider, sessionStore, toolRegistry, toolPolicy, auditLog, skillRegistry, skillExecutor, pluginRegistry, config.provider as import('@ontofelia/core').ProviderConfig, knowledgeEngine, bootstrapDir);
   await defaultAgent.initialize();
+  // The agent's state directory (the parent of its sessions) holds the key of the
+  // digests of masked tool arguments.
+  defaultAgent.setStateDir(path.dirname(agentsPath));
 
   const agents = new Map<string, AgentRuntime>();
   agents.set(PRIMARY_AGENT_ID, defaultAgent);
@@ -175,8 +211,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     await initChannels(config, agents);
 
   // --- Owner notification (docs/initiative-architecture.md §7) ---
-  // The governed notification layer. It is the real NotificationSink for
-  // initiative cycles AND backs the notify_owner tool. Constructed here (after
+  // The governed notification layer. It backs the notify_owner tool. Constructed here (after
   // channels) because it needs the channel registry + allowlist to resolve and
   // reach the owner's Telegram chat. Delivery target resolution order:
   //   config.notifications.target ?? channels.telegram.ownerChatId
@@ -228,13 +263,12 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   // is composed after the tool registry). getAllowedTools reads the registry
   // live, so a late registration is picked up on the next message.
   toolRegistry.register(new NotifyOwnerTool(notificationService));
+  // list_goals reads the same grounded goal summaries as /goals, per agent.
+  toolRegistry.register(new ListGoalsTool({
+    openGoals: async ({ agentId, sessionId }) => agents.get(agentId)?.openGoalSummaries(sessionId),
+  }));
   // Surface the "while you were away" digest on the next owner conversation.
   defaultAgent.setDigestSource(notificationService);
-  // Use the real sink for initiative cycles only when a telegram channel exists;
-  // otherwise fall back to the no-op logging sink (design §7).
-  const notificationSink: NotificationSink = config.channels.telegram?.enabled
-    ? notificationService
-    : new LoggingNotificationSink();
 
   // --- Scheduler ---
   const { JobScheduler, WebhookRegistry } = await import('@ontofelia/scheduler');
@@ -285,11 +319,40 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
     dispatch: async (envelope) => {
       await defaultAgent.handleMessage(envelope);
     },
-    notificationSink,
     session: initiativeSessionPort,
   });
 
+  // arm_goal gives an owner-requested goal a mandate and a wake, then schedules
+  // the wake through the InitiativeService (docs/initiative-architecture.md §9).
+  toolRegistry.register(new ArmGoalTool({
+    arm: async (req) =>
+      agents.get(req.agentId)?.armGoal(req, (goal) => initiativeService.registerGoalWake(goal)),
+  }));
+
+  // update_goal_step records progress on a goal; an unattended initiative cycle
+  // may touch only the goal it was woken for (docs/initiative-architecture.md §9).
+  toolRegistry.register(new UpdateGoalStepTool({
+    update: async (req) => agents.get(req.agentId)?.updateGoalStep(req),
+  }));
+
+  // The self-model was derived at initialize(), before the tools above existed:
+  // derive it again now that the registry is complete (a no-op with the
+  // self-model flag off). Later changes are picked up before the next cycle.
+  await defaultAgent
+    .seedDerivedSelfModelIfEnabled()
+    .catch((e) => logger.warn('Self-model derivation after tool registration failed: ' + (e as Error).message));
+
+  // The weekly metacognitive scan runs the worldview reflection for the owner
+  // with the same conflict detector the reflection endpoint uses.
+  defaultAgent.setConflictDetector(conflictDetector);
+
   scheduler.onJob(async (job) => {
+    // Reasoning catch-up: a direct engine call, no agent session. A no-op
+    // unless the reasoning gate left the inferred graphs stale.
+    if (job.name === REASONING_CATCHUP_JOB) {
+      await runReasoningCatchupJob(knowledgeEngine, resolveAgentId(job.agentId), logger);
+      return;
+    }
     // Initiative wakes are routed to the InitiativeService, which enforces the
     // kill switch and runaway guards before running any cycle.
     if (job.name.startsWith(INITIATIVE_JOB_PREFIX)) {
@@ -341,9 +404,20 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   const cogJobDefaults = [
     { name: 'cog.retention', cron: '0 3 * * *', prompt: '/cog retain' },
     { name: 'cog.consolidation', cron: '0 */6 * * *', prompt: '/cog consolidate' },
+    { name: 'cog.cleanup', cron: '30 3 * * *', prompt: '/cog cleanup' },
+    { name: 'cog.consolidate-episodes', cron: '45 3 * * *', prompt: '/cog consolidate-episodes' },
     { name: 'cog.metacog-scan', cron: '0 4 * * 0', prompt: '/cog scan' },
   ];
   const existingCogNames = new Set(scheduler.listCronJobs().map((j) => j.name));
+  // Reasoning catch-up (off in effect until the owner sets reasoning/asyncThreshold).
+  if (!existingCogNames.has(REASONING_CATCHUP_DEFAULT.name)) {
+    try {
+      await scheduler.addCronJob({ ...REASONING_CATCHUP_DEFAULT, agentId: PRIMARY_AGENT_ID, enabled: true });
+      logger.info(`Registered background job: ${REASONING_CATCHUP_DEFAULT.name} (${REASONING_CATCHUP_DEFAULT.cron})`);
+    } catch (e) {
+      logger.error(`Failed to register ${REASONING_CATCHUP_DEFAULT.name}: ${(e as Error).message}`);
+    }
+  }
   for (const def of cogJobDefaults) {
     if (existingCogNames.has(def.name)) continue;
     try {
@@ -372,12 +446,22 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   await fastify.register(fastifyMultipart);
 
   // Global Auth Hook
+  // The decision is taken on the route the router actually matched, never on the raw URL:
+  // the router decodes percent-encoding, so string checks on request.url can be bypassed.
   fastify.addHook('onRequest', async (request, reply) => {
-    if (request.url === '/api/health') return;
-    if (request.url === '/ws' || request.url === '/ws/node') return;
-    if (request.url.startsWith('/canvas/media/')) return;
-    if (request.url.startsWith('/webhooks/')) return;
-    if (!request.url.startsWith('/api/')) return;
+    const pattern = request.routeOptions?.url;
+    if (typeof pattern === 'string' && pattern !== '' && pattern !== '/*') {
+      // A concrete route matched: exempt only the explicitly public patterns.
+      if (pattern === '/api/health') return;
+      if (pattern === '/ws' || pattern === '/ws/node') return;
+      if (pattern.startsWith('/canvas/media/')) return;
+      if (pattern.startsWith('/webhooks/')) return;
+      if (!pattern.startsWith('/api/')) return;
+    } else if (!isApiPath(request.url)) {
+      // No concrete route (not found or static wildcard) and the decoded path is not under /api:
+      // no API handler can run, the not-found handler decides.
+      return;
+    }
 
     if (config.gateway.auth.tokenRequired) {
       const authHeader = request.headers.authorization;
@@ -391,13 +475,7 @@ export async function startGateway(config: OntofeliaConfig): Promise<FastifyInst
   // Static UI files
   const webUiDist = path.resolve(currentDir, '..', '..', 'web-ui', 'dist');
   if (fs.existsSync(webUiDist)) {
-    await fastify.register(fastifyStatic, { root: webUiDist, prefix: '/' });
-    fastify.setNotFoundHandler(async (request, reply) => {
-      if (!request.url.startsWith('/api/') && !request.url.startsWith('/ws') && !request.url.startsWith('/webhooks/')) {
-        return reply.sendFile('index.html');
-      }
-      reply.code(404).send({ error: 'Not found' });
-    });
+    await registerWebUi(fastify, webUiDist);
   }
 
   // Cleanup hook

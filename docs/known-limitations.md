@@ -70,6 +70,12 @@ architecture is sufficient. Larger deployments or multi-user scenarios
 will need either the optional Fuseki backend or a future migration to a
 dedicated graph database.
 
+**Mitigation:** Storing a fact materializes OWL inferences synchronously,
+which dominates latency on large graphs. The owner can switch on the
+[reasoning gate](reasoning-gate.md) (off by default) to skip that step above
+a chosen ABox size and let a background job rebuild the inferred graphs; the
+trade-off is that inferred triples may be missing for a few minutes.
+
 **Tracking:** Oxigraph write throughput and KG memory-footprint profiling.
 
 ---

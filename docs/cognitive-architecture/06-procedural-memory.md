@@ -31,8 +31,8 @@ Written by Phase 5 (execution) for every tool call, success **or** failure.
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:trace_2026-05-31T18-12-00Z_001 a cogt:SkillTrace ;
-    cogt:traceId        "trace_2026-05-31T18-12-00Z_001" ;
+cog:trace:4f2a9c1e a cogt:SkillTrace ;
+    cogt:traceId        "tr_2026-05-31T18-12-00-412Z_4f2a9c1e" ;
     cogt:toolName       "fs_read" ;                          # required
     cogt:toolArgsHash   "sha256:1f3a..." ;                   # required, content-addressed
     cogt:toolArgsBrief  "path=/root/Ontofelia/README.md" ;   # short, human readable
@@ -40,14 +40,16 @@ cog:trace_2026-05-31T18-12-00Z_001 a cogt:SkillTrace ;
     cogt:durationMs     147 ;
     cogt:outcome        "success" ;                          # success | error | partial
     cogt:errorClass     "" ;                                 # filled iff error
-    cogt:cycleId        "cycle_2026-05-31T18-12-00Z_001" ;
+    cogt:cycleId        "cyc-0001" ;
     cogt:sessionId      "sess_2026-05-31_18-04" ;
-    cogt:forGoal        cog:goal_20260531_204900_concept ;
-    cogt:forGoalType    cogt:WriteConceptDoc ;
+    cogt:forGoal        cog:goal:c9a1e5d2 ;
+    cogt:forGoalType    "urn:shared:ontology#cog/WriteConceptDoc" ;   # plain literal holding the goal type's IRI
     cogt:sequencePos    2 ;                                  # this is the 2nd tool in this cycle
     cogt:sequenceLen    7 ;                                  # cycle ended up using 7 tools
-    cogt:previousTrace  cog:trace_2026-05-31T18-11-58Z_001 ;
-    cogt:userSatisfied  true ;                               # set at cycle-end via feedback signal
+    cogt:previousTrace  cog:trace:b7d30a58 ;
+    cogt:userSatisfied  true ;                               # back-filled from the next message of the same user
+    cogt:satisfactionWeight "0.3000"^^xsd:decimal ;          # written with userSatisfied; how much the signal counts
+    cogt:forUser        "alice" ;                            # cognitive user key of the turn's sender
     cogt:agentId        "ontofelia" .
 ```
 
@@ -87,9 +89,9 @@ Maintained by the background consolidation job (§5). One row per
 ```turtle
 PREFIX cogt: <urn:shared:ontology#cog/>
 
-cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
+cog:skill:fs_read:writeconceptdoc a cogt:Skill ;
     cogt:toolName        "fs_read" ;
-    cogt:forGoalType     cogt:WriteConceptDoc ;
+    cogt:forGoalType     "urn:shared:ontology#cog/WriteConceptDoc" ;
     cogt:successCount    42 ;
     cogt:failureCount    3 ;
     cogt:partialCount    1 ;
@@ -98,8 +100,8 @@ cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
     cogt:lastUsedAt      "2026-05-31T18:12:00Z"^^xsd:dateTime ;
     cogt:successRate     "0.93"^^xsd:decimal ;
     cogt:satisfactionRate "0.88"^^xsd:decimal ;          # of successCount, share with userSatisfied = true
-    cogt:hasTrace        cog:trace_2026-05-31T18-12-00Z_001,
-                         cog:trace_2026-05-31T18-11-58Z_001 ;
+    cogt:hasTrace        cog:trace:4f2a9c1e,
+                         cog:trace:b7d30a58 ;
     cogt:typicalArgPattern "path=/root/Ontofelia/{*}.md" .
 ```
 
@@ -108,18 +110,27 @@ cog:skill_fs_read__WriteConceptDoc a cogt:Skill ;
 Some skills are about a *sequence* of tools, not a single one. For these:
 
 ```turtle
-cog:seqskill_explore_repo a cogt:SequenceSkill ;
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read a cogt:SequenceSkill ;
     cogt:label           "explore_repo" ;
-    cogt:forGoalType     cogt:CodeAnalysisGoal ;
-    cogt:hasStep         [ cogt:stepIndex 1 ; cogt:toolName "fs_list" ;
-                           cogt:notes "list package roots" ] ,
-                         [ cogt:stepIndex 2 ; cogt:toolName "fs_read" ;
-                           cogt:notes "READMEs and root manifests" ] ,
-                         [ cogt:stepIndex 3 ; cogt:toolName "fs_read" ;
-                           cogt:notes "deep-dive into the largest packages" ] ;
-    cogt:successCount    7 ;
-    cogt:meanDurationMs  3842 .
+    cogt:forGoalType     "urn:shared:ontology#cog/CodeAnalysisGoal" ;
+    cogt:hasStep         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:1 ,
+                         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:2 ,
+                         cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:3 ;
+    cogt:successCount    7 .
+
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:1
+    cogt:stepIndex 1 ; cogt:toolName "fs_list" .
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:2
+    cogt:stepIndex 2 ; cogt:toolName "fs_read" .
+cog:seqskill:codeanalysisgoal:fs_list_fs_read_fs_read:step:3
+    cogt:stepIndex 3 ; cogt:toolName "fs_read" .
 ```
+
+As built, the steps are IRI resources (`<skill IRI>:step:<n>`) that carry
+`stepIndex` and `toolName` only; `cogt:notes` is not written. A sequence skill
+carries `successCount`, `failureCount`, `successRate`, `satisfactionRate` and
+`agentId`; `meanDurationMs` and `lastUsedAt` are not written for it (only for
+single-tool skills).
 
 Sequence skills are first-class because action selection should sometimes
 choose a *sequence template* rather than a single next tool. (See §6.)
@@ -138,7 +149,7 @@ PREFIX cogt: <urn:shared:ontology#cog/>
 SELECT ?skill ?tool ?successRate ?satRate ?meanMs WHERE {
   GRAPH <urn:ontofelia:cog:procedural> {
     ?skill a cogt:Skill ;
-           cogt:forGoalType      cogt:WriteConceptDoc ;
+           cogt:forGoalType      "urn:shared:ontology#cog/WriteConceptDoc" ;
            cogt:toolName         ?tool ;
            cogt:successRate      ?successRate ;
            cogt:satisfactionRate ?satRate ;
@@ -240,7 +251,7 @@ export class ProceduralMemory {
   }
 
   async recordTrace(t: TraceInput): Promise<TraceId> { /* ... */ }
-  async backfillSatisfaction(traceId: TraceId, satisfied: boolean | null): Promise<void> { /* ... */ }
+  async backfillSatisfaction(traceId: TraceId, satisfied: boolean | null, weight?: number): Promise<void> { /* ... */ }
 
   async suggestSkills(forGoalType: string, k = 5): Promise<SkillSuggestion[]> { /* ... */ }
   async suggestSequenceSkills(forGoalType: string, k = 3): Promise<SequenceSkillSuggestion[]> { /* ... */ }
@@ -256,14 +267,22 @@ export interface TraceInput {
   durationMs: number;
   outcome: 'success' | 'error' | 'partial';
   errorClass?: string;
-  forGoal: string;           // goal URI
-  forGoalType: string;       // GoalType URI
-  cycleId: string;
-  sessionId: string;
+  forGoal?: string;          // goal URI
+  forGoalType?: string;      // GoalType URI
+  cycleId?: string;
+  sessionId?: string;
   sequencePos: number;
   sequenceLen?: number;      // unknown until cycle end
   previousTrace?: string;
-  proceduralAdherence: boolean | null;
+  proceduralAdherence?: boolean | null;  // null/absent: no suggestion was shown
+  forUser?: string;          // cognitive user key of the turn's sender
+  maskedArgs?: MaskedArgHash[];  // digests of masked arguments; written as cogt:maskedArg
+}
+
+export interface MaskedArgHash {
+  path: string;              // sanitised argument path
+  digest: string;            // hex digest of the raw value; the value itself is never stored
+  scheme?: 'hmac-sha256' | 'sha256';
 }
 
 export interface SkillSuggestion {
@@ -287,7 +306,7 @@ files). Two rules:
   values for the same logical args do not look like different calls.
 - **`toolArgsBrief`** is the human-readable form that ends up in retrieval;
   it is mandatorily redacted (`token=*****`, paths shortened to a base).
-  The redaction map lives in `urn:<agent>:setup` (`cog:argRedactionRules`).
+  The redaction map lives in `urn:<agent>:setup` (`cogt:argRedactionRules`).
 
 This keeps procedural memory shareable for cross-session learning without
 leaking credentials into a long-lived store.
@@ -313,29 +332,83 @@ memory_store`. After the consolidation job runs:
 
 ```turtle
 GRAPH <urn:ontofelia:cog:procedural> {
-  cog:seqskill_concept_doc_writing a cogt:SequenceSkill ;
+  cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store a cogt:SequenceSkill ;
       cogt:label "concept_doc_writing" ;
-      cogt:forGoalType  cogt:WriteConceptDoc ;
+      cogt:forGoalType  "urn:shared:ontology#cog/WriteConceptDoc" ;
       cogt:hasStep
-        [ cogt:stepIndex 1 ; cogt:toolName "fs_list" ;
-          cogt:notes "Inventory target directory" ] ,
-        [ cogt:stepIndex 2 ; cogt:toolName "fs_read" ;
-          cogt:notes "Read existing related docs to align style" ] ,
-        [ cogt:stepIndex 3 ; cogt:toolName "fs_write" ;
-          cogt:notes "Write the new doc(s)" ] ,
-        [ cogt:stepIndex 4 ; cogt:toolName "memory_store" ;
-          cogt:notes "Record decisions for future reference" ] ;
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:1 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:2 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:3 ,
+        cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:4 ;
       cogt:successCount    7 ;
       cogt:failureCount    0 ;
-      cogt:meanDurationMs  41382 ;
       cogt:successRate     "1.0"^^xsd:decimal ;
-      cogt:satisfactionRate "0.86"^^xsd:decimal ;
-      cogt:lastUsedAt      "2026-05-31T20:55:00Z"^^xsd:dateTime .
+      cogt:satisfactionRate "0.86"^^xsd:decimal .
+
+  # one resource per step, e.g.
+  cog:seqskill:writeconceptdoc:fs_list_fs_read_fs_write_memory_store:step:1
+      cogt:stepIndex 1 ; cogt:toolName "fs_list" .
+  # ... steps 2 to 4 the same way: fs_read, fs_write, memory_store
 }
 ```
 
 Next time the agent picks up `cogt:WriteConceptDoc`, goal management
 surfaces this SequenceSkill into the prompt, and the LLM tends to follow
 it — closing the loop.
+
+## 11. Completion rules (procedural flag on)
+
+Everything here applies only with the procedural-memory flag on; with it off
+there are no new reads or writes and the prompt is unchanged.
+
+- **Suggestion filter.** A skill is suggested only with `successRate >= 0.7`
+  over at least 3 recorded calls (the same floor sequence skills need). A
+  learned sequence needs `successRate >= 0.7`. The `[Skills that worked ...]`
+  block text itself is unchanged.
+- **Adherence.** When the prompt of a turn showed suggestions, every traced
+  call of the turn gets `cogt:proceduralAdherence` (true when its tool is one of
+  the tools named by the shown suggestions) and the cycle gets one
+  `cogt:AdherenceSummary` (`suggestedTools`, `tracedCalls`, `adheredCalls`,
+  `adherenceRate`, `forUser`). With no suggestion shown neither is written.
+- **Cumulative p95.** `cogt:p95DurationMs` is the exact nearest-rank p95 of a
+  bounded window: the latest 200 measured durations of the skill (kept as
+  `cogt:durationWindow`). Calls without a measured duration are left out.
+- **Follow-up satisfaction.** The next message of the same user in the same
+  session (and within 6 hours of the turn) is classified satisfied / dissatisfied
+  / ambiguous; ambiguity writes nothing. Only that user's own, not yet judged
+  traces of the previous cycle are updated, once, with `cogt:satisfactionWeight
+  0.3`. The skill keeps `satisfiedWeight` and `dissatisfiedWeight`;
+  `satisfactionRate = max(0, satisfiedWeight - dissatisfiedWeight) /
+  successCount`. A signal without a weight counts as before (1 / 0).
+  The classifier matches whole words (Unicode-aware, German and English),
+  applies negation inside one clause ("not good", "nicht gut", "funktioniert
+  nicht" are dissatisfied; "not bad", "nicht schlecht" are satisfied), and
+  returns ambiguous for questions, contrast ("but", "aber") and long messages.
+- **Argument redaction.** A trace stores argument keys only. Every argument the
+  rules mask is stored as `cogt:maskedArg "<path>=hmac-sha256:<hex>"`: the
+  HMAC-SHA256 of the value under a key that only this instance holds, so equality
+  can be checked without keeping the value and a weak value (a short PIN) cannot
+  be guessed from the stored text without the key. The key is 32 random bytes,
+  generated once, in the file `arg-digest.key` of the agent's state directory
+  (the parent of its sessions directory), mode 0600, created atomically (written
+  to a private temporary file and linked to its name, so a concurrent creator
+  never leaves a half-written key). It is never logged, printed, stored in the
+  triplestore or passed in a command line. Without a key (no state directory, or
+  the file cannot be read or created) no digest is stored, only the path of the
+  masked argument. Values written before this change keep the form
+  `<path>=sha256:<hex>`; the prefix names the scheme, two digests compare only
+  within one scheme, and there is no migration. Built-in rules: keys matching
+  `token|secret|passw|key|auth|cookie|credential` (at any depth), values that
+  match a known credential shape, hex runs of 32+ characters, base64-like runs of
+  40+, and `Bearer`/`Basic` credentials. The setup graph may add rules with one
+  JSON literal `cogt:argRedactionRules` on the cognitive config subject:
+  `{"keyPatterns": ["^pin$"], "valuePatterns": ["^[0-9]{16}$"]}`. Configured
+  rules only add to the built-ins.
+- **Retention.** Traces and adherence summaries older than 90 days are deleted
+  by the daily `/cog cleanup` job (the existing cron). Skill and sequence-skill
+  aggregates stay; only their ring-buffer link to a deleted trace goes.
+- **Ownership.** Traces and adherence summaries carry `cogt:forUser`. The skill
+  aggregates remain agent-wide by design (content-free: tool names, counts,
+  timings), so suggestions are drawn from them for every user.
 
 Continue with [`07-goals-and-attention.md`](07-goals-and-attention.md).

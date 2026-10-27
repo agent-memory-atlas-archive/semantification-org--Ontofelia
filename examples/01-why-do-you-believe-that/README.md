@@ -50,12 +50,46 @@ Reply from a real run (output will vary — LLM-dependent):
 That answer is not confabulated — the agent called its `memory_explain` tool
 and read the claim from the graph.
 
-**3. Look at the graph yourself.** The gateway exposes all Named Graphs at
-`GET /api/knowledge/graphs`; the shared helper filters them:
+**3. Look at the graph yourself.** The gateway has a read-only SPARQL endpoint,
+`POST /api/knowledge/sparql` (see [`docs/api.md`](../../docs/api.md)). It accepts
+only `SELECT` and `ASK`, requires every triple pattern to sit inside an explicit
+`GRAPH <iri> { ... }`, and serves only graphs that hold no private user data
+(the shared vocabulary, `urn:<agent>:worldview`, `schema`, `inferred`, `self`,
+`skills`). Everything else is refused with `403`: the per-user and per-session
+graphs, and also `claims`, `evidence`, `conflicts` and the cognitive graphs,
+because those collect the messages of every user. The agent id is `ontofelia`
+unless you set `ONTOFELIA_AGENT`. The `sparql` helper in `common.sh` posts the
+query and prints the result as a table (IRIs shortened: `entity:` is
+`urn:ontofelia:entity:`, `core:` is `urn:ontofelia:core#`):
 
 ```bash
 source ../common.sh
-show_graph worldview Ada    # the fact itself
+
+# the fact itself: the triples about Ada in the worldview graph
+sparql 'SELECT ?subject ?predicate ?object WHERE {
+  GRAPH <urn:ontofelia:worldview> {
+    ?subject ?predicate ?object .
+    FILTER(CONTAINS(STR(?subject), "Ada"))
+  }
+} ORDER BY ?predicate'
+```
+
+Output shape (the model may phrase predicates differently, so your rows can
+vary):
+
+```
+subject             predicate     object
+------------------  ------------  ----------------------
+entity:Ada_Marlowe  rdf:type      entity:Person
+entity:Ada_Marlowe  rdfs:label    Ada Marlowe
+entity:Ada_Marlowe  core:worksAt  entity:Helios_Robotics
+```
+
+The claim and the evidence live in graphs the SPARQL endpoint does not serve.
+As the operator you read them with the graph dump `GET /api/knowledge/graphs`;
+the shared helper filters it:
+
+```bash
 show_graph claims Ada       # the claim: status, confidence, timestamps
 show_graph evidence Ada     # the evidence: the exact source utterance
 ```
@@ -63,10 +97,6 @@ show_graph evidence Ada     # the evidence: the exact source utterance
 From the same run (claim and evidence IDs will differ):
 
 ```
---- graph urn:ontofelia:worldview (8 triples) ---
-<urn:ontofelia:entity:Ada_Marlowe> <urn:ontofelia:core#worksAt> <urn:ontofelia:entity:Helios_Robotics> .
-...
-
 --- graph urn:ontofelia:claims (29 triples) ---
 <urn:claim:...> a <urn:shared:ontology#Claim> ;
   claimSubject   <urn:ontofelia:entity:Ada_Marlowe> ;
@@ -85,7 +115,9 @@ From the same run (claim and evidence IDs will differ):
 ```
 
 (The API returns one triple per line; the block above is condensed for
-readability. `run.sh` shows the raw form.)
+readability. `run.sh` shows the raw form. Facts about *you* are written to your
+private user graph, which neither endpoint path is meant for; that is why this
+recipe teaches the agent a fact about a third party.)
 
 ## What just happened
 

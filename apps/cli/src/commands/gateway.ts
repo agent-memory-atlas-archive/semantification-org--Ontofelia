@@ -34,7 +34,6 @@ export function registerGatewayCommand(program: Command) {
     .option('--port <port>', 'Port to listen on')
     .option('--bind <mode>', 'Network bind mode')
     .option('--token <token>', 'Gateway token')
-    .option('--verbose', 'Enable verbose logging')
     .option('--foreground', 'Run in foreground (default is background)')
     .action(async (options) => {
       // Check if already running (skip in foreground mode — parent already wrote PID)
